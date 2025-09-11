@@ -208,20 +208,7 @@ def Total_power_plot(Spect_dat):
     fig.tight_layout()
     return fig
 
-def plot_total_power_with_UP_marks(Spect_dat, time_vec, Total_power, UP_idx):
-    fig, ax = plt.subplots()
-    ax.plot(Spect_dat[1], np.sum(Spect_dat[0], axis=0), label="Power(1–10 Hz)")
-    if (Total_power is not None) and len(UP_idx):
-        sel = UP_idx.astype(int)
-        sel = sel[(sel >= 0) & (sel < len(time_vec)) & (sel < len(Total_power))]
-        if len(sel):
-            ax.scatter(time_vec[sel], Total_power[sel], s=12, color="red", label="Detected UP")
-    ax.set_title("Total Power mit UP-Markierungen")
-    ax.set_xlabel("Zeit (s)")
-    ax.set_ylabel("Power (summiert)")
-    ax.legend()
-    fig.tight_layout()
-    return fig
+
 
 def plot_power_spectrum_comparison(freqs, spont_mean, pulse_mean, p_vals=None, alpha=0.05, title=None):
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -272,8 +259,7 @@ run_and_save(
 
 # Power-Zeitreihe + Marks
 run_and_save(Total_power_plot, "total_power", Spect_dat)
-run_and_save(plot_total_power_with_UP_marks, "total_power_with_UP_marks",
-             Spect_dat, time_s, Total_power, UP_start_i)
+
 
 # Frequenz-Achse Vergleich (falls compare_spectra geliefert hat)
 if (freqs is not None) and (spont_mean is not None) and (pulse_mean is not None):
@@ -291,3 +277,37 @@ run_and_save(
 )
 
 print("[DONE] Alle Plot-Funktionen mit Auto-Save in:", SAVE_DIR)
+
+
+
+
+# ======================
+# ERGEBNIS-TABELLE SCHREIBEN
+# ======================
+import csv
+
+# Experiment = Ordnername, wo deine Daten liegen
+experiment_name = os.path.basename(BASE_PATH)
+
+# Counts bestimmen
+total_up = len(Spontaneous_UP) + len(Pulse_triggered_UP) + len(Pulse_associated_UP)
+row = {
+    "Experiment": experiment_name,
+    "Upstates total": total_up,
+    "triggered": len(Pulse_triggered_UP),
+    "spon": len(Spontaneous_UP),
+    "associated": len(Pulse_associated_UP),
+}
+
+# CSV-Datei im Elternordner von BASE_PATH ablegen
+summary_path = os.path.join(os.path.dirname(BASE_PATH), "upstate_summary.csv")
+
+# Falls Datei noch nicht existiert: Kopf schreiben
+file_exists = os.path.isfile(summary_path)
+with open(summary_path, "a", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=row.keys())
+    if not file_exists:
+        writer.writeheader()
+    writer.writerow(row)
+
+print(f"[SUMMARY] Ergebnisse in {summary_path} ergänzt/geschrieben.")
