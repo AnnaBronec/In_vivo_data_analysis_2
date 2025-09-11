@@ -160,6 +160,13 @@ print("[COUNTS] sponUP:", len(Spontaneous_UP),
       " trigUP:", len(Pulse_triggered_UP),
       " assocUP:", len(Pulse_associated_UP))
 
+# === Mittelwerte der UP-Dauern (in Sekunden) ===
+trig_durations = (Pulse_triggered_DOWN - Pulse_triggered_UP) * dt if len(Pulse_triggered_UP) else []
+spon_durations = (Spontaneous_DOWN - Spontaneous_UP) * dt if len(Spontaneous_UP) else []
+mean_trig = float(np.mean(trig_durations)) if len(trig_durations) else np.nan
+mean_spon = float(np.mean(spon_durations)) if len(spon_durations) else np.nan
+
+
 # ============ HELFER: UP/DOWN-Paare konsistent bauen ============
 def build_up_down_pairs(Up_states, time_vec):
     UP_i   = np.array(Up_states.get("UP_start_i",   []), dtype=int)
@@ -307,7 +314,7 @@ parent_folder = os.path.basename(os.path.dirname(BASE_PATH))
 # Counts bestimmen
 total_up = len(Spontaneous_UP) + len(Pulse_triggered_UP) + len(Pulse_associated_UP)
 row = {
-    "Parent": parent_folder, 
+    "Parent": parent_folder,
     "Experiment": experiment_name,
     "Dauer [s]": round(float(time_s[-1] - time_s[0]), 2),
     "Samplingrate [Hz]": round(1/dt, 2),
@@ -321,6 +328,8 @@ row = {
     "Downstates total": len(Spontaneous_DOWN) + len(Pulse_triggered_DOWN) + len(Pulse_associated_DOWN),
     "UP/DOWN ratio": round(total_up / max(1, (len(Spontaneous_DOWN)+len(Pulse_triggered_DOWN)+len(Pulse_associated_DOWN))), 3),
     "Mean UP Dauer [s]": np.mean((DOWN_start_i - UP_start_i) * dt) if len(UP_start_i) else np.nan,
+    "Mean UP Dauer Triggered [s]": mean_trig,
+    "Mean UP Dauer Spontaneous [s]": mean_spon,
     "Datum Analyse": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
 }
 
