@@ -25,7 +25,8 @@ from state_detection import (
 from plotter import (
     plot_all_channels,
     plot_spont_up_mean,
-    plot_upstate_amplitude_blocks_colored,   # optional am Ende
+    plot_upstate_amplitude_blocks_colored,
+    plot_upstate_duration_comparison   # optional am Ende
 )
 
 # ============ PARAMS ============
@@ -256,6 +257,13 @@ run_and_save(
     Pulse_triggered_UP, Pulse_triggered_DOWN,
     Spontaneous_UP, Spontaneous_DOWN
 )
+run_and_save(
+    plot_upstate_duration_comparison, "upstate_duration_compare",
+    Pulse_triggered_UP, Pulse_triggered_DOWN,
+    Spontaneous_UP, Spontaneous_DOWN, dt
+)
+
+
 
 # Power-Zeitreihe + Marks
 run_and_save(Total_power_plot, "total_power", Spect_dat)
@@ -286,28 +294,61 @@ print("[DONE] Alle Plot-Funktionen mit Auto-Save in:", SAVE_DIR)
 # ======================
 import csv
 
-# Experiment = Ordnername, wo deine Daten liegen
+# ======================
+# ERGEBNIS-TABELLE SCHREIBEN (mit Überschreiben falls Experiment schon vorhanden)
+# ======================
+import csv
+
 experiment_name = os.path.basename(BASE_PATH)
+
+# Übergeordneter Ordner (z.B. "DRD cross")
+parent_folder = os.path.basename(os.path.dirname(BASE_PATH))
 
 # Counts bestimmen
 total_up = len(Spontaneous_UP) + len(Pulse_triggered_UP) + len(Pulse_associated_UP)
 row = {
+    "Parent": parent_folder, 
     "Experiment": experiment_name,
+    "Dauer [s]": round(float(time_s[-1] - time_s[0]), 2),
+    "Samplingrate [Hz]": round(1/dt, 2),
+    "Kanäle": NUM_CHANNELS,
+    "Pulse count 1": len(pulse_times_1),
+    "Pulse count 2": len(pulse_times_2),
     "Upstates total": total_up,
     "triggered": len(Pulse_triggered_UP),
     "spon": len(Spontaneous_UP),
     "associated": len(Pulse_associated_UP),
+    "Downstates total": len(Spontaneous_DOWN) + len(Pulse_triggered_DOWN) + len(Pulse_associated_DOWN),
+    "UP/DOWN ratio": round(total_up / max(1, (len(Spontaneous_DOWN)+len(Pulse_triggered_DOWN)+len(Pulse_associated_DOWN))), 3),
+    "Mean UP Dauer [s]": np.mean((DOWN_start_i - UP_start_i) * dt) if len(UP_start_i) else np.nan,
+    "Datum Analyse": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
 }
 
-# CSV-Datei im Elternordner von BASE_PATH ablegen
+
 summary_path = os.path.join(os.path.dirname(BASE_PATH), "upstate_summary.csv")
 
-# Falls Datei noch nicht existiert: Kopf schreiben
-file_exists = os.path.isfile(summary_path)
-with open(summary_path, "a", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=row.keys())
-    if not file_exists:
-        writer.writeheader()
-    writer.writerow(row)
+rows = []
+# Falls Datei existiert → einlesen
+if os.path.isfile(summary_path):
+    with open(summary_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
 
-print(f"[SUMMARY] Ergebnisse in {summary_path} ergänzt/geschrieben.")
+# Liste aktualisieren: falls Experiment schon existiert, überschreiben
+found = False
+for r in rows:
+    if r["Experiment"] == experiment_name:
+        r.update(row)
+        found = True
+        break
+if not found:
+    rows.append(row)
+
+# CSV neu schreiben (immer komplett)
+with open(summary_path, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=row.keys())
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(f"[SUMMARY] Tabelle aktualisiert: {summary_path}")
