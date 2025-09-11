@@ -165,3 +165,30 @@ def plot_upstate_amplitude_blocks_colored(main_channel, UP_start_i, DOWN_start_i
     fig.tight_layout()
     return fig
 
+
+def plot_upstate_duration_comparison(Pulse_triggered_UP, Pulse_triggered_DOWN,
+                                     Spontaneous_UP, Spontaneous_DOWN, dt):
+    """
+    Plottet mittlere Dauer von Triggered vs. Spontaneous UP-States.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # Dauern berechnen (in Sekunden)
+    trig_durations = (Pulse_triggered_DOWN - Pulse_triggered_UP) * dt if len(Pulse_triggered_UP) else []
+    spon_durations = (Spontaneous_DOWN - Spontaneous_UP) * dt if len(Spontaneous_UP) else []
+
+    mean_trig = np.mean(trig_durations) if len(trig_durations) else np.nan
+    mean_spon = np.mean(spon_durations) if len(spon_durations) else np.nan
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.bar(["Triggered", "Spontaneous"], [mean_trig, mean_spon],
+           color=["red", "blue"], alpha=0.7)
+    ax.set_ylabel("Mean UP Duration (s)")
+    ax.set_title("Durchschnittliche Dauer von UP-States")
+    for i, val in enumerate([mean_trig, mean_spon]):
+        if not np.isnan(val):
+            ax.text(i, val, f"{val:.2f}s", ha="center", va="bottom", fontsize=9)
+    fig.tight_layout()
+    return fig
+
