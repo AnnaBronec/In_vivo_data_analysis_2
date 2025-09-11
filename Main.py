@@ -23,7 +23,14 @@ from loader import load_LFP, load_lightpulses,
 from preprocessing import downsampling, filtering, get_main_channel, pre_post_condition
 from plotter import plot_all_channels, plot_spont_up_mean, Total_power_plot, tests, plot_upstate_amplitudes, plot_upstate_amplitude_mean, plot_upstate_amplitude_blocks_colored
 from state_detection import classify_states, Generate_CSD_mean, Spectrum, extract_upstate_windows, compute_spectra, compare_spectra, plot_contrast_heatmap, average_amplitude_in_upstates, compute_spectra, plot_CSD_comparison, plot_LFP_average_around_peaks
-from loader_old import load_LFP, load_lightpulses, load_LFP_from_CSC_csv
+from loader_old_patched import load_LFP_new, load_lightpulses_simple
+
+# LFP laden
+lfp_df, ch_names, lfp_meta = load_LFP_new(BASE_PATH, LFP_CSV)
+
+# Pulse laden (auto-find der Stimuli-CSV, sonst filename angeben)
+pulse_times_1 = load_lightpulses_simple(BASE_PATH, filename=None, lfp_meta=lfp_meta)
+
 
 
 

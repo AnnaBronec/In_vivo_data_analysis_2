@@ -17,7 +17,7 @@ DOWNSAMPLE_FACTOR = 50
 HIGH_CUTOFF = 10
 LOW_CUTOFF  = 2
 BASE_PATH = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/DRD cross/2017-8-9_13-52-30onePulse200msX20per15s"
-LFP_FILENAME = "neuralynx_csc_and_stim.csv"
+LFP_FILENAME = "2017-8-9_13-52-30onePulse200msX20per15s.csv"
 
 # Optional: bestimmte Kanäle wählen (z.B. ["CSC1","CSC3"])
 # Wenn nicht definiert, werden automatisch alle Kanäle genommen.

@@ -24,6 +24,14 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.stats import ttest_ind
 from scipy.signal import welch
 
+def _save_svg(fig, hint, out_dir=None, dpi=200):
+    if out_dir is None:
+        out_dir = os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{hint}.svg")
+    fig.canvas.draw_idle()
+    fig.savefig(path, format="svg", dpi=dpi, bbox_inches="tight")
+    print(f"[SAVED] {path}")
 
 
 def compute_peak_aligned_segments(up_indices, LFP_array, dt, b_lp, a_lp, b_hp, a_hp, align_pre, align_post, align_len):
@@ -364,34 +372,38 @@ def Generate_CSD_mean(peaks_list, signal_array, dt):
 
 
 
-def plot_CSD_comparison(csd_spont, csd_triggered, dt):
-    fig, axs = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+def plot_CSD_comparison(CSD_spont, CSD_trig, dt, cmap="bwr",
+                        save=False, hint="CSD_spont_vs_trig",
+                        out_dir=None, show=True, close=False):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6), sharey=True)
 
-     # Zeitachse
-    n_timepoints = csd_spont.shape[1]
-    t = np.linspace(-0.5, 0.5, n_timepoints)
+    im1 = axes[0].imshow(CSD_spont, aspect="auto", cmap=cmap, origin="lower",
+                         extent=[0, CSD_spont.shape[1]*dt, 0, CSD_spont.shape[0]])
+    axes[0].set_title("Spontaneous UP — CSD")
+    axes[0].set_xlabel("Time (s)")
+    axes[0].set_ylabel("Channel depth")
 
-    # Gemeinsame Farbsättigung berechnen
-    v_abs = np.nanmax(np.abs([csd_spont, csd_triggered]))
+    im2 = axes[1].imshow(CSD_trig, aspect="auto", cmap=cmap, origin="lower",
+                         extent=[0, CSD_trig.shape[1]*dt, 0, CSD_trig.shape[0]])
+    axes[1].set_title("Pulse-triggered UP — CSD")
+    axes[1].set_xlabel("Time (s)")
 
-    im1 = axs[0].imshow(csd_spont, aspect='auto', origin='lower',
-                        extent=[t[0], t[-1], 0, csd_spont.shape[0]],
-                        cmap='seismic', vmin=-v_abs, vmax=v_abs)
-    axs[0].set_title("Spontaneous UP CSD")
-    axs[0].set_xlabel("Time (s)")
-    axs[0].set_ylabel("Channel")
-    fig.colorbar(im1, ax=axs[0])
+    # gemeinsame Colorbar rechts außen
+    fig.colorbar(im1, ax=axes, shrink=0.9, label="CSD (a.u.)",
+                 location="right", anchor=(0, 0.5))
+    fig.tight_layout(rect=[0, 0, 0.93, 1])
 
-    im2 = axs[1].imshow(csd_triggered, aspect='auto', origin='lower',
-                        extent=[t[0], t[-1], 0, csd_triggered.shape[0]],
-                        cmap='seismic', vmin=-v_abs, vmax=v_abs)
-    axs[1].set_title("Pulse-triggered UP CSD")
-    axs[1].set_xlabel("Time (s)")
-    #cbar = fig.colorbar(im1, ax=axs, shrink=0.8, location='right', label='CSD (a.u.)')
+    if save:
+        _save_svg(fig, hint, out_dir=out_dir)
 
-    plt.suptitle("Vergleich: Spontane vs. Getriggerte CSDs", fontsize=14)
-    plt.tight_layout()
-    plt.show()
+    if show:
+        plt.draw()
+        plt.pause(0.001)   # winziger Event-Loop-Tick, Fenster wird sicher angezeigt
+
+    if close:
+        plt.close(fig)
+
+    return fig
 
 
 def Spectrum(V_win):
@@ -470,7 +482,9 @@ def compare_spectra(pulse_windows, spont_windows, dt, ignore_start_s=0.0):
     plt.legend()
     plt.title("Mean Power Spectrum: Spontaneous vs. Pulse-triggered UP states")
     plt.grid(True)
-    plt.show()
+    plt.draw()
+    plt.pause(0.001)   # winziger Event-Loop-Tick, Fenster wird sicher angezeigt
+
 
     return freqs, spont_mean, pulse_mean, p_vals
 
@@ -492,7 +506,10 @@ def plot_contrast_heatmap(pulse_windows, spont_windows, dt):
     ax.set_ylabel("Trial")
     fig.colorbar(im, ax=ax, label="Power Difference")
     plt.tight_layout()
-    plt.show()
+    plt.draw()
+    plt.pause(0.001)   # winziger Event-Loop-Tick, Fenster wird sicher angezeigt
+
+   
 
 
 def average_amplitude_in_upstates(main_channel, time_s, UP_start_i, DOWN_start_i, start_idx, end_idx):

@@ -311,8 +311,11 @@ def main(session_dir, out_csv=None):
         mask=USER_MASK, active_low=ACTIVE_LOW, pulse_ms=PULSE_MS, verbose=True
     )
 
-    out = Path(out_csv) if out_csv else (p / "neuralynx_csc_and_stim.csv")
+        # Session-Ordner-Name als Basis nehmen
+    folder_name = p.name  # z.B. "2017-8-9_13-52-30onePulse200msX20per15s"
+    out = Path(out_csv) if out_csv else (p / f"{folder_name}.csv")
     df_all.to_csv(out, index=False)
+
 
     print(f"\nWrote: {out}")
     print(f"Rows: {len(df_all)}")
