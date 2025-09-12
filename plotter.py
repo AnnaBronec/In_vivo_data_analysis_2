@@ -29,9 +29,9 @@ def plot_all_channels(num_channels: int, time_s, LFP_array):
         axs[i].set_ylabel(f"pri_{i}")
         axs[i].grid(True)
     axs[-1].set_xlabel("Zeit (s)")
-    fig.suptitle("Plot 1 – LFP-Kanäle über Zeit (getrennte Darstellung)")
+    fig.suptitle("LFP-Kanäle über Zeit")
     fig.tight_layout(rect=[0, 0, 1, 0.97])
-    return fig  # <— zurückgeben
+    return fig
 
 def plot_spont_up_mean(main_channel, time_s, dt, Spon_Peaks, up_state_binary,
                        pulse_times_1, pulse_times_2,
@@ -39,8 +39,8 @@ def plot_spont_up_mean(main_channel, time_s, dt, Spon_Peaks, up_state_binary,
                        Spontaneous_UP, Spontaneous_DOWN):
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(time_s, main_channel, label='LFP', color='black')
-    added_labels = set()
 
+    added_labels = set()
     for up, down in zip(Pulse_triggered_UP, Pulse_triggered_DOWN):
         up, down = int(up), int(down)
         if down < len(time_s):
@@ -55,48 +55,40 @@ def plot_spont_up_mean(main_channel, time_s, dt, Spon_Peaks, up_state_binary,
             ax.axvspan(time_s[up], time_s[down], color='lightblue', alpha=0.3, label=label)
             added_labels.add('spontan')
 
-    visible_pulses_1 = pulse_times_1[(pulse_times_1 >= time_s[0]) & (pulse_times_1 <= time_s[-1])]
-    for i, p in enumerate(visible_pulses_1):
+    vis1 = pulse_times_1[(pulse_times_1 >= time_s[0]) & (pulse_times_1 <= time_s[-1])]
+    for i, p in enumerate(vis1):
         ax.axvline(p, color='red', linestyle='--', linewidth=0.8, label='Licht 1' if i == 0 else None)
 
-    visible_pulses_2 = pulse_times_2[(pulse_times_2 >= time_s[0]) & (pulse_times_2 <= time_s[-1])]
-    for i, p in enumerate(visible_pulses_2):
+    vis2 = pulse_times_2[(pulse_times_2 >= time_s[0]) & (pulse_times_2 <= time_s[-1])]
+    for i, p in enumerate(vis2):
         ax.axvline(p, color='blue', linestyle=':', linewidth=0.8, label='Licht 2' if i == 0 else None)
 
     all_ups = np.concatenate((Pulse_triggered_UP, Spontaneous_UP))
     all_times_sorted = time_s[np.sort(all_ups)]
     y0, y1 = ax.get_ylim()
     for i, t in enumerate(all_times_sorted):
-        ax.annotate(str(i + 1), xy=(t, y0), xytext=(t, y0 - 0.05 * np.ptp(main_channel)),
+        ax.annotate(str(i + 1), xy=(t, y0), xytext=(t, y0 - 0.05 * (y1 - y0)),
                     ha='center', va='top', fontsize=7, rotation=90, color='black')
 
     handles, labels = ax.get_legend_handles_labels()
-    unique = dict(zip(labels, handles))
-    ax.legend(unique.values(), unique.keys())
-
-    ax.set_xlabel("Time (s)")
+    uniq = dict(zip(labels, handles))
+    ax.legend(uniq.values(), uniq.keys())
+    ax.set_xlabel("Zeit (s)")
     ax.set_ylabel("Amplitude")
-    ax.set_title("UP-States: spontaneous (blau) vs. triggered (rot)")
+    ax.set_title("UP-States: spontan (blau) vs. getriggert (rot)")
     fig.tight_layout()
-    return fig  # <—
+    return fig
 
 def Total_power_plot(Spect_dat):
     fig, ax = plt.subplots()
     ax.plot(Spect_dat[1], np.sum(Spect_dat[0], axis=0))
-    ax.set_title("Gesamtleistung im 1–10Hz Bereich")
+    ax.set_title("Gesamtleistung im 1–10 Hz Bereich")
     ax.set_xlabel("Zeit (s)")
     ax.set_ylabel("Power (summiert)")
     fig.tight_layout()
-    return fig  # <— früher: kein neues fig + kein return
+    return fig
 
-def tests(Spect_dat, time_s, Total_power, UP_start_i):
-    fig, ax = plt.subplots()
-    ax.plot(Spect_dat[1], np.sum(Spect_dat[0], axis=0))
-    ax.scatter(time_s[UP_start_i.astype(int)], Total_power[UP_start_i.astype(int)],
-               color="red", label="Detected UP")
-    ax.legend()
-    fig.tight_layout()
-    return fig  # <— früher: kein neues fig + kein return
+
 
 def plot_upstate_amplitudes(main_channel, UP_start_i, DOWN_start_i, start_idx, end_idx):
     assert 1 <= start_idx <= end_idx <= len(UP_start_i), "Ungültiger Indexbereich."
@@ -137,7 +129,7 @@ def plot_upstate_amplitude_mean(main_channel, UP_start_i, DOWN_start_i, start_id
     return fig
 
 def plot_upstate_amplitude_blocks_colored(main_channel, UP_start_i, DOWN_start_i, index_blocks, filename):
-    block_labels = []; block_means = []; block_colors = []; block_legend_labels = []
+    block_labels, block_means, block_colors, block_legend_labels = [], [], [], []
     for idx, (start_idx, end_idx) in enumerate(index_blocks):
         assert 1 <= start_idx <= end_idx <= len(UP_start_i), f"Ungültiger Bereich: {start_idx}-{end_idx}"
         amps = []
@@ -152,40 +144,32 @@ def plot_upstate_amplitude_blocks_colored(main_channel, UP_start_i, DOWN_start_i
             block_colors.append("orange"); block_legend_labels.append("orange light")
         else:
             block_colors.append("violet"); block_legend_labels.append("violet light")
+
     fig, ax = plt.subplots(figsize=(8, 5))
     bars = ax.bar(block_labels, block_means, color=block_colors)
     seen = set()
     for bar, label in zip(bars, block_legend_labels):
         if label not in seen:
             bar.set_label(label); seen.add(label)
-    ax.set_xlabel("UP-Bereich (Index)"); ax.set_ylabel("Ø Amplitude")
+    ax.set_xlabel("UP-Bereich (Index)")
+    ax.set_ylabel("Ø Amplitude")
     ax.set_title("Vergleich mittlerer Amplituden: violet vs. orange light")
     if filename: fig.suptitle(f"Datei: {filename}", fontsize=10, y=0.98)
     ax.legend(); ax.grid(axis='y', linestyle='--', alpha=0.4)
     fig.tight_layout()
     return fig
 
-
 def plot_upstate_duration_comparison(Pulse_triggered_UP, Pulse_triggered_DOWN,
                                      Spontaneous_UP, Spontaneous_DOWN, dt):
-    """
-    Plottet mittlere Dauer von Triggered vs. Spontaneous UP-States.
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    # Dauern berechnen (in Sekunden)
     trig_durations = (Pulse_triggered_DOWN - Pulse_triggered_UP) * dt if len(Pulse_triggered_UP) else []
     spon_durations = (Spontaneous_DOWN - Spontaneous_UP) * dt if len(Spontaneous_UP) else []
-
-    mean_trig = np.mean(trig_durations) if len(trig_durations) else np.nan
-    mean_spon = np.mean(spon_durations) if len(spon_durations) else np.nan
+    mean_trig = float(np.mean(trig_durations)) if len(trig_durations) else np.nan
+    mean_spon = float(np.mean(spon_durations)) if len(spon_durations) else np.nan
 
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.bar(["Triggered", "Spontaneous"], [mean_trig, mean_spon],
-           color=["red", "blue"], alpha=0.7)
-    ax.set_ylabel("Mean UP Duration (s)")
-    ax.set_title("Durchschnittliche Dauer von UP-States")
+    ax.bar(["Triggered", "Spontaneous"], [mean_trig, mean_spon], color=["red", "blue"], alpha=0.7)
+    ax.set_ylabel("Mean UP Dauer (s)")
+    ax.set_title("Durchschnittliche UP-Dauer")
     for i, val in enumerate([mean_trig, mean_spon]):
         if not np.isnan(val):
             ax.text(i, val, f"{val:.2f}s", ha="center", va="bottom", fontsize=9)

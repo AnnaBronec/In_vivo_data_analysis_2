@@ -95,11 +95,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
     print("Total_power stats:", np.min(Total_power), np.max(Total_power), np.isnan(Total_power).sum())
   
     Total_power_smooth = gaussian_filter1d(Total_power, sigma=2)  # glättet über ca. 5 Zeitschritte
-    
-    plt.plot(Total_power)
-    plt.title("Total Power (linear)")
-    plt.xlabel("Time")
-    plt.ylabel("Power")
+ 
 
     # Thresholding
     threshold = np.percentile(Total_power, 65)  # obere 25 % als UP-Zustand 
@@ -436,10 +432,7 @@ def extract_upstate_windows(UP_indices, LFP_array, dt, window_s):
             up_windows.append(window)
     return up_windows
 
-
 def compute_spectra(windows, dt, ignore_start_s=0.0):
-    print(f"⏩ compute_spectra schneidet {ignore_start_s} Sekunden = {int(ignore_start_s / dt)} Samples ab")
-
     spectra = []
     for trial in windows:
         trial = np.asarray(trial)
@@ -449,43 +442,17 @@ def compute_spectra(windows, dt, ignore_start_s=0.0):
         freqs, power = welch(trial, fs=1/dt, nperseg=min(256, len(trial)))
         spectra.append(power)
     return np.array(spectra), freqs
-    print("⏩ Ignoring first", ignore_start_s, "seconds =>", start_idx, "samples")
 
 
 
 
 def compare_spectra(pulse_windows, spont_windows, dt, ignore_start_s=0.0):
-
-    print(f"🚨 compare_spectra wurde aufgerufen mit ignore_start_s = {ignore_start_s}")
-
     pulse_spec, freqs = compute_spectra(pulse_windows, dt, ignore_start_s)
-    spont_spec, _ = compute_spectra(spont_windows, dt, ignore_start_s)
-
+    spont_spec, _     = compute_spectra(spont_windows, dt, ignore_start_s)
 
     pulse_mean = np.mean(pulse_spec, axis=0)
     spont_mean = np.mean(spont_spec, axis=0)
-    pulse_sem = np.std(pulse_spec, axis=0) / np.sqrt(pulse_spec.shape[0])
-    spont_sem = np.std(spont_spec, axis=0) / np.sqrt(spont_spec.shape[0])
-
-    t_vals, p_vals = ttest_ind(spont_spec, pulse_spec, axis=0)
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(freqs, spont_mean, label="Spontaneous", lw=2)
-    plt.fill_between(freqs, spont_mean - spont_sem, spont_mean + spont_sem, alpha=0.3)
-    plt.plot(freqs, pulse_mean, label="Pulse-triggered", lw=2)
-    plt.fill_between(freqs, pulse_mean - pulse_sem, pulse_mean + pulse_sem, alpha=0.3)
-    sig_mask = p_vals < 0.05
-    plt.plot(freqs[sig_mask], np.maximum(spont_mean, pulse_mean)[sig_mask], 'k.', label="p < 0.05")
-
-    plt.xlabel("Frequency (Hz)")
-    plt.ylabel("Power")
-    plt.legend()
-    plt.title("Mean Power Spectrum: Spontaneous vs. Pulse-triggered UP states")
-    plt.grid(True)
-    plt.draw()
-    plt.pause(0.001)   # winziger Event-Loop-Tick, Fenster wird sicher angezeigt
-
-
+    t_vals, p_vals = ttest_ind(spont_spec, pulse_spec, axis=0, equal_var=False, nan_policy='omit')
     return freqs, spont_mean, pulse_mean, p_vals
 
 def plot_contrast_heatmap(pulse_windows, spont_windows, dt):
@@ -495,21 +462,20 @@ def plot_contrast_heatmap(pulse_windows, spont_windows, dt):
     min_trials = min(len(pulse_spec), len(spont_spec))
     pulse_trim = pulse_spec[:min_trials]
     spont_trim = spont_spec[:min_trials]
-
     contrast = pulse_trim - spont_trim
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    im = ax.imshow(contrast, aspect='auto', origin='lower',
-                   extent=[freqs[0], freqs[-1], 0, min_trials], cmap='bwr', vmin=-np.max(np.abs(contrast)), vmax=np.max(np.abs(contrast)))
+    im = ax.imshow(
+        contrast, aspect='auto', origin='lower',
+        extent=[freqs[0], freqs[-1], 0, min_trials],
+        cmap='bwr', vmin=-np.max(np.abs(contrast)), vmax=np.max(np.abs(contrast))
+    )
     ax.set_title("Difference Heatmap: Pulse - Spontaneous UP Spectra")
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Trial")
     fig.colorbar(im, ax=ax, label="Power Difference")
-    plt.tight_layout()
-    plt.draw()
-    plt.pause(0.001)   # winziger Event-Loop-Tick, Fenster wird sicher angezeigt
-
-   
+    fig.tight_layout()
+    return fig
 
 
 def average_amplitude_in_upstates(main_channel, time_s, UP_start_i, DOWN_start_i, start_idx, end_idx):
