@@ -34,8 +34,17 @@ DOWNSAMPLE_FACTOR = 50
 HIGH_CUTOFF = 10
 LOW_CUTOFF  = 2
 
-BASE_PATH    = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/DRD cross/2017-8-9_13-52-30onePulse200msX20per15s"
-LFP_FILENAME = "2017-8-9_13-52-30onePulse200msX20per15s.csv"
+# --- Nur Defaults setzen, falls nicht vom Wrapper gesetzt ---
+# Beispiel-Default (beliebig lassen; wird im Batch sowieso überschrieben)
+_DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/DRD cross/2017-8-9_13-52-30onePulse200msX20per15s"
+
+BASE_PATH = globals().get("BASE_PATH", _DEFAULT_SESSION)
+# Wenn LFP_FILENAME nicht vorgegeben wurde: vom Ordnernamen ableiten
+if "LFP_FILENAME" in globals():
+    LFP_FILENAME = globals()["LFP_FILENAME"]
+else:
+    _base_tag = os.path.basename(os.path.normpath(BASE_PATH))
+    LFP_FILENAME = f"{_base_tag}.csv"
 
 # Alle Plots in denselben Ordner wie die Daten speichern
 SAVE_DIR = BASE_PATH
@@ -250,7 +259,7 @@ try:
     CSD_trig   = Generate_CSD_mean(Trig_Peaks,  LFP_array, dt)
     if (CSD_spont is not None and CSD_trig is not None and
         getattr(CSD_spont, "ndim", 0) == 2 and getattr(CSD_trig, "ndim", 0) == 2):
-        run_and_save(plot_CSD_comparison, "CSD_spont_vs_trig", CSD_spont, CSD_trig, dt)
+        run_and_save(plot_CSD_comparison, "CSD_spont_vs_trig", CSD_spont, CSD_trig, dt, dz_um=100.0, cmap="PiYG")
 except Exception as e:
     print("[WARN] CSD skipped:", e)
 
@@ -334,7 +343,9 @@ row = {
 }
 
 
-summary_path = os.path.join(os.path.dirname(BASE_PATH), "upstate_summary.csv")
+# eine Ebene höher: FOR ANNA IN VIVO
+summary_path = os.path.join(os.path.dirname(os.path.dirname(BASE_PATH)), "upstate_summary.csv")
+
 
 rows = []
 # Falls Datei existiert → einlesen

@@ -367,38 +367,81 @@ def Generate_CSD_mean(peaks_list, signal_array, dt):
         return np.full((signal_array.shape[0], int(1 / dt)), np.nan)
 
 
+#
+#def plot_CSD_comparison(CSD_spont, CSD_trig, dt, cmap="bwr",
+#                        save=False, hint="CSD_spont_vs_trig",
+#                        out_dir=None, show=True, close=False):
+#    fig, axes = plt.subplots(1, 2, figsize=(12, 6), sharey=True)#
+#
+#    im1 = axes[0].imshow(CSD_spont, aspect="auto", cmap=cmap, origin="lower",
+#                         extent=[0, CSD_spont.shape[1]*dt, 0, CSD_spont.shape[0]])
+#    axes[0].set_title("Spontaneous UP — CSD")
+#    axes[0].set_xlabel("Time (s)")
+#    axes[0].set_ylabel("Channel depth")
+#
+##    im2 = axes[1].imshow(CSD_trig, aspect="auto", cmap=cmap, origin="lower",
+          #               extent=[0, CSD_trig.shape[1]*dt, 0, CSD_trig.shape[0]])
+#    axes[1].set_title("Pulse-triggered UP — CSD")
+##    axes[1].set_xlabel("Time (s)")##
+#
+#    # gemeinsame Colorbar rechts außen
+#    fig.colorbar(im1, ax=axes, shrink=0.9, label="CSD (a.u.)",
+#                 location="right", anchor=(0, 0.5))
+##    fig.tight_layout(rect=[0, 0, 0.93, 1])##
+#
+ #   if save:
+#        _save_svg(fig, hint, out_dir=out_dir)#
 
-def plot_CSD_comparison(CSD_spont, CSD_trig, dt, cmap="bwr",
-                        save=False, hint="CSD_spont_vs_trig",
-                        out_dir=None, show=True, close=False):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6), sharey=True)
+#    if show:
+#        plt.draw()
+#        plt.pause(0.001)   # winziger Event-Loop-Tick, Fenster wird sicher angezeigt
 
-    im1 = axes[0].imshow(CSD_spont, aspect="auto", cmap=cmap, origin="lower",
-                         extent=[0, CSD_spont.shape[1]*dt, 0, CSD_spont.shape[0]])
-    axes[0].set_title("Spontaneous UP — CSD")
-    axes[0].set_xlabel("Time (s)")
-    axes[0].set_ylabel("Channel depth")
+ #   if close:
+   #     plt.close(fig)
+#
+ #   return fig
 
-    im2 = axes[1].imshow(CSD_trig, aspect="auto", cmap=cmap, origin="lower",
-                         extent=[0, CSD_trig.shape[1]*dt, 0, CSD_trig.shape[0]])
-    axes[1].set_title("Pulse-triggered UP — CSD")
-    axes[1].set_xlabel("Time (s)")
 
-    # gemeinsame Colorbar rechts außen
-    fig.colorbar(im1, ax=axes, shrink=0.9, label="CSD (a.u.)",
-                 location="right", anchor=(0, 0.5))
-    fig.tight_layout(rect=[0, 0, 0.93, 1])
+from scipy.ndimage import gaussian_filter
 
-    if save:
-        _save_svg(fig, hint, out_dir=out_dir)
+def plot_CSD_comparison(CSD_spont, CSD_trig, dt, dz_um=50.0,
+                              sigma_ch=0.8, sigma_t=0.4,  # Glättung: Kanäle, Zeit
+                              vmax_pct=98, cmap="seismic"):
+    """
+    Sauberer CSD-Plot: 2D-Glättung + robustes vlim + symmetrische Skala.
+    dz_um: Elektrodenabstand in µm (nur für Achsenbeschriftung).
+    """
+    # 1) leichte 2D-Glättung (Kanäle x Zeit)
+    CSDs = []
+    for M in (CSD_spont, CSD_trig):
+        if M is None or getattr(M, "ndim", 0) != 2:
+            CSDs.append(None); continue
+        M_sm = gaussian_filter(M, sigma=(sigma_ch, sigma_t), mode="nearest")
+        CSDs.append(M_sm)
 
-    if show:
-        plt.draw()
-        plt.pause(0.001)   # winziger Event-Loop-Tick, Fenster wird sicher angezeigt
+    CSD_spont_sm, CSD_trig_sm = CSDs
 
-    if close:
-        plt.close(fig)
+    # 2) robuste symmetrische Skala
+    stack = np.concatenate([np.abs(CSD_spont_sm).ravel(), np.abs(CSD_trig_sm).ravel()])
+    vmax = np.percentile(stack[~np.isnan(stack)], vmax_pct)
+    vmin = -vmax
 
+    # 3) Plot
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6), sharey=True, constrained_layout=True)
+    titles = ["Spontaneous UP — CSD", "Pulse-triggered UP — CSD"]
+    for ax, M, title in zip(axes, (CSD_spont_sm, CSD_trig_sm), titles):
+        im = ax.imshow(M, aspect="auto", origin="lower",
+                       extent=[0, M.shape[1]*dt, 0, M.shape[0]*dz_um/1000.0],  # Tiefe in mm
+                       cmap=cmap, vmin=vmin, vmax=vmax, interpolation="none")
+        ax.set_title(title)
+        ax.set_xlabel("Time (s)")
+        ax.set_xlim(0, M.shape[1]*dt)
+        ax.set_ylabel("Depth (mm)")
+        # optional: Isolinien für Struktur
+        cs = ax.contour(M, levels=7, colors="k", alpha=0.2,
+                        extent=[0, M.shape[1]*dt, 0, M.shape[0]*dz_um/1000.0], origin="lower")
+
+    cbar = fig.colorbar(im, ax=axes, shrink=0.9, label="CSD (a.u.)")
     return fig
 
 
