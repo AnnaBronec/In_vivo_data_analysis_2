@@ -30,8 +30,7 @@ import argparse
 import importlib
 import importlib.util
 import sys
-import csv   
-import pandas as pd
+import csv  
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime

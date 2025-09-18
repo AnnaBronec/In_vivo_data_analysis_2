@@ -15,6 +15,8 @@ from scipy.signal import find_peaks
 import scipy.stats as stats
 import os
 import random
+from scipy.ndimage import gaussian_filter
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt

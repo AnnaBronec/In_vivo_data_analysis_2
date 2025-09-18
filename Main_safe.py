@@ -264,7 +264,8 @@ except Exception as e:
     print("[WARN] CSD skipped:", e)
 
 # ============ RUN & SAVE – genau einmal pro Plot ============
-run_and_save(plot_all_channels, "all_channels", NUM_CHANNELS, time_s, LFP_array)
+
+#save(plot_all_channels, "all_channels", NUM_CHANNELS, time_s, LFP_array)
 
 run_and_save(
     plot_spont_up_mean, "spont_up_mean",
