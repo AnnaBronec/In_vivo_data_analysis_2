@@ -33,9 +33,6 @@ def load_lightpulses (base_path: str, filename: str):
 
 
 def load_LFP_from_CSC_csv(base_path, filename):
-    import pandas as pd
-    import numpy as np
-    import os
 
     filepath = os.path.join(base_path, filename)
     df = pd.read_csv(filepath)

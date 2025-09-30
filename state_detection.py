@@ -365,7 +365,7 @@ def Generate_CSD_mean(peaks_list, signal_array, dt):
     if len(all_csd) > 0:
         return np.nanmean(np.stack(all_csd), axis=0)
     else:
-        print("❌ Kein CSD berechnet – Rückgabe: Dummy mit NaNs")
+        print("Kein CSD berechnet – Rückgabe: Dummy mit NaNs")
         return np.full((signal_array.shape[0], int(1 / dt)), np.nan)
 
 
