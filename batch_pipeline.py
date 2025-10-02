@@ -67,34 +67,59 @@ def _import_attr(module: str | None, path: str | None, func: str, kind: str):
         raise ImportError(f"Failed to import {func} from module '{module}': {e}") from e
 
 # ---------- Discovery ----------
+_NEURALYNX_EXTS = {".ncs", ".nse", ".ntt", ".nst"}
 
-_NEURALYNX_EXTS = {".ncs", ".nse", ".ntt", ".nst"}  # .nsc ist Tippfehler; .ncs ist richtig
-
-def _looks_like_session_dir(p: Path) -> bool:
-    """Heuristik: Session-Ordner enthält mind. eine Neuralynx-Datei."""
-    if not p.is_dir():
-        return False
+def _has_neuralynx_raw(p: Path) -> bool:
     try:
         for f in p.iterdir():
             if f.is_file() and f.suffix.lower() in _NEURALYNX_EXTS:
                 return True
     except PermissionError:
-        return False
+        pass
     return False
 
+def _has_xdat_pair(p: Path) -> bool:
+    try:
+        for dp in p.glob("*_data.xdat"):
+            ts = dp.with_name(dp.stem.replace("_data", "_timestamp") + ".xdat")
+            if ts.is_file():
+                return True
+    except PermissionError:
+        pass
+    return False
+
+def _has_session_csv_exact(p: Path) -> bool:
+    return (p / f"{p.name}.csv").is_file()
+
+def _has_any_csv(p: Path) -> bool:
+    try:
+        return any(f.is_file() and f.suffix.lower()==".csv" for f in p.iterdir())
+    except PermissionError:
+        return False
+
+def _looks_like_session_dir(p: Path) -> bool:
+    if not p.is_dir():
+        return False
+    # Neuralynx ODER XDAT-Paar ODER eine passende/fertige CSV im Ordner
+    return _has_neuralynx_raw(p) or _has_xdat_pair(p) or _has_session_csv_exact(p) or _has_any_csv(p)
+
 def _find_sessions(root: Path, recursive: bool) -> list[Path]:
-    if not recursive:
-        # nur direkte Unterordner betrachten
-        return [d for d in root.iterdir() if _looks_like_session_dir(d)]
-    # rekursiv
-    out = []
-    for sub in root.rglob("*"):
-        if _looks_like_session_dir(sub):
-            out.append(sub)
-    # Duplikate vermeiden, falls verschachtelte Strukturen vorkommen
-    # (optional: nur leaf-Verzeichnisse)
+    out: list[Path] = []
+    if _looks_like_session_dir(root):
+        out.append(root)
+    if recursive:
+        for sub in root.rglob("*"):
+            if _looks_like_session_dir(sub):
+                out.append(sub)
+    else:
+        for d in root.iterdir():
+            if _looks_like_session_dir(d):
+                out.append(d)
     return sorted(set(out))
 
+
+
+   
 # ---------- CSV-Pfad ----------
 
 def _default_csv_for_session(session_dir: Path) -> Path:
@@ -115,6 +140,17 @@ def _process_one_session(
     """
     try:
         csv_path = Path(out_csv).expanduser().resolve() if out_csv else _default_csv_for_session(session_dir)
+        # Wenn wir eine bereits vorhandene CSV akzeptieren sollen, aber der Defaultname nicht existiert:
+        if skip_convert_if_exists and not csv_path.exists():
+            # nimm eine vorhandene CSV im Session-Ordner (falls genau eine da ist)
+            csvs = sorted([f for f in session_dir.iterdir() if f.is_file() and f.suffix.lower()==".csv"])
+            if len(csvs) == 1:
+                csv_path = csvs[0].resolve()
+            # wenn mehrere CSVs da sind, präferiere die mit Ordnernamen drin
+            elif len(csvs) > 1:
+                preferred = [f for f in csvs if session_dir.name in f.name]
+                if preferred:
+                    csv_path = preferred[0].resolve()
 
         # Step 1: Convert
         if skip_convert_if_exists and csv_path.exists():
@@ -142,6 +178,34 @@ def _process_one_session(
         return (session_dir.name, False, f"SystemExit {int(e.code)}")
     except Exception as e:
         return (session_dir.name, False, f"{type(e).__name__}: {e}")
+
+# # ---------- Discovery ----------
+
+# _NEURALYNX_EXTS = {".ncs", ".nse", ".ntt", ".nst"}  # Neuralynx-Dateiendungen
+
+# def _looks_like_session_dir(p: Path) -> bool:
+#     """Heuristik: Session-Ordner enthält mind. eine Neuralynx-Datei ODER schon eine CSV."""
+#     if not p.is_dir():
+#         return False
+#     try:
+#         has_neuralynx = any(f.is_file() and f.suffix.lower() in _NEURALYNX_EXTS for f in p.iterdir())
+#         has_csv       = any(f.is_file() and f.suffix.lower() == ".csv" for f in p.iterdir())
+#         return has_neuralynx or has_csv
+#     except PermissionError:
+#         return False
+
+# def _find_sessions(root: Path, recursive: bool) -> list[Path]:
+#     """Finde Session-Ordner unterhalb von root (rekursiv optional)."""
+#     if not recursive:
+#         return [d for d in root.iterdir() if _looks_like_session_dir(d)]
+#     out: list[Path] = []
+#     for sub in root.rglob("*"):
+#         if _looks_like_session_dir(sub):
+#             out.append(sub)
+#     # Duplikate/verschachtelte Mehrtreffer vermeiden
+#     return sorted(set(out))
+
+
 
 # ---------- Main ----------
 
