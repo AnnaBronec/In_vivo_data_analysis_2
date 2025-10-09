@@ -31,8 +31,10 @@ import importlib
 import importlib.util
 import sys
 import csv  
+import gc
+import matplotlib.pyplot as plt
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+#from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # ---------- Import-Helpers ----------
@@ -92,6 +94,7 @@ def _has_session_csv_exact(p: Path) -> bool:
     return (p / f"{p.name}.csv").is_file()
 
 def _has_any_csv(p: Path) -> bool:
+    # (ALT) NICHT MEHR VERWENDEN
     try:
         return any(f.is_file() and f.suffix.lower()==".csv" for f in p.iterdir())
     except PermissionError:
@@ -100,8 +103,14 @@ def _has_any_csv(p: Path) -> bool:
 def _looks_like_session_dir(p: Path) -> bool:
     if not p.is_dir():
         return False
-    # Neuralynx ODER XDAT-Paar ODER eine passende/fertige CSV im Ordner
-    return _has_neuralynx_raw(p) or _has_xdat_pair(p) or _has_session_csv_exact(p) or _has_any_csv(p)
+    # Session = Neuralynx-Rohdaten ODER XDAT-Paar ODER *gutes* Session-CSV
+    return (
+        _has_neuralynx_raw(p)
+        or _has_xdat_pair(p)
+        or _has_session_csv_exact(p)
+        or _has_any_good_csv(p)
+    )
+
 
 def _find_sessions(root: Path, recursive: bool) -> list[Path]:
     out: list[Path] = []
@@ -125,6 +134,26 @@ def _find_sessions(root: Path, recursive: bool) -> list[Path]:
 def _default_csv_for_session(session_dir: Path) -> Path:
     return (session_dir / f"{session_dir.name}.csv").resolve()
 
+# --- CSV-Auswahl: "gute" vs. auszuschließende CSVs ---
+_BAD_CSV_BASENAMES = {"upstate_summary.csv"}
+
+def _is_good_csv_file(p: Path, session_dir: Path) -> bool:
+    """True nur für CSVs, die als LFP-CSV taugen."""
+    if not p.is_file() or p.suffix.lower() != ".csv":
+        return False
+    name = p.name.lower()
+    # Alles mit *_summary*.csv ausschließen (inkl. upstate_summary.csv)
+    if name in _BAD_CSV_BASENAMES or name.endswith("_summary.csv"):
+        return False
+    return True
+
+def _has_any_good_csv(p: Path) -> bool:
+    try:
+        return any(_is_good_csv_file(f, p) for f in p.iterdir())
+    except PermissionError:
+        return False
+
+
 # ---------- Single-Job ----------
 
 def _process_one_session(
@@ -142,15 +171,22 @@ def _process_one_session(
         csv_path = Path(out_csv).expanduser().resolve() if out_csv else _default_csv_for_session(session_dir)
         # Wenn wir eine bereits vorhandene CSV akzeptieren sollen, aber der Defaultname nicht existiert:
         if skip_convert_if_exists and not csv_path.exists():
-            # nimm eine vorhandene CSV im Session-Ordner (falls genau eine da ist)
-            csvs = sorted([f for f in session_dir.iterdir() if f.is_file() and f.suffix.lower()==".csv"])
-            if len(csvs) == 1:
+            csvs = sorted([f for f in session_dir.iterdir() if _is_good_csv_file(f, session_dir)])
+            # 1) exakter Default-Name <Ordnername>.csv bevorzugt
+            preferred = [f for f in csvs if f.name == f"{session_dir.name}.csv"]
+            if preferred:
+                csv_path = preferred[0].resolve()
+            elif len(csvs) == 1:
                 csv_path = csvs[0].resolve()
-            # wenn mehrere CSVs da sind, präferiere die mit Ordnernamen drin
             elif len(csvs) > 1:
-                preferred = [f for f in csvs if session_dir.name in f.name]
+                # 2) sonst irgendwas, was den Ordnernamen im Stem trägt
+                preferred = [f for f in csvs if session_dir.name in f.stem]
                 if preferred:
                     csv_path = preferred[0].resolve()
+                # 3) andernfalls nimm die erste "gute" CSV – aber niemals *_summary.csv
+                else:
+                    csv_path = csvs[0].resolve()
+
 
         # Step 1: Convert
         if skip_convert_if_exists and csv_path.exists():
@@ -178,6 +214,151 @@ def _process_one_session(
         return (session_dir.name, False, f"SystemExit {int(e.code)}")
     except Exception as e:
         return (session_dir.name, False, f"{type(e).__name__}: {e}")
+
+def _process_one_session_subproc(
+    session_dir: Path,
+    converter_func,
+    wrapper_script_path: Path,   # Pfad zu analysis_wrapper.py
+    out_csv: str | None,
+    skip_convert_if_exists: bool,
+    dry_run: bool
+) -> tuple[str, bool, str]:
+    """
+    Wie _process_one_session, aber: Analyse läuft in einem *Subprozess*,
+    damit Speicher garantiert freikommt (ohne Threads).
+    Schreibt die Ausgabe des Subprozesses direkt durch (Realtime).
+    """
+    try:
+        csv_path = Path(out_csv).expanduser().resolve() if out_csv else _default_csv_for_session(session_dir)
+        if skip_convert_if_exists and not csv_path.exists():
+            csvs = sorted([f for f in session_dir.iterdir() if _is_good_csv_file(f, session_dir)])
+            # 1) exakter Default-Name <Ordnername>.csv bevorzugt
+            preferred = [f for f in csvs if f.name == f"{session_dir.name}.csv"]
+            if preferred:
+                csv_path = preferred[0].resolve()
+            elif len(csvs) == 1:
+                csv_path = csvs[0].resolve()
+            elif len(csvs) > 1:
+                # 2) sonst irgendwas, was den Ordnernamen im Stem trägt
+                preferred = [f for f in csvs if session_dir.name in f.stem]
+                if preferred:
+                    csv_path = preferred[0].resolve()
+                # 3) andernfalls nimm die erste "gute" CSV – aber niemals *_summary.csv
+                else:
+                    csv_path = csvs[0].resolve()
+
+
+        # 1) Konvertierung im Hauptprozess
+        if skip_convert_if_exists and csv_path.exists():
+            print(f"{session_dir.name}: [SKIP] CSV exists: {csv_path.name}")
+        else:
+            print(f"{session_dir.name}: [1/2] Convert -> {csv_path.name}")
+            if not dry_run:
+                converter_func(str(session_dir), str(csv_path) if out_csv else None)
+                if not csv_path.exists():
+                    fallback = _default_csv_for_session(session_dir)
+                    if fallback.exists():
+                        csv_path = fallback
+                    else:
+                        return (session_dir.name, False, "CSV not created")
+
+        # 2) Analyse im Subprozess — strikt Single-Thread und synchron
+        print(f"{session_dir.name}: [2/2] Analysis on {csv_path.name}")
+        if not dry_run:
+            import subprocess, sys, os
+            cmd = [
+                sys.executable,
+                str(wrapper_script_path),
+                str(session_dir),
+                "--lfp-filename", str(csv_path.name),
+            ]
+            # Umgebung für Kinderprozess: Threads auf 1
+            env = os.environ.copy()
+            env.update({
+                "OMP_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "VECLIB_MAXIMUM_THREADS": "1",
+                "NUMEXPR_NUM_THREADS": "1",
+                "BLIS_NUM_THREADS": "1",
+            })
+            # Live-Output durchreichen (keine Pufferung, einfacher zu debuggen)
+            cp = subprocess.run(cmd, env=env)
+            if cp.returncode != 0:
+                return (session_dir.name, False, f"SubprocessError: returncode={cp.returncode}")
+
+        return (session_dir.name, True, "OK (converted+analyzed)" if not dry_run else "DRY-RUN")
+
+    except SystemExit as e:
+        return (session_dir.name, False, f"SystemExit {int(e.code)}")
+    except Exception as e:
+        return (session_dir.name, False, f"{type(e).__name__}: {e}")
+
+
+# def _process_one_session_subproc(
+#     session_dir: Path,
+#     converter_func,
+#     wrapper_script_path: Path,   # Pfad zu analysis_wrapper.py
+#     out_csv: str | None,
+#     skip_convert_if_exists: bool,
+#     dry_run: bool
+# ) -> tuple[str, bool, str]:
+#     """
+#     Wie _process_one_session, aber: Analyse läuft in einem *Subprozess*,
+#     damit Speicher garantiert freikommt (ohne Threads).
+#     """
+#     try:
+#         csv_path = Path(out_csv).expanduser().resolve() if out_csv else _default_csv_for_session(session_dir)
+#         # Falls skip_convert_if_exists: vorhandene CSVs im Ordner respektieren
+#         if skip_convert_if_exists and not csv_path.exists():
+#             csvs = sorted([f for f in session_dir.iterdir() if f.is_file() and f.suffix.lower()==".csv"])
+#             if len(csvs) == 1:
+#                 csv_path = csvs[0].resolve()
+#             elif len(csvs) > 1:
+#                 preferred = [f for f in csvs if session_dir.name in f.name]
+#                 if preferred:
+#                     csv_path = preferred[0].resolve()
+
+#         # 1) Konvertierung
+#         if skip_convert_if_exists and csv_path.exists():
+#             msg = f"[SKIP] CSV exists: {csv_path.name}"
+#             print(f"{session_dir.name}: {msg}")
+#         else:
+#             print(f"{session_dir.name}: [1/2] Convert -> {csv_path.name}")
+#             if not dry_run:
+#                 converter_func(str(session_dir), str(csv_path) if out_csv else None)
+#                 # Fallback, falls Converter Standardnamen benutzt
+#                 if not csv_path.exists():
+#                     fallback = _default_csv_for_session(session_dir)
+#                     if fallback.exists():
+#                         csv_path = fallback
+#                     else:
+#                         return (session_dir.name, False, "CSV not created")
+
+#         # 2) Analyse (Subprozess, ruft analysis_wrapper.py als Skript auf)
+#         print(f"{session_dir.name}: [2/2] Analysis on {csv_path.name}")
+#         if not dry_run:
+#             import subprocess, sys
+#             cmd = [
+#                 sys.executable,
+#                 str(wrapper_script_path),
+#                 str(session_dir),             # base_path
+#                 "--lfp-filename", str(csv_path.name),
+#             ]
+#             cp = subprocess.run(cmd, capture_output=True, text=True)
+#             if cp.returncode != 0:
+#                 tail = (cp.stderr or cp.stdout or "").splitlines()
+#                 msg  = tail[-1] if tail else "subprocess failed"
+#                 return (session_dir.name, False, f"SubprocessError: {msg}")
+
+#         return (session_dir.name, True, "OK (converted+analyzed)" if not dry_run else "DRY-RUN")
+
+#     except SystemExit as e:
+#         return (session_dir.name, False, f"SystemExit {int(e.code)}")
+#     except Exception as e:
+#         return (session_dir.name, False, f"{type(e).__name__}: {e}")
+
+
 
 # # ---------- Discovery ----------
 
@@ -208,6 +389,34 @@ def _process_one_session(
 
 
 # ---------- Main ----------
+# === DROP-IN: speichersichere Batch-Version ===
+# Ergänze am Dateianfang:
+# import gc
+# import matplotlib.pyplot as plt
+
+def _teardown_memory():
+    """Schließt ALLE offenen Matplotlib-Figuren und stößt den GC an."""
+    try:
+        plt.close('all')
+    except Exception:
+        pass
+    gc.collect()
+
+def _run_one_session_with_teardown(
+    sess_path, converter_func, analysis_func,
+    out_csv, skip_convert_if_exists, dry_run
+):
+    """
+    Wrapper um _process_one_session, der GARANTIERT aufräumt – auch bei Exceptions.
+    Gibt exakt dieselbe Tripel-Rückgabe wie _process_one_session.
+    """
+    try:
+        return _process_one_session(
+            sess_path, converter_func, analysis_func,
+            out_csv, skip_convert_if_exists, dry_run
+        )
+    finally:
+        _teardown_memory()
 
 def main():
     ap = argparse.ArgumentParser(description="Batch convert+analyze all sessions in a folder.")
@@ -263,12 +472,13 @@ def main():
         print("[INFO] No sessions found.")
         sys.exit(0)
 
+    # (Optional) Master-Liste initial anlegen, so wie bisher
     summary_path = root / "upstate_summary.csv"
     rows = []
     for s in sessions:
         experiment_name = s.name
         parent_folder   = s.parent.name
-        row = {
+        rows.append({
             "Parent": parent_folder,
             "Experiment": experiment_name,
             "Dauer [s]": None,
@@ -286,14 +496,12 @@ def main():
             "Mean UP Dauer Triggered [s]": None,
             "Mean UP Dauer Spontaneous [s]": None,
             "Datum Analyse": None,
-        }
-        rows.append(row)
+        })
 
     with open(summary_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
-
     print(f"[INFO] Master-Liste geschrieben: {summary_path}")
 
     print(f"[INFO] Found {len(sessions)} session(s) under {root}")
@@ -305,24 +513,28 @@ def main():
         sys.exit(0)
 
     results = []
-    if args.max_workers and args.max_workers > 1:
-        with ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-            fut2sess = {
-                ex.submit(
-                    _process_one_session, s, converter_func, analysis_func,
-                    args.out_csv, args.skip_convert_if_exists, args.dry_run
-                ): s for s in sessions
-            }
-            for fut in as_completed(fut2sess):
-                results.append(fut.result())
-    else:
-        for s in sessions:
-            results.append(
-                _process_one_session(
-                    s, converter_func, analysis_func,
-                    args.out_csv, args.skip_convert_if_exists, args.dry_run
-                )
+
+    # --- IMMER SEQUENTIELL, ohne Threads ---
+    wrapper_path = Path(args.analysis_path).expanduser().resolve()
+    for s in sessions:
+        print(f"\n=== SESSION: {s} ===")
+        try:
+            res = _process_one_session_subproc(
+                s,
+                converter_func=converter_func,
+                wrapper_script_path=wrapper_path,
+                out_csv=args.out_csv,
+                skip_convert_if_exists=args.skip_convert_if_exists,
+                dry_run=args.dry_run,
             )
+        finally:
+            _teardown_memory()
+        results.append(res)
+
+    _teardown_memory()
+
+        
+ 
 
     # Summary
     ok = sum(1 for _, success, _ in results if success)

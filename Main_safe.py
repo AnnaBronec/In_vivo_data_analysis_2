@@ -41,7 +41,73 @@ HIGH_CUTOFF = 10
 LOW_CUTOFF  = 2
 
 
+def export_interactive_lfp_html(base_tag, save_dir, time_s, y,
+                                pulse_times_1=None, pulse_times_2=None,
+                                max_points=300_000,  # zur Sicherheit decimieren
+                                title="LFP (interaktiv)"):
+    """
+    Erstellt eine interaktive HTML mit Range-Slider und Zoom/Pan.
+    - time_s: 1D array (Sekunden)
+    - y:      1D array (LFP)
+    - pulse_times_*: Sekunden (optional)
+    - max_points: wenn Signal sehr lang ist -> decimieren
+    """
+    import plotly.graph_objects as go
+    from plotly.offline import plot as plotly_offline_plot
+    import os
 
+    t = np.asarray(time_s, dtype=float)
+    x = np.asarray(y, dtype=float)
+
+    # robustes Decimate (nur für die Darstellung, Daten bleiben unverändert)
+    if t.size > max_points:
+        step = int(np.ceil(t.size / max_points))
+        t = t[::step]
+        x = x[::step]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=t, y=x, mode="lines", name="LFP"))
+
+    # Puls-Linien als „Shapes“, damit sie nicht in die y-Skalierung reinpfuschen
+    shapes = []
+    def _add_pulses(ts, dash):
+        if ts is None or len(ts) == 0:
+            return
+        # ausdünnen, wenn seeehr viele Pulse
+        tt = np.asarray(ts, float)
+        if tt.size > 1200:
+            tt = tt[::int(np.ceil(tt.size/1200))]
+        for p in tt:
+            shapes.append(dict(
+                type="line",
+                x0=float(p), x1=float(p),
+                y0=0, y1=1,                  # relative y (0..1)
+                xref="x", yref="paper",
+                opacity=0.35,                # <-- HIER (Top-Level)
+                line=dict(width=1, dash=dash, color="red")
+            ))
+
+    _add_pulses(pulse_times_1, "dot")
+    _add_pulses(pulse_times_2, "dash")
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(title="Zeit (s)", rangeslider=dict(visible=True)),
+        yaxis=dict(title="LFP (a.u.)"),
+        shapes=shapes,
+        margin=dict(l=60, r=20, t=50, b=50),
+        template="plotly_white",
+    )
+
+    out_html = os.path.join(save_dir, f"{base_tag}__lfp_interactive.html")
+    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    print(f"[HTML] interaktiver LFP-Plot: {out_html}")
+    return out_html
+
+
+# === GANZ OBEN (nach Imports / Parametern) ===
+# Stelle das auf deine XDAT-Samplingrate ein:
+DEFAULT_FS_XDAT = 32000.0   # <-- ggf. 30000.0, 20000.0, 1000.0 etc.
 
 # --- Defaults (werden vom Wrapper überschrieben) ---
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/DRD cross/2017-8-9_13-52-30onePulse200msX20per15s"
@@ -63,76 +129,138 @@ time_full = LFP_df["time"].to_numpy(float)
 print("[INFO] CSV rows:", len(LFP_df),
       "time range:", float(LFP_df["time"].iloc[0]), "->", float(LFP_df["time"].iloc[-1]))
 
-# ... nach dem Downsampling:
-# time_s, dt, LFP_array, ...
-try:
-    _save_all_channels_svg_from_array(
-        time_s, LFP_array,
-        [f"pri_{i}" for i in range(NUM_CHANNELS)],
-        os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_DS.svg"),
-        max_points=50000,
-        overlay=False
-    )
-except Exception as e:
-    print("[ALL-CH][DS] skip:", e)
 
 
-def save_all_channels_stacked_svg(
-    out_svg_path,
-    time_s,
-    X,                     # shape: (n_channels, n_samples)
-    ch_names=None,         # Liste mit Kanalnamen, optional
-    height_per_channel=0.4,# Inch pro Kanal -> steuert „füllt die Seite“
-    width_in=12.0,         # Seitenbreite in Inch
-    lw=0.6                 # Liniendicke
-):
-    """
-    Zeichnet alle Kanäle gestapelt (0,1,2,...), normiert pro Kanal,
-    füllt dank dynamischer Figure-Höhe die Seite.
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
+# def _is_quasi_binary_trace(x):
+#     x = np.asarray(x, float)
+#     x = x[np.isfinite(x)]
+#     if x.size < 10:
+#         return False
+#     vals, counts = np.unique(np.round(x, 3), return_counts=True)
+#     if len(vals) <= 4:
+#         return True
+#     p01 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
+#     return p01 >= 0.95
 
-    X = np.asarray(X)
-    assert X.ndim == 2, "X muss (n_channels, n_samples) sein"
-    n_ch, n_s = X.shape
-    if ch_names is None or len(ch_names) != n_ch:
-        ch_names = [f"ch{i:02d}" for i in range(n_ch)]
+# def _line_noise_ratio(x, fs):
+#     f, Pxx = welch(np.nan_to_num(x, nan=0.0), fs=fs, nperseg=min(len(x), 4096))
+#     def bp(f1,f2):
+#         m = (f>=f1) & (f<=f2)
+#         return float(np.trapz(Pxx[m], f[m])) if m.any() else 0.0
+#     total = bp(0.5, 120.0)
+#     line  = bp(49.0, 51.0)
+#     return line / (total + 1e-12)
 
-    # --- pro Kanal robust normalisieren (Z-Score, NaN-sicher)
-    Xn = X.copy().astype(float)
-    for i in range(n_ch):
-        xi = Xn[i]
-        m  = np.nanmedian(xi)
-        s  = np.nanstd(xi)
-        if not np.isfinite(s) or s == 0:
-            s = 1.0
-        Xn[i] = (xi - m) / s
+# fs = 1.0 / dt
+# reasons = []
 
-    # --- Offsets 0..n-1 -> füllt vertikal schön auf
-    offsets = np.arange(n_ch).astype(float)
-    Y = Xn + offsets[:, None]
+# for i in range(LFP_array.shape[0]):
+#     x = LFP_array[i]
+#     finite = np.isfinite(x)
+#     if finite.mean() < 0.95:
+#         bad_idx.add(i); reasons.append((i, "zu viele NaNs")); continue
+#     std = np.nanstd(x)
+#     if not np.isfinite(std) or std == 0:
+#         bad_idx.add(i); reasons.append((i, "konstant/0-Std")); continue
+#     if _is_quasi_binary_trace(x):
+#         bad_idx.add(i); reasons.append((i, "quasi-binär")); continue
+#     z = (x - np.nanmedian(x)) / (std if std else 1.0)
+#     if np.mean(np.abs(z) > 8) > 0.02:
+#         bad_idx.add(i); reasons.append((i, "Artefakte (>2% |z|>8)")); continue
+#     if _line_noise_ratio(x, fs) > 0.3:
+#         bad_idx.add(i); reasons.append((i, "50Hz-dominant")); continue
 
-    # --- Figure-Größe dynamisch nach Kanalzahl
-    height_in = max(2.5, n_ch * height_per_channel)  # mind. etwas Platz
-    fig, ax = plt.subplots(figsize=(width_in, height_in))
+# # Optional: Manuelle Whitelist/Blacklist
+# MANUAL_KEEP = None   # z.B. [2,3,5]
+# MANUAL_DROP = None   # z.B. [14,17]
+# if MANUAL_DROP:
+#     for j in MANUAL_DROP: bad_idx.add(int(j))
+# if MANUAL_KEEP:
+#     bad_idx = {j for j in bad_idx if j not in set(map(int, MANUAL_KEEP))}
 
-    # --- Plot
-    ax.plot(time_s, Y.T, lw=lw)
+# good_idx = [j for j in range(LFP_array.shape[0]) if j not in bad_idx]
+# if len(good_idx) < 2:
+#     print("[CHAN-FILTER][WARN] zu wenige 'gute' Kanäle – benutze alle.")
+#     good_idx = list(range(LFP_array.shape[0]))
 
-    # --- Achsen & Limits so setzen, dass es „aufgeht“
-    ax.set_xlim(float(time_s[0]), float(time_s[-1]))
-    ax.set_ylim(-0.5, n_ch - 0.5)           # genau über/unter ersten/letzten Offset
-    ax.set_yticks(offsets)
-    ax.set_yticklabels(ch_names, fontsize=8)
-    ax.set_xlabel("Zeit (s)")
-    ax.set_ylabel("Kanal")
-    ax.set_title(f"Alle Kanäle (gestapelt, z-normiert) — {n_ch} Kanäle")
+# LFP_array_good = LFP_array[good_idx, :]
+# ch_names_good  = [f"pri_{j}" for j in good_idx]
 
-    # hübscher Abstand
-    fig.tight_layout()
-    fig.savefig(out_svg_path, format="svg")
-    plt.close(fig)
+# if reasons:
+#     print("[CHAN-FILTER] excluded:", ", ".join([f"pri_{j}({r})" for j, r in reasons]))
+# print(f"[CHAN-FILTER] kept {len(good_idx)}/{NUM_CHANNELS} Kanäle:", ch_names_good[:10], ("..." if len(good_idx)>10 else ""))
+
+# ========= CSD & Multi-Channel-Plots NUR mit guten Kanälen =========
+# CSD_spont = CSD_trig = None
+# if NUM_CHANNELS_GOOD >= 7:
+#     try:
+#         Trig_Peaks = Up.get("Trig_Peaks", np.array([], float))
+#         CSD_spont  = Generate_CSD_mean(Spon_Peaks, LFP_array_good, dt)
+#         CSD_trig   = Generate_CSD_mean(Trig_Peaks,  LFP_array_good, dt)
+#     except Exception as e:
+#         print("[WARN] CSD skipped:", e)
+# else:
+#     print(f"[INFO] CSD skipped: only {NUM_CHANNELS_GOOD} good channels (<7).")
+
+# Und auch die Kanal-SVGs besser mit den guten:
+
+
+# def save_all_channels_stacked_svg(
+#     out_svg_path,
+#     time_s,
+#     X,                     # shape: (n_channels, n_samples)
+#     ch_names=None,         # Liste mit Kanalnamen, optional
+#     height_per_channel=0.4,# Inch pro Kanal -> steuert „füllt die Seite“
+#     width_in=12.0,         # Seitenbreite in Inch
+#     lw=0.6                 # Liniendicke
+# ):
+#     """
+#     Zeichnet alle Kanäle gestapelt (0,1,2,...), normiert pro Kanal,
+#     füllt dank dynamischer Figure-Höhe die Seite.
+#     """
+#     import numpy as np
+#     import matplotlib.pyplot as plt
+
+#     X = np.asarray(X)
+#     assert X.ndim == 2, "X muss (n_channels, n_samples) sein"
+#     n_ch, n_s = X.shape
+#     if ch_names is None or len(ch_names) != n_ch:
+#         ch_names = [f"ch{i:02d}" for i in range(n_ch)]
+
+#     # --- pro Kanal robust normalisieren (Z-Score, NaN-sicher)
+#     Xn = X.copy().astype(float)
+#     for i in range(n_ch):
+#         xi = Xn[i]
+#         m  = np.nanmedian(xi)
+#         s  = np.nanstd(xi)
+#         if not np.isfinite(s) or s == 0:
+#             s = 1.0
+#         Xn[i] = (xi - m) / s
+
+#     # --- Offsets 0..n-1 -> füllt vertikal schön auf
+#     offsets = np.arange(n_ch).astype(float)
+#     Y = Xn + offsets[:, None]
+
+#     # --- Figure-Größe dynamisch nach Kanalzahl
+#     height_in = max(2.5, n_ch * height_per_channel)  # mind. etwas Platz
+#     fig, ax = plt.subplots(figsize=(width_in, height_in))
+
+#     # --- Plot
+#     ax.plot(time_s, Y.T, lw=lw)
+
+#     # --- Achsen & Limits so setzen, dass es „aufgeht“
+#     ax.set_xlim(float(time_s[0]), float(time_s[-1]))
+#     ax.set_ylim(-0.5, n_ch - 0.5)           # genau über/unter ersten/letzten Offset
+#     ax.set_yticks(offsets)
+#     ax.set_yticklabels(ch_names, fontsize=8)
+#     ax.set_xlabel("Zeit (s)")
+#     ax.set_ylabel("Kanal")
+#     ax.set_title(f"Alle Kanäle (gestapelt, z-normiert) — {n_ch} Kanäle")
+
+#     # hübscher Abstand
+#     fig.tight_layout()
+#     fig.savefig(out_svg_path, format="svg")
+#     plt.close(fig)
 
 
 
@@ -161,75 +289,6 @@ def _decimate_xy(x, Y, max_points=40000):
         return x, Y
     step = int(np.ceil(len(x) / max_points))
     return x[::step], Y[:, ::step]
-
-def _save_all_channels_svg_from_df(df, out_path, *, max_points=40000, overlay=False):
-    import numpy as np, matplotlib.pyplot as plt, os
-    assert "time" in df.columns, "CSV braucht eine Spalte 'time'."
-    cols = [c for c in df.columns if c != "time"]
-    if not cols:
-        print("[ALL-CH][RAW] keine Kanalspalten gefunden"); return
-    t = df["time"].to_numpy(dtype=float)
-    X = np.vstack([pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float) for c in cols])
-
-    t, X = _decimate_xy(t, X, max_points=max_points)
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-    if overlay:
-        # alle überlagert
-        for i in range(X.shape[0]):
-            ax.plot(t, X[i], lw=0.6, alpha=0.7)
-        ax.set_title(f"Alle Kanäle (overlaid) — {len(cols)} Kanäle")
-    else:
-        # gestapelt mit Offsets (lesbarer)
-        # Skala aus Median-Std ableiten
-        med_std = np.nanmedian(np.nanstd(X, axis=1)) or 1.0
-        spacing = 100 * med_std
-        for i in range(X.shape[0]):
-            ax.plot(t, X[i] + i*spacing, lw=0.6)
-        ax.set_yticks([i*spacing for i in range(X.shape[0])])
-        ax.set_yticklabels([f"ch{i:02d}" for i in range(X.shape[0])])
-        ax.set_title(f"Alle Kanäle (gestapelt) — {len(cols)} Kanäle")
-
-    ax.set_xlabel("Zeit (s)")
-    ax.set_ylabel("Amplitude (a.u.)")
-    ax.grid(True, alpha=0.2)
-    fig.tight_layout()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig.savefig(out_path, format="svg")
-    plt.close(fig)
-    print(f"[ALL-CH][RAW] saved: {out_path}")
-
-def _save_all_channels_svg_from_array(time_s, LFP_array, labels, out_path, *, max_points=40000, overlay=False):
-    import numpy as np, matplotlib.pyplot as plt, os
-    time_s = np.asarray(time_s, dtype=float)
-    X = np.asarray(LFP_array, dtype=float)
-    assert X.ndim == 2 and X.shape[1] == time_s.size, "Shape mismatch LFP_array/time_s"
-    t, X = _decimate_xy(time_s, X, max_points=max_points)
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-    if overlay:
-        for i in range(X.shape[0]):
-            ax.plot(t, X[i], lw=0.6, alpha=0.7)
-        ax.set_title(f"Alle Kanäle (downsampled, overlaid) — {X.shape[0]} Kanäle")
-    else:
-        med_std = np.nanmedian(np.nanstd(X, axis=1)) or 1.0
-        spacing = 3.5 * med_std
-        for i in range(X.shape[0]):
-            ax.plot(t, X[i] + i*spacing, lw=0.6)
-        ax.set_yticks([i*spacing for i in range(X.shape[0])])
-        ax.set_yticklabels(labels if labels else [f"ch{i:02d}" for i in range(X.shape[0])])
-        ax.set_title(f"Alle Kanäle (downsampled, gestapelt) — {X.shape[0]} Kanäle")
-
-    ax.set_xlabel("Zeit (s)")
-    ax.set_ylabel("Amplitude (a.u.)")
-    ax.grid(True, alpha=0.2)
-    fig.tight_layout()
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig.savefig(out_path, format="svg")
-    plt.close(fig)
-    print(f"[ALL-CH][DS] saved: {out_path}")
-
-
 
 # ========= Pulses (inkl. Auto-Detect) =========
 pulse_times_1_full = np.array([], dtype=float)
@@ -311,6 +370,30 @@ for i, col in enumerate(chan_cols):
     LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
 NUM_CHANNELS = len(chan_cols)
 
+def _name_to_idx(name, chan_cols_local=None, num_channels=None):
+    # pri_7 -> 7
+    if isinstance(name, str) and name.startswith("pri_"):
+        try:
+            i = int(name.split("_", 1)[1])
+            return i if num_channels is None or (0 <= i < num_channels) else None
+        except Exception:
+            pass
+    # Originalspaltennamen -> Position in chan_cols
+    if chan_cols_local is None:
+        try:
+            chan_cols_local = chan_cols  # falls im selben Scope vorhanden
+        except NameError:
+            chan_cols_local = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
+    try:
+        i = chan_cols_local.index(name)
+        return i if num_channels is None or (0 <= i < num_channels) else None
+    except ValueError:
+        return None
+
+
+#name_to_idx = {col: i for i, col in enumerate(chan_cols)}  # chan_cols stammt aus deinem Build der pri_i
+
+
 # ========= Downsample =========
 time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(
     DOWNSAMPLE_FACTOR, LFP_df_ds, NUM_CHANNELS,
@@ -318,6 +401,29 @@ time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(
     pulse_times_2=pulse_times_2_full,
     snap_pulses=True
 )
+# ----- NACH dem Downsampling -----
+# time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(...)
+
+# Wenn dt offensichtlich "Samples" ist (z.B. 50), rechne in Sekunden um:
+if dt > 1.0:  # dt in SAMPLES -> Sekunden
+    dt = dt / DEFAULT_FS_XDAT
+
+# Falls der Zeitvektor noch wie "Samples" aussieht (sehr große Zahlen),
+# ebenfalls auf Sekunden bringen:
+if np.nanmax(time_s) > 1e6:
+    time_s = time_s / DEFAULT_FS_XDAT
+
+# Pulszeiten ebenfalls normalisieren (falls noch in Samples)
+if (pulse_times_1 is not None) and (len(pulse_times_1) > 0) and (np.nanmax(pulse_times_1) > 1e6):
+    pulse_times_1 = pulse_times_1 / DEFAULT_FS_XDAT
+if (pulse_times_2 is not None) and (len(pulse_times_2) > 0) and (np.nanmax(pulse_times_2) > 1e6):
+    pulse_times_2 = pulse_times_2 / DEFAULT_FS_XDAT
+
+print(f"[DS][FIXED] dt={dt:.9f} s, Nyquist={0.5/dt:.3f} Hz, "
+      f"time_s: {float(time_s[0]):.3f}->{float(time_s[-1]):.3f} s")
+
+
+
 assert LFP_array.shape[0] == NUM_CHANNELS
 assert LFP_array.shape[1] == len(time_s)
 print(f"[DS] time {time_s[0]:.3f}->{time_s[-1]:.3f}s, N={len(time_s)}, dt={dt:.6f}s, "
@@ -332,17 +438,17 @@ print(f"[DS] time {time_s[0]:.3f}->{time_s[-1]:.3f}s, N={len(time_s)}, dt={dt:.6
 ch_names_for_plot = [f"pri_{i}" for i in range(LFP_array.shape[0])]
 svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED.svg")
 
-# Seite „füttern“: 0.4–0.6 inch pro Kanal sind meist gut.
-save_all_channels_stacked_svg(
-    svg_path,
-    time_s,
-    LFP_array,
-    ch_names=ch_names_for_plot,
-    height_per_channel=0.5,   # -> mehr/ weniger vertikaler Platz pro Kanal
-    width_in=12.0,
-    lw=0.6
-)
-print("[SVG] all channels stacked:", svg_path)
+# # Seite „füttern“: 0.4–0.6 inch pro Kanal sind meist gut.
+# save_all_channels_stacked_svg(
+#     svg_path,
+#     time_s,
+#     LFP_array,
+#     ch_names=ch_names_for_plot,
+#     height_per_channel=0.5,   # -> mehr/ weniger vertikaler Platz pro Kanal
+#     width_in=12.0,
+#     lw=0.6
+# )
+# print("[SVG] all channels stacked:", svg_path)
 
 
 # ========= Stimulus-Fenster bestimmen & ALLES croppen =========
@@ -370,7 +476,23 @@ if win is not None:
     # Zeit/Signale croppen (ALLE synchron!)
     time_s       = time_s[i0:i1]
     LFP_array    = LFP_array[:, i0:i1]
-    main_channel = LFP_array[0, :]  # falls du später einen anderen Hauptkanal willst, setz das nach get_main_channel
+    # main_channel = LFP_array[0, :]  # falls du später einen anderen Hauptkanal willst, setz das nach get_main_channel
+
+    # === Hauptkanal festlegen (hier: fix Kanal 10) ===
+    ch_idx = 10
+    if ch_idx < 0 or ch_idx >= NUM_CHANNELS:
+        raise ValueError(f"Channel {ch_idx} existiert nicht (nur {NUM_CHANNELS} Kanäle vorhanden).")
+
+    main_channel = LFP_array[ch_idx, :]
+    print(f"[INFO] main_channel = pri_{ch_idx}, len={len(main_channel)}, time_len={len(time_s)}")
+    
+        # Interaktiver Plot (gesamtes Signal)
+    export_interactive_lfp_html(
+        BASE_TAG, SAVE_DIR, time_s, main_channel,
+        pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
+        max_points=300_000,  # ggf. erhöhen/verringern
+        title=f"{BASE_TAG} — Main LFP (interaktiv)"
+    )
 
     # Pulse-Zeiten aufs Fenster begrenzen (Sekunden bleiben Sekunden)
     if pulse_times_1 is not None:
@@ -382,31 +504,91 @@ if win is not None:
 else:
     print("[CROP] no pulses -> no cropping")
 
+        # auch ohne Crop: main_channel definieren
+    ch_idx = 10
+    if ch_idx < 0 or ch_idx >= NUM_CHANNELS:
+        raise ValueError(f"Channel {ch_idx} existiert nicht (nur {NUM_CHANNELS} Kanäle vorhanden).")
+    main_channel = LFP_array[ch_idx, :]
+    print(f"[INFO] main_channel = pri_{ch_idx}, len={len(main_channel)}, time_len={len(time_s)}")
 
-# === Preprocess + Spectrogram (robust gegen falsche Kanal-Indizes) ===
+
+
+# ========= Kanal-Qualitätsfilter (nach Cropping/No-Crop, dt & LFP_array vorhanden) =========
+from scipy.signal import welch
+
+bad_idx, reasons = set(), []
+fs = 1.0 / dt
+
+# Stim-ähnliche Kanäle optional vorab ausschließen:
+stim_idx = []
+for s in stim_like_cols:
+    i = _name_to_idx(s, num_channels=NUM_CHANNELS)
+    if i is not None:
+        stim_idx.append(i)
+bad_idx.update(stim_idx)
+
+def _is_quasi_binary_trace(x):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size < 10:
+        return False
+    vals = np.unique(np.round(x, 3))
+    if len(vals) <= 4:
+        return True
+    p01 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
+    return p01 >= 0.95
+
+def _line_noise_ratio(x, fs):
+    f, Pxx = welch(np.nan_to_num(x, nan=0.0), fs=fs, nperseg=min(len(x), 4096))
+    def bp(f1, f2):
+        m = (f>=f1) & (f<=f2)
+        return float(np.trapz(Pxx[m], f[m])) if m.any() else 0.0
+    total = bp(0.5, 120.0)
+    line  = bp(49.0, 51.0)
+    return line / (total + 1e-12)
+
+for i in range(LFP_array.shape[0]):
+    if i in bad_idx:
+        continue
+    x = LFP_array[i]
+    finite = np.isfinite(x)
+    if finite.mean() < 0.95:
+        bad_idx.add(i); reasons.append((i, "zu viele NaNs")); continue
+    std = np.nanstd(x)
+    if not np.isfinite(std) or std == 0:
+        bad_idx.add(i); reasons.append((i, "konstant/0-Std")); continue
+    if _is_quasi_binary_trace(x):
+        bad_idx.add(i); reasons.append((i, "quasi-binär")); continue
+    z = (x - np.nanmedian(x)) / (std if std else 1.0)
+    if np.mean(np.abs(z) > 8) > 0.02:
+        bad_idx.add(i); reasons.append((i, "Artefakte (>2% |z|>8)")); continue
+    if _line_noise_ratio(x, fs) > 0.3:
+        bad_idx.add(i); reasons.append((i, "50Hz-dominant")); continue
+
+# Optional: manuelle Whitelist/Blacklist
+MANUAL_KEEP = None
+MANUAL_DROP = None
+if MANUAL_DROP:
+    for j in MANUAL_DROP:
+        bad_idx.add(int(j))
+if MANUAL_KEEP:
+    bad_idx = {j for j in bad_idx if j not in set(map(int, MANUAL_KEEP))}
+
+good_idx = [j for j in range(NUM_CHANNELS) if j not in bad_idx]
+if len(good_idx) < 2:
+    print("[CHAN-FILTER][WARN] zu wenige 'gute' Kanäle – benutze alle.")
+    good_idx = list(range(NUM_CHANNELS))
+
+LFP_array_good    = LFP_array[good_idx, :]
+ch_names_good     = [f"pri_{j}" for j in good_idx]
+NUM_CHANNELS_GOOD = len(good_idx)
+
+if reasons:
+    print("[CHAN-FILTER] excluded:", ", ".join([f"pri_{j}({r})" for j, r in reasons]))
+print(f"[CHAN-FILTER] kept {NUM_CHANNELS_GOOD}/{NUM_CHANNELS} Kanäle:", ch_names_good[:10], ("..." if NUM_CHANNELS_GOOD>10 else ""))
+
+
 b_lp, a_lp, b_hp, a_hp = filtering(HIGH_CUTOFF, LOW_CUTOFF, dt)
-
-# === Hauptkanal sicher nach dem Cropping bestimmen ===
-try:
-    mc = get_main_channel(DOWNSAMPLE_FACTOR, LFP_df_ds, NUM_CHANNELS)
-except Exception as e:
-    print(f"[WARN] get_main_channel failed ({e}) -> fallback to channel 0")
-    mc = 0
-
-# Wichtig: Hauptkanal IMMER aus dem (gecroppten) LFP_array nehmen
-if np.isscalar(mc):
-    ch_idx = int(mc)
-    if not (0 <= ch_idx < NUM_CHANNELS):
-        ch_idx = max(0, min(NUM_CHANNELS - 1, ch_idx))
-else:
-    # Falls get_main_channel ein Array zurückgegeben hat: ignorieren
-    # und den variantenstärksten Kanal im JETZTIGEN (gecroppten) Array wählen
-    ch_idx = int(np.nanargmax(np.nanvar(LFP_array, axis=1))) if NUM_CHANNELS > 1 else 0
-
-main_channel = LFP_array[ch_idx, :]
-print(f"[INFO] main_channel from cropped LFP_array, ch_idx={ch_idx}, len={len(main_channel)}, time_len={len(time_s)}")
-
-
 
 
 print(f"[INFO] NUM_CHANNELS={NUM_CHANNELS}, main_channel_len={len(main_channel)}")
@@ -526,8 +708,8 @@ up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", Non
 print("[COUNTS] sponUP:", len(Spontaneous_UP), " trigUP:", len(Pulse_triggered_UP), " assocUP:", len(Pulse_associated_UP))
 
 # ========= Extras für Plots =========
-pulse_windows = extract_upstate_windows(Pulse_triggered_UP, LFP_array, dt, window_s=1.0)
-spont_windows = extract_upstate_windows(Spontaneous_UP,    LFP_array, dt, window_s=1.0)
+pulse_windows = extract_upstate_windows(Pulse_triggered_UP, main_channel[None, :], dt, window_s=1.0)
+spont_windows = extract_upstate_windows(Spontaneous_UP, main_channel[None, :], dt, window_s=1.0)
 freqs = spont_mean = pulse_mean = p_vals = None
 try:
     freqs, spont_mean, pulse_mean, p_vals = compare_spectra(
@@ -540,8 +722,17 @@ CSD_spont = CSD_trig = None
 if NUM_CHANNELS >= 7:
     try:
         Trig_Peaks = Up.get("Trig_Peaks", np.array([], float))
-        CSD_spont  = Generate_CSD_mean(Spon_Peaks, LFP_array, dt)
-        CSD_trig   = Generate_CSD_mean(Trig_Peaks,  LFP_array, dt)
+        CSD_spont = CSD_trig = None
+        if NUM_CHANNELS_GOOD >= 7:
+            try:
+                Trig_Peaks = Up.get("Trig_Peaks", np.array([], float))
+                CSD_spont  = Generate_CSD_mean(Spon_Peaks, LFP_array_good, dt)
+                CSD_trig   = Generate_CSD_mean(Trig_Peaks,  LFP_array_good, dt)
+            except Exception as e:
+                print("[WARN] CSD skipped:", e)
+        else:
+            print(f"[INFO] CSD skipped: only {NUM_CHANNELS_GOOD} good channels (<7).")
+
     except Exception as e:
         print("[WARN] CSD skipped:", e)
 else:
@@ -555,11 +746,11 @@ if freqs is not None and pulse_mean is not None:
     pd.DataFrame({"freq": freqs, "power": pulse_mean}).to_csv(
         os.path.join(SAVE_DIR, "spectrum_trig.csv"), index=False)
 
-# nach Generate_CSD_mean(...)
-if isinstance(CSD_spont, np.ndarray):
-    np.save(os.path.join(SAVE_DIR, "csd_spont.npy"), CSD_spont)
-if isinstance(CSD_trig, np.ndarray):
-    np.save(os.path.join(SAVE_DIR, "csd_trig.npy"), CSD_trig)
+# # nach Generate_CSD_mean(...)
+# if isinstance(CSD_spont, np.ndarray):
+#     np.save(os.path.join(SAVE_DIR, "csd_spont.npy"), CSD_spont)
+# if isinstance(CSD_trig, np.ndarray):
+#     np.save(os.path.join(SAVE_DIR, "csd_trig.npy"), CSD_trig)
 
 
 
@@ -714,38 +905,38 @@ def Total_power_plot_ax(Spect_dat, Total_power=None, ax=None, title="Gesamtleist
     return fig
 
 
-def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=0.05, ax=None):
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8,3))
-    else:
-        fig = ax.figure
+# def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=0.05, ax=None):
+#     if ax is None:
+#         fig, ax = plt.subplots(figsize=(8,3))
+#     else:
+#         fig = ax.figure
 
-    # Robustheit
-    if freqs is None or spont_mean is None or pulse_mean is None or len(freqs) == 0:
-        ax.text(0.5, 0.5, "no spectra", ha="center", va="center", transform=ax.transAxes)
-        return fig
+#     # Robustheit
+#     if freqs is None or spont_mean is None or pulse_mean is None or len(freqs) == 0:
+#         ax.text(0.5, 0.5, "no spectra", ha="center", va="center", transform=ax.transAxes)
+#         return fig
 
-    ax.plot(freqs, spont_mean, label="Spontan", lw=2)
-    ax.plot(freqs, pulse_mean, label="Getriggert", lw=2)
+#     ax.plot(freqs, spont_mean, label="Spontan", lw=2)
+#     ax.plot(freqs, pulse_mean, label="Getriggert", lw=2)
 
-    # Signifikanz-Bänder (optional)
-    import numpy as np
-    if p_vals is not None and np.size(p_vals) == np.size(freqs):
-        sig = (p_vals < alpha)
-        if np.any(sig):
-            idx = np.where(sig)[0]
-            start = idx[0]
-            for i in range(1, len(idx) + 1):
-                if i == len(idx) or idx[i] != idx[i-1] + 1:
-                    ax.axvspan(freqs[start], freqs[idx[i-1]], alpha=0.12)
-                    if i < len(idx):
-                        start = idx[i]
+#     # Signifikanz-Bänder (optional)
+#     import numpy as np
+#     if p_vals is not None and np.size(p_vals) == np.size(freqs):
+#         sig = (p_vals < alpha)
+#         if np.any(sig):
+#             idx = np.where(sig)[0]
+#             start = idx[0]
+#             for i in range(1, len(idx) + 1):
+#                 if i == len(idx) or idx[i] != idx[i-1] + 1:
+#                     ax.axvspan(freqs[start], freqs[idx[i-1]], alpha=0.12)
+#                     if i < len(idx):
+#                         start = idx[i]
 
-    ax.set_xlabel("Hz")
-    ax.set_ylabel("Power (a.u.)")
-    ax.set_title("Power (Spontan vs. Getriggert)")
-    ax.legend()
-    return fig
+#     ax.set_xlabel("Hz")
+#     ax.set_ylabel("Power (a.u.)")
+#     ax.set_title("Power (Spontan vs. Getriggert)")
+#     ax.legend()
+#     return fig
 
 
 def CSD_compare_side_by_side_ax(
@@ -910,19 +1101,28 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
 
 
 
-svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED_realamp.svg")
-ch_names_for_plot = [f"pri_{i}" for i in range(LFP_array.shape[0])]
-save_all_channels_stacked_svg_realamp(
-    svg_path,
-    time_s,
-    LFP_array,
-    ch_names=ch_names_for_plot,
-    height_per_channel=0.6,  # mehr Platz -> Seite füllt sich
-    gain=1.0,                # z.B. 0.7 kleiner / 1.5 größer
-    spacing_mult=1.4,        # mehr Luft zwischen Kanälen
-    lw=0.6
-)
-print("[SVG] all channels (real amp):", svg_path)
+# svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED_realamp.svg")
+# ch_names_for_plot = [f"pri_{i}" for i in range(LFP_array.shape[0])]
+# save_all_channels_stacked_svg_realamp(
+#     svg_path,
+#     time_s,
+#     LFP_array,
+#     ch_names=ch_names_for_plot,
+#     height_per_channel=0.6,  # mehr Platz -> Seite füllt sich
+#     gain=1.0,                # z.B. 0.7 kleiner / 1.5 größer
+#     spacing_mult=1.4,        # mehr Luft zwischen Kanälen
+#     lw=0.6
+# )
+# print("[SVG] all channels (real amp):", svg_path)
+
+# --- Gefilterte Variante (nach Kanal-Qualitätsfilter) ---
+# svg_path_good = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED_realamp_GOOD.svg")
+# save_all_channels_stacked_svg_realamp(
+#     svg_path_good, time_s, LFP_array_good, ch_names=ch_names_good,
+#     height_per_channel=0.6, gain=1.0, spacing_mult=1.4, lw=0.6
+# )
+# print("[SVG] all channels (real amp, filtered):", svg_path_good)
+
 
 
 def save_all_channels_small_multiples_svg(
@@ -967,6 +1167,18 @@ save_all_channels_small_multiples_svg(
     lw=1.0
 )
 print("[SVG] all channels small-multiples:", svg_path2)
+
+# --- Gefilterte Variante (nach Kanal-Qualitätsfilter) ---
+svg_path2_good = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_SMALLMULT_GOOD.svg")
+save_all_channels_small_multiples_svg(
+    svg_path2_good, time_s, LFP_array_good, ch_names=ch_names_good,
+    height_per_channel=0.7, lw=1.0
+)
+print("[SVG] all channels small-multiples (filtered):", svg_path2_good)
+
+# === am Datei-Anfang einmalig sicherstellen ===
+# pip: pip install plotly
+import numpy as np
 
 
 # Helfer (rasterize 0-Arg-Plots & PDF-Grid) 
@@ -1200,61 +1412,61 @@ def plot_up_classification_ax(
 
     return fig
 
-def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None,
-                              alpha=0.05, ax=None, title="Power (Spon vs. Trig)"):
-    import numpy as np
-    import matplotlib.pyplot as plt
+# def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None,
+#                               alpha=0.05, ax=None, title="Power (Spon vs. Trig)"):
+#     import numpy as np
+#     import matplotlib.pyplot as plt
 
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8,3))
-    else:
-        fig = ax.figure
+#     if ax is None:
+#         fig, ax = plt.subplots(figsize=(8,3))
+#     else:
+#         fig = ax.figure
 
-    # Existenz + Arrays glätten
-    if freqs is None or spont_mean is None or pulse_mean is None:
-        ax.text(0.5,0.5,"no spectra", ha="center", va="center", transform=ax.transAxes)
-        return fig
-    freqs      = np.asarray(freqs).ravel()
-    spont_mean = np.asarray(spont_mean).ravel()
-    pulse_mean = np.asarray(pulse_mean).ravel()
+#     # Existenz + Arrays glätten
+#     if freqs is None or spont_mean is None or pulse_mean is None:
+#         ax.text(0.5,0.5,"no spectra", ha="center", va="center", transform=ax.transAxes)
+#         return fig
+#     freqs      = np.asarray(freqs).ravel()
+#     spont_mean = np.asarray(spont_mean).ravel()
+#     pulse_mean = np.asarray(pulse_mean).ravel()
 
-    # Längen abgleichen, NaNs filtern
-    m = min(freqs.size, spont_mean.size, pulse_mean.size)
-    if m < 3:
-        ax.text(0.5,0.5,"invalid/empty spectra", ha="center", va="center", transform=ax.transAxes)
-        return fig
-    freqs, spont_mean, pulse_mean = freqs[:m], spont_mean[:m], pulse_mean[:m]
-    good = np.isfinite(freqs) & np.isfinite(spont_mean) & np.isfinite(pulse_mean)
-    if good.sum() < 3:
-        ax.text(0.5,0.5,"spectra have too many NaNs", ha="center", va="center", transform=ax.transAxes)
-        return fig
-    freqs, spont_mean, pulse_mean = freqs[good], spont_mean[good], pulse_mean[good]
+#     # Längen abgleichen, NaNs filtern
+#     m = min(freqs.size, spont_mean.size, pulse_mean.size)
+#     if m < 3:
+#         ax.text(0.5,0.5,"invalid/empty spectra", ha="center", va="center", transform=ax.transAxes)
+#         return fig
+#     freqs, spont_mean, pulse_mean = freqs[:m], spont_mean[:m], pulse_mean[:m]
+#     good = np.isfinite(freqs) & np.isfinite(spont_mean) & np.isfinite(pulse_mean)
+#     if good.sum() < 3:
+#         ax.text(0.5,0.5,"spectra have too many NaNs", ha="center", va="center", transform=ax.transAxes)
+#         return fig
+#     freqs, spont_mean, pulse_mean = freqs[good], spont_mean[good], pulse_mean[good]
 
-    # Plot
-    ax.plot(freqs, spont_mean, label="Spontan",  lw=2)
-    ax.plot(freqs, pulse_mean, label="Getriggert", lw=2)
+#     # Plot
+#     ax.plot(freqs, spont_mean, label="Spontan",  lw=2)
+#     ax.plot(freqs, pulse_mean, label="Getriggert", lw=2)
 
-    # Optional: Signifikanzschattierung
-    if p_vals is not None:
-        p_vals = np.asarray(p_vals).ravel()[:len(freqs)]
-        sig = np.isfinite(p_vals) & (p_vals < alpha)
-        if sig.any():
-            idx = np.where(sig)[0]
-            starts = [idx[0]]
-            for i in range(1, len(idx)):
-                if idx[i] != idx[i-1] + 1:
-                    starts.append(idx[i])
-            ends = []
-            for s in starts[1:] + [None]:
-                ends.append(idx[np.where(idx < s)[0][-1]] if s is not None else idx[-1])
-            for s, e in zip(starts, ends):
-                ax.axvspan(freqs[s], freqs[e], alpha=0.12, lw=0)
+#     # Optional: Signifikanzschattierung
+#     if p_vals is not None:
+#         p_vals = np.asarray(p_vals).ravel()[:len(freqs)]
+#         sig = np.isfinite(p_vals) & (p_vals < alpha)
+#         if sig.any():
+#             idx = np.where(sig)[0]
+#             starts = [idx[0]]
+#             for i in range(1, len(idx)):
+#                 if idx[i] != idx[i-1] + 1:
+#                     starts.append(idx[i])
+#             ends = []
+#             for s in starts[1:] + [None]:
+#                 ends.append(idx[np.where(idx < s)[0][-1]] if s is not None else idx[-1])
+#             for s, e in zip(starts, ends):
+#                 ax.axvspan(freqs[s], freqs[e], alpha=0.12, lw=0)
 
-    ax.set_xlabel("Frequenz (Hz)")
-    ax.set_ylabel("Power (a.u.)")
-    ax.set_title(title)
-    ax.legend()
-    return fig
+#     ax.set_xlabel("Frequenz (Hz)")
+#     ax.set_ylabel("Power (a.u.)")
+#     ax.set_title(title)
+#     ax.legend()
+#     return fig
 
 def _blank_ax(ax, msg=None):
     ax.axis("off")
