@@ -16,10 +16,8 @@ import scipy.stats as stats
 import os
 import random
 from scipy.ndimage import gaussian_filter
-
+from scipy import signal
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 from loader import load_LFP, load_lightpulses
 from preprocessing import downsampling, filtering, get_main_channel, pre_post_condition
 from scipy.ndimage import gaussian_filter1d
@@ -36,9 +34,6 @@ def _save_svg(fig, hint, out_dir=None, dpi=200):
     print(f"[SAVED] {path}")
 
 
-from scipy import signal
-import numpy as np
-
 def compute_peak_aligned_segments(
     up_indices, LFP_array, dt,
     b_lp, a_lp, b_hp, a_hp,
@@ -50,14 +45,13 @@ def compute_peak_aligned_segments(
     # Peak-Suchfenster (innerhalb des obigen Ausschnitts)
     search_start_s=0.2,        # s relativ zum UP-Start
     search_end_s=2.0,          # s relativ zum UP-Start
-    # minimaler Peak-Abstand in Sekunden (skaliert mit dt)
+    # minimaler Peak-Abstand in Sekunden 
     min_peak_spacing_s=0.15
 ):
     peak_segments = np.full((len(up_indices), align_len), np.nan)
     peak_indices = []
 
     for i, up in enumerate(up_indices):
-        # 1) Fenster relativ zum UP-Start: [+0.2 s, +2.0 s]
         start_idx = up + int(offset_start / dt)
         end_idx   = up + int(offset_end   / dt)
         if start_idx < 0 or end_idx <= start_idx or end_idx > LFP_array.shape[1]:
@@ -65,20 +59,20 @@ def compute_peak_aligned_segments(
 
         current_data = np.asarray(LFP_array[0, start_idx:end_idx], dtype=float)
 
-        # 2) Filtern (LP dann HP)
+        # Filtern (LP dann HP)
         try:
             V_filt = signal.filtfilt(b_lp, a_lp, current_data)
             V_filt = signal.filtfilt(b_hp, a_hp, V_filt)
         except Exception:
-            V_filt = current_data  # Fallback: ungefiltert
+            V_filt = current_data  
 
-        # 3) Peak-Suchbereich innerhalb des Ausschnitts festlegen
+        # Peak-Suchbereich innerhalb des Ausschnitts festlegen
         lo = int((search_start_s - offset_start) / dt)  # relative Indizes
         hi = int((search_end_s   - offset_start) / dt)
         lo = max(0, min(lo, len(V_filt)))
         hi = max(lo+1, min(hi, len(V_filt)))
 
-        # 4) Peaks suchen – Abstand zeitbasiert skalieren
+        # Peaks suchen – Abstand zeitbasiert skalieren
         min_dist = max(1, int(min_peak_spacing_s / dt))
         peaks, _ = signal.find_peaks(
             V_filt[lo:hi],
@@ -92,7 +86,7 @@ def compute_peak_aligned_segments(
             peak_global = start_idx + peaks[0]
             peak_indices.append(peak_global)
 
-            # 5) Aligniertes Segment rund um den Peak extrahieren
+            # Aligniertes Segment rund um den Peak extrahieren
             align_start = peaks[0] - align_pre
             align_end   = peaks[0] + align_post
             if 0 <= align_start and align_end <= len(current_data):
@@ -473,23 +467,23 @@ def plot_CSD_comparison(CSD_spont, CSD_trig, dt, dz_um=50.0,
     return fig
 
 
-def Spectrum(V_win):
-	LFP_win = V_win - np.mean(V_win)
-	# Windowing if you want
-	w = np.hanning(len(V_win))
-	LFP_win = w * LFP_win
-	# Calculate power spectrum for window
-	Fs = srate
-	N = len(LFP_win)
-	xdft = np.fft.fft(LFP_win)
-	xdft = xdft[0:int((N / 2) + 1)]
-	psdx = (1 / (Fs * N)) * np.abs(xdft) ** 2
-	freq = np.arange(0, (Fs / 2) + Fs / N, Fs / N)
-	Pow = psdx
-	Pow = np.zeros((501, 1))
-	for j in range(0, 200):
-		Pow[j] = psdx[j]
-	return Pow, freq
+# def Spectrum(V_win):
+# 	LFP_win = V_win - np.mean(V_win)
+# 	# Windowing if you want
+# 	w = np.hanning(len(V_win))
+# 	LFP_win = w * LFP_win
+# 	# Calculate power spectrum for window
+# 	Fs = srate
+# 	N = len(LFP_win)
+# 	xdft = np.fft.fft(LFP_win)
+# 	xdft = xdft[0:int((N / 2) + 1)]
+# 	psdx = (1 / (Fs * N)) * np.abs(xdft) ** 2
+# 	freq = np.arange(0, (Fs / 2) + Fs / N, Fs / N)
+# 	Pow = psdx
+# 	Pow = np.zeros((501, 1))
+# 	for j in range(0, 200):
+# 		Pow[j] = psdx[j]
+# 	return Pow, freq
 
 
 def extract_upstate_windows(UP_indices, LFP_array, dt, window_s):

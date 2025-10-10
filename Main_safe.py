@@ -25,6 +25,7 @@ from state_detection import (
     classify_states, Generate_CSD_mean, extract_upstate_windows,
     compare_spectra
 )
+from pathlib import Path
 
 
 # + Plotter-Funktionen
@@ -122,13 +123,45 @@ SAVE_DIR = BASE_PATH
 BASE_TAG = os.path.splitext(os.path.basename(LFP_FILENAME))[0]
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+def load_all_parts(parts_dir: Path, usecols=None, dtype=None) -> pd.DataFrame:
+    """
+    Lädt alle *.partXXX.csv in parts_dir und concat't sie zu einem DataFrame.
+    Tipp: usecols/dtype setzen, wenn du RAM sparen willst.
+    """
+    part_files = sorted(parts_dir.glob("*.part*.csv"))
+    if not part_files:
+        raise FileNotFoundError(f"Keine Parts unter {parts_dir} gefunden.")
+    dfs = []
+    for pf in part_files:
+        print(f"[PART] Lade {pf.name} ...")
+        df = pd.read_csv(pf, usecols=usecols, dtype=dtype, low_memory=False, memory_map=True)
+        dfs.append(df)
+    df_all = pd.concat(dfs, ignore_index=True)
+    return df_all
+
+
+
+
 # ========= Load LFP =========
-LFP_df, ch_names, lfp_meta = load_LFP_new(BASE_PATH, LFP_FILENAME)
+# ========= Load LFP =========
+parts_dir = Path(BASE_PATH) / "_csv_parts"
+if parts_dir.exists() and any(parts_dir.glob("*.part*.csv")):
+    print(f"[INFO] Parts erkannt unter {parts_dir} -> lade alle Parts (on-the-fly concat)")
+    # Wenn du nur bestimmte Spalten brauchst, setze usecols=["time","CSC1_values", ...]
+    LFP_df = load_all_parts(parts_dir, usecols=None, dtype=None)
+    # ch_names & Meta minimal ableiten (kompatibel zum restlichen Code)
+    ch_names = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
+    lfp_meta = {"source": "parts", "n_parts": len(list(parts_dir.glob('*.part*.csv')))}
+    # Für nachfolgenden Code den erwarteten Dateinamen setzen (nur kosmetisch/log)
+    LFP_FILENAME = f"{BASE_TAG}.csv (from parts)"
+else:
+    # Fallback: normales Laden der (nicht-gesplitteten) CSV
+    LFP_df, ch_names, lfp_meta = load_LFP_new(BASE_PATH, LFP_FILENAME)
+
 assert "time" in LFP_df.columns, "CSV braucht eine Spalte 'time'."
 time_full = LFP_df["time"].to_numpy(float)
 print("[INFO] CSV rows:", len(LFP_df),
       "time range:", float(LFP_df["time"].iloc[0]), "->", float(LFP_df["time"].iloc[-1]))
-
 
 
 # def _is_quasi_binary_trace(x):

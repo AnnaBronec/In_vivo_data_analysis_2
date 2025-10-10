@@ -32,12 +32,36 @@ import importlib.util
 import sys
 import csv  
 import gc
+import shutil
+
 import matplotlib.pyplot as plt
 from pathlib import Path
 #from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # ---------- Import-Helpers ----------
+
+from pathlib import Path
+import shutil
+
+def merge_csv_parts(parts_dir: Path, out_csv: Path) -> int:
+    """Mergt *.part*.csv aus parts_dir -> out_csv. Gibt die Anzahl Parts zurück."""
+    parts = sorted(parts_dir.glob("*.part*.csv"))
+    if not parts:
+        return 0
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="") as fout:
+        with parts[0].open("r") as f0:
+            header = f0.readline()
+            fout.write(header)
+            shutil.copyfileobj(f0, fout)
+        for pf in parts[1:]:
+            with pf.open("r") as f:
+                _ = f.readline()  # Header überspringen
+                shutil.copyfileobj(f, fout)
+    print(f"[MERGE] {len(parts)} Parts → {out_csv}")
+    return len(parts)
+
 
 def _import_attr_by_module_name(module_name: str, attr_name: str):
     mod = importlib.import_module(module_name)
@@ -103,6 +127,9 @@ def _has_any_csv(p: Path) -> bool:
 def _looks_like_session_dir(p: Path) -> bool:
     if not p.is_dir():
         return False
+    # >>> NEU: interne Split-Ordner ignorieren
+    if p.name == "_csv_parts":
+        return False
     # Session = Neuralynx-Rohdaten ODER XDAT-Paar ODER *gutes* Session-CSV
     return (
         _has_neuralynx_raw(p)
@@ -152,6 +179,25 @@ def _has_any_good_csv(p: Path) -> bool:
         return any(_is_good_csv_file(f, p) for f in p.iterdir())
     except PermissionError:
         return False
+
+def merge_csv_parts(parts_dir: Path, out_csv: Path) -> int:
+    """Mergt *.part*.csv aus parts_dir → out_csv (im Session-Ordner). Gibt die Part-Anzahl zurück."""
+    parts = sorted(parts_dir.glob("*.part*.csv"))
+    if not parts:
+        return 0
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="") as fout:
+        with parts[0].open("r") as f0:
+            header = f0.readline()
+            fout.write(header)
+            shutil.copyfileobj(f0, fout)
+        for pf in parts[1:]:
+            with pf.open("r") as f:
+                _ = f.readline()
+                shutil.copyfileobj(f, fout)
+    print(f"[MERGE] {len(parts)} Parts → {out_csv}")
+    return len(parts)
+
 
 
 # ---------- Single-Job ----------
@@ -224,31 +270,37 @@ def _process_one_session_subproc(
     dry_run: bool
 ) -> tuple[str, bool, str]:
     """
-    Wie _process_one_session, aber: Analyse läuft in einem *Subprozess*,
-    damit Speicher garantiert freikommt (ohne Threads).
-    Schreibt die Ausgabe des Subprozesses direkt durch (Realtime).
+    Analyse im Subprozess (Speicher wird sauber freigegeben).
+    - Große CSVs werden in Teile gesplittet.
+    - Winzige Parts werden übersprungen (verhindert Spectrogram-Crash).
+    - Alle validen Parts werden seriell analysiert (Outputs im Session-Ordner).
+    - Danach werden die Parts zu <Session>.merged.csv zusammengeführt.
+    - Abschließend wird EIN gemeinsamer Analyse-Lauf auf dem Merged-CSV gestartet,
+      sodass die kombinierten Plots entstehen (im Session-Ordner).
     """
     try:
+        import os, sys, subprocess
+
+        # --- Tuning per Env möglich ---
+        split_threshold_gb = float(os.environ.get("BATCH_SPLIT_THRESHOLD_GB", "7.0"))
+        rows_per_part      = int(os.environ.get("BATCH_ROWS_PER_PART", "5000000"))
+        min_rows_per_part  = int(os.environ.get("BATCH_MIN_ROWS_PER_PART", "200000"))  # <-- Crash-Schutz
+
         csv_path = Path(out_csv).expanduser().resolve() if out_csv else _default_csv_for_session(session_dir)
+
+        # vorhandene CSV respektieren/finden
         if skip_convert_if_exists and not csv_path.exists():
             csvs = sorted([f for f in session_dir.iterdir() if _is_good_csv_file(f, session_dir)])
-            # 1) exakter Default-Name <Ordnername>.csv bevorzugt
             preferred = [f for f in csvs if f.name == f"{session_dir.name}.csv"]
             if preferred:
                 csv_path = preferred[0].resolve()
             elif len(csvs) == 1:
                 csv_path = csvs[0].resolve()
             elif len(csvs) > 1:
-                # 2) sonst irgendwas, was den Ordnernamen im Stem trägt
                 preferred = [f for f in csvs if session_dir.name in f.stem]
-                if preferred:
-                    csv_path = preferred[0].resolve()
-                # 3) andernfalls nimm die erste "gute" CSV – aber niemals *_summary.csv
-                else:
-                    csv_path = csvs[0].resolve()
+                csv_path = (preferred[0] if preferred else csvs[0]).resolve()
 
-
-        # 1) Konvertierung im Hauptprozess
+        # 1) Konvertierung (falls nötig)
         if skip_convert_if_exists and csv_path.exists():
             print(f"{session_dir.name}: [SKIP] CSV exists: {csv_path.name}")
         else:
@@ -262,17 +314,101 @@ def _process_one_session_subproc(
                     else:
                         return (session_dir.name, False, "CSV not created")
 
-        # 2) Analyse im Subprozess — strikt Single-Thread und synchron
+        size_gb = _bytes_to_gb(csv_path.stat().st_size)
+        if size_gb >= split_threshold_gb:
+            print(f"{session_dir.name}: CSV {size_gb:.2f} GB ≥ {split_threshold_gb:.2f} GB -> split in Teile")
+            parts_dir = session_dir / "_csv_parts"
+            parts = _split_csv_by_rows(csv_path, parts_dir, rows_per_part=rows_per_part, header=True)
+            if not parts:
+                return (session_dir.name, False, "Split failed / no parts created")
+            print(f"{session_dir.name}: created {len(parts)} part(s) in {parts_dir}")
+
+            # 2) Teile analysieren (Subprozess, strikt single-threaded)
+            analyzed = 0
+            for i, part in enumerate(parts, start=1):
+                # --- Early-Skip winziger Parts (z. B. part006) ---
+                try:
+                    # schnell die Zeilenzahl ermitteln (ohne volle Datei zu lesen)
+                    with part.open("r") as fh:
+                        # Header + bis wir min_rows_per_part überschreiten
+                        cnt = 0
+                        for cnt, _ in enumerate(fh, 0):
+                            if cnt >= min_rows_per_part:
+                                break
+                    if cnt < min_rows_per_part:
+                        print(f"{session_dir.name}: [SKIP-PART] {part.name} hat nur ~{cnt} Datenzeilen -> übersprungen")
+                        continue
+                except Exception:
+                    pass
+
+                print(f"{session_dir.name}: [2/2] Analysis part {i}/{len(parts)} -> {part.name}")
+                if not dry_run:
+                    cmd = [
+                        sys.executable,
+                        str(wrapper_script_path),
+                        str(parts_dir),                # base_path = Parts-Verzeichnis
+                        "--lfp-filename", part.name,   # nur Dateiname, relativ zu parts_dir
+                    ]
+                    env = os.environ.copy()
+                    env.update({
+                        "OMP_NUM_THREADS": "1",
+                        "OPENBLAS_NUM_THREADS": "1",
+                        "MKL_NUM_THREADS": "1",
+                        "VECLIB_MAXIMUM_THREADS": "1",
+                        "NUMEXPR_NUM_THREADS": "1",
+                        "BLIS_NUM_THREADS": "1",
+                        "BATCH_PARTIAL_APPEND": "1",
+                        "ANALYSIS_SAVE_DIR": str(session_dir),  # Outputs eine Ebene höher
+                    })
+                    cp = subprocess.run(cmd, env=env)
+                    if cp.returncode != 0:
+                        return (session_dir.name, False, f"SubprocessError on part {i}: returncode={cp.returncode}")
+                    analyzed += 1
+
+            # 3) Parts zurück-mergen in den Session-Ordner
+            out_merged = session_dir / f"{session_dir.name}.merged.csv"
+            try:
+                n_parts = merge_csv_parts(parts_dir, out_merged)
+                if n_parts == 0:
+                    print(f"{session_dir.name}: [MERGE][WARN] keine Parts gefunden")
+            except Exception as e:
+                print(f"{session_dir.name}: [MERGE][WARN] {e}")
+
+            # 4) Gemeinsame Plots/Analysen EINMAL auf dem Merged-CSV
+            if out_merged.exists() and not dry_run:
+                print(f"{session_dir.name}: [FINAL] Analysis on merged -> {out_merged.name}")
+                cmd = [
+                    sys.executable,
+                    str(wrapper_script_path),
+                    str(session_dir),
+                    "--lfp-filename", out_merged.name,
+                ]
+                env = os.environ.copy()
+                env.update({
+                    "OMP_NUM_THREADS": "1",
+                    "OPENBLAS_NUM_THREADS": "1",
+                    "MKL_NUM_THREADS": "1",
+                    "VECLIB_MAXIMUM_THREADS": "1",
+                    "NUMEXPR_NUM_THREADS": "1",
+                    "BLIS_NUM_THREADS": "1",
+                    "ANALYSIS_SAVE_DIR": str(session_dir),
+                    "BATCH_IS_MERGED_RUN": "1",
+                })
+                cp = subprocess.run(cmd, env=env)
+                if cp.returncode != 0:
+                    return (session_dir.name, False, f"SubprocessError on merged: returncode={cp.returncode}")
+
+            return (session_dir.name, True, f"OK (split {len(parts)}; analyzed {analyzed}; merged+final-run)")
+
+        # --- Standardfall (keine Splits) ---
         print(f"{session_dir.name}: [2/2] Analysis on {csv_path.name}")
         if not dry_run:
-            import subprocess, sys, os
             cmd = [
                 sys.executable,
                 str(wrapper_script_path),
                 str(session_dir),
                 "--lfp-filename", str(csv_path.name),
             ]
-            # Umgebung für Kinderprozess: Threads auf 1
             env = os.environ.copy()
             env.update({
                 "OMP_NUM_THREADS": "1",
@@ -281,8 +417,8 @@ def _process_one_session_subproc(
                 "VECLIB_MAXIMUM_THREADS": "1",
                 "NUMEXPR_NUM_THREADS": "1",
                 "BLIS_NUM_THREADS": "1",
+                "ANALYSIS_SAVE_DIR": str(session_dir),
             })
-            # Live-Output durchreichen (keine Pufferung, einfacher zu debuggen)
             cp = subprocess.run(cmd, env=env)
             if cp.returncode != 0:
                 return (session_dir.name, False, f"SubprocessError: returncode={cp.returncode}")
@@ -293,6 +429,55 @@ def _process_one_session_subproc(
         return (session_dir.name, False, f"SystemExit {int(e.code)}")
     except Exception as e:
         return (session_dir.name, False, f"{type(e).__name__}: {e}")
+
+# --- neu: Split-Helfer ---
+import math
+
+# --- Split-Helpers: großformatige CSVs sicher zerlegen ---
+
+def _bytes_to_gb(nbytes: int) -> float:
+    return nbytes / (1024**3)
+
+def _split_csv_by_rows(csv_path: Path, out_dir: Path, rows_per_part: int = 5_000_000, header: bool = True) -> list[Path]:
+    """
+    Splittet csv_path in Teile mit rows_per_part Datenzeilen (exkl. Header).
+    Schreibt identischen Header in jedes Part (falls header=True).
+    Gibt die Liste erzeugter Part-Dateien zurück.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    parts: list[Path] = []
+
+    with csv_path.open("r", newline="") as fin:
+        # Header (optional) übernehmen
+        hdr_line = fin.readline() if header else None
+        if header and not hdr_line:
+            return []
+
+        idx = -1            # damit der erste Part bei der ersten Datenzeile erzeugt wird
+        written_in_part = 0
+        fout = None
+
+        # Zeile für Zeile kopieren (streamend, O(1) RAM)
+        for line in fin:
+            if (written_in_part == 0) or (written_in_part >= rows_per_part):
+                # neuen Part beginnen
+                if fout:
+                    fout.close()
+                idx += 1
+                part_path = out_dir / f"{csv_path.stem}.part{idx:03d}.csv"
+                fout = part_path.open("w", newline="")
+                if header and hdr_line is not None:
+                    fout.write(hdr_line)
+                parts.append(part_path)
+                written_in_part = 0
+            fout.write(line)
+            written_in_part += 1
+
+        if fout:
+            fout.close()
+
+    return parts
+
 
 
 # def _process_one_session_subproc(
