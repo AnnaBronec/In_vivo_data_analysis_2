@@ -97,7 +97,7 @@ def compute_peak_aligned_segments(
 def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, LFP_array, b_lp, a_lp, b_hp, a_hp, align_pre, align_post, align_len):
     # 1. Detect state transitions via spectrogram power
     # Frequenzachse holen
-    freqs = Spect_dat[2]  # z. B. array([0.01, 0.5, 1.0, ..., 10])
+    freqs = Spect_dat[2]  
     Spect_dB = np.clip(Spect_dat[0], -100, 100)
 
     # Frequenzmaske für z. B. 0.5–4 Hz
@@ -177,9 +177,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
         UP_start_i = np.array(filtered_UP, dtype=int)
         DOWN_start_i = np.array(filtered_DOWN, dtype=int)
         
-
-      # 3. Build pulse time array
-    #Pulse_times_array = []  # Initialisiere leere Liste fuer Puls-Zeitpunkte
+  
     # 3. Kombiniere beide Pulstypen
     Pulse_times_array = np.sort(np.concatenate([pulse_times_1, pulse_times_2]))
 
@@ -545,7 +543,7 @@ def plot_contrast_heatmap(pulse_windows, spont_windows, dt):
 
 def average_amplitude_in_upstates(main_channel, time_s, UP_start_i, DOWN_start_i, start_idx, end_idx):
     """
-    Berechnet die mittlere Amplitude (mean(abs)) der UP-Zustände im Bereich [start_idx, end_idx] (1-basiert).
+    Berechnet die mittlere Amplitude (mean(abs)) der UP-Zustände im Bereich [start_idx, end_idx].
     """
 
     assert 1 <= start_idx <= end_idx <= len(UP_start_i), "Ungültiger Indexbereich."
@@ -568,7 +566,7 @@ def average_amplitude_in_upstates(main_channel, time_s, UP_start_i, DOWN_start_i
         for i, a in enumerate(selected_amplitudes, start=start_idx):
             print(f"{i}. {a:.4f}")
     else:
-        print("❌ Keine gültigen UP-Zustände im angegebenen Bereich gefunden.")
+        print("Keine gültigen UP-Zustände im angegebenen Bereich gefunden.")
 
 
 
@@ -587,7 +585,7 @@ def plot_LFP_average_around_peaks(peaks, LFP_array, dt, window_s=1.0, channel_id
                 traces.append(trace)
 
     if len(traces) == 0:
-        print(f"❌ Keine gültigen Trials für {label}")
+        print(f"Keine gültigen Trials für {label}")
         return
 
     traces = np.array(traces)
