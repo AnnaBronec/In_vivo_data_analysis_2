@@ -75,7 +75,7 @@ def main_safe(base_path: str, lfp_filename: str | None = None):
         _teardown_memory()
 
 
-# Optional CLI: allows running one session in a fully isolated subprocess
+# allows running one session in a fully isolated subprocess
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Run ONE analysis session (isolated, sequential).")
@@ -83,7 +83,6 @@ if __name__ == "__main__":
     p.add_argument("--lfp-filename", default=None, help="CSV filename (defaults to <foldername>.csv)")
     args = p.parse_args()
 
-    # <-- Debug-Ausgabe hier einfügen:
     print(f"[WRAPPER] start PID={os.getpid()} base_path={args.base_path}")
 
     name, ok, msg = main_safe(args.base_path, args.lfp_filename)

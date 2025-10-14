@@ -6,15 +6,13 @@ import os, math
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # headless, safe for batch exports
+matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
-# do NOT call plt.ion() in batch mode
-
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Patch
-
-# --- Deine Module ---
 from loader_old import load_LFP_new
+from matplotlib import gridspec
+from scipy.signal import welch
 try:
     from preprocessing import downsampling_old as _ds_fun
 except ImportError:
@@ -26,9 +24,6 @@ from state_detection import (
     compare_spectra
 )
 from pathlib import Path
-
-
-# + Plotter-Funktionen
 from plotter import (
     plot_all_channels,
     plot_spont_up_mean,
@@ -36,23 +31,37 @@ from plotter import (
     plot_upstate_amplitude_blocks_colored,
 )
 
-# ========= Params =========
+
+
+#Konstanten
+
 DOWNSAMPLE_FACTOR = 50
 HIGH_CUTOFF = 10
 LOW_CUTOFF  = 2
 
 
-def export_interactive_lfp_html(base_tag, save_dir, time_s, y,
-                                pulse_times_1=None, pulse_times_2=None,
-                                max_points=300_000,  # zur Sicherheit decimieren
-                                title="LFP (interaktiv)"):
+
+def export_interactive_lfp_html(
+    base_tag, save_dir, time_s, y,
+    pulse_times_1=None, pulse_times_2=None,
+    *,
+    up_spont=None,       # Tuple (UP_idx, DOWN_idx) in SAMPLE-INDIZES
+    up_trig=None,        # Tuple (UP_idx, DOWN_idx)
+    up_assoc=None,       # Tuple (UP_idx, DOWN_idx)
+    max_points=300_000,
+    title="LFP (interaktiv)",
+    limit_to_last_pulse=False
+):
     """
     Erstellt eine interaktive HTML mit Range-Slider und Zoom/Pan.
+    Zusätzlich können UP-Intervalle (spont/triggered/associated) schattiert werden.
     - time_s: 1D array (Sekunden)
     - y:      1D array (LFP)
-    - pulse_times_*: Sekunden (optional)
-    - max_points: wenn Signal sehr lang ist -> decimieren
+    - *_times_*: Sekunden (optional)
+    - up_*: Tuple (UP_idx, DOWN_idx) mit Indizes in time_s
     """
+
+    import numpy as np
     import plotly.graph_objects as go
     from plotly.offline import plot as plotly_offline_plot
     import os
@@ -60,7 +69,21 @@ def export_interactive_lfp_html(base_tag, save_dir, time_s, y,
     t = np.asarray(time_s, dtype=float)
     x = np.asarray(y, dtype=float)
 
-    # robustes Decimate (nur für die Darstellung, Daten bleiben unverändert)
+    # optional auf letzten Puls begrenzen
+    if limit_to_last_pulse:
+        last_p = None
+        if pulse_times_1 is not None and len(pulse_times_1):
+            last_p = float(np.max(pulse_times_1))
+        if pulse_times_2 is not None and len(pulse_times_2):
+            lp2 = float(np.max(pulse_times_2))
+            last_p = lp2 if (last_p is None or lp2 > last_p) else last_p
+        if last_p is not None and len(t):
+            i1 = int(np.searchsorted(t, last_p, side="right"))
+            i1 = max(1, min(i1, len(t)))
+            t = t[:i1]
+            x = x[:i1]
+
+    # robustes Decimate (nur Darstellung)
     if t.size > max_points:
         step = int(np.ceil(t.size / max_points))
         t = t[::step]
@@ -69,12 +92,55 @@ def export_interactive_lfp_html(base_tag, save_dir, time_s, y,
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=t, y=x, mode="lines", name="LFP"))
 
-    # Puls-Linien als „Shapes“, damit sie nicht in die y-Skalierung reinpfuschen
     shapes = []
+
+    # --- Helper: UP/DOWN-Indizes -> Zeitintervalle (Sekunden)
+    def _mk_intervals(UP, DOWN):
+        if UP is None or DOWN is None:
+            return []
+        UP   = np.asarray(UP,   dtype=int)
+        DOWN = np.asarray(DOWN, dtype=int)
+        m = min(len(UP), len(DOWN))
+        if m == 0:
+            return []
+        UP, DOWN = UP[:m], DOWN[:m]
+        # sortiert nach Startzeit
+        order = np.argsort(UP)
+        UP, DOWN = UP[order], DOWN[order]
+        out = []
+        for u, d in zip(UP, DOWN):
+            if 0 <= u < len(time_s) and 0 < d <= len(time_s) and d > u:
+                out.append((float(time_s[u]), float(time_s[d-1])))
+        return out
+
+    # --- UP-Intervalle vorbereiten (Farben an deine Matplotlib-Plots angelehnt)
+    intervals = []
+    if up_spont:
+        intervals.append(("UP spontaneous", _mk_intervals(*up_spont), "rgba(46, 204, 113, 0.22)"))  # grün
+    if up_trig:
+        intervals.append(("UP triggered",   _mk_intervals(*up_trig),  "rgba(31, 119, 180, 0.22)"))  # blau
+    if up_assoc:
+        intervals.append(("UP associated",  _mk_intervals(*up_assoc), "rgba(255, 127, 14, 0.22)"))  # orange
+
+    # --- Schattierungen als Shapes (über gesamte Plot-Höhe)
+    for label, spans, fill in intervals:
+        for (t0, t1) in spans:
+            # auf ggf. gekürzte Zeitachse clippen
+            if len(t) and (t1 < t[0] or t0 > t[-1]):
+                continue
+            shapes.append(dict(
+                type="rect",
+                x0=t0, x1=t1,
+                y0=0, y1=1,
+                xref="x", yref="paper",
+                line=dict(width=0),
+                fillcolor=fill
+            ))
+
+    # --- Pulse-Linien
     def _add_pulses(ts, dash):
         if ts is None or len(ts) == 0:
             return
-        # ausdünnen, wenn seeehr viele Pulse
         tt = np.asarray(ts, float)
         if tt.size > 1200:
             tt = tt[::int(np.ceil(tt.size/1200))]
@@ -82,14 +148,33 @@ def export_interactive_lfp_html(base_tag, save_dir, time_s, y,
             shapes.append(dict(
                 type="line",
                 x0=float(p), x1=float(p),
-                y0=0, y1=1,                  # relative y (0..1)
+                y0=0, y1=1,
                 xref="x", yref="paper",
-                opacity=0.35,                # <-- HIER (Top-Level)
+                opacity=0.35,
                 line=dict(width=1, dash=dash, color="red")
             ))
 
     _add_pulses(pulse_times_1, "dot")
     _add_pulses(pulse_times_2, "dash")
+
+    # --- Dummy-Traces für Legende (damit Shapes in der Legende erscheinen)
+    if intervals:
+        for label, _, fill in intervals:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode="lines",
+                line=dict(width=12, color=fill),
+                name=label,
+                showlegend=True
+            ))
+    if pulse_times_1 is not None and len(pulse_times_1):
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
+                                 line=dict(width=1, dash="dot", color="red"),
+                                 name="Pulse 1"))
+    if pulse_times_2 is not None and len(pulse_times_2):
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
+                                 line=dict(width=1, dash="dash", color="red"),
+                                 name="Pulse 2"))
 
     fig.update_layout(
         title=title,
@@ -98,6 +183,7 @@ def export_interactive_lfp_html(base_tag, save_dir, time_s, y,
         shapes=shapes,
         margin=dict(l=60, r=20, t=50, b=50),
         template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
     )
 
     out_html = os.path.join(save_dir, f"{base_tag}__lfp_interactive.html")
@@ -106,11 +192,82 @@ def export_interactive_lfp_html(base_tag, save_dir, time_s, y,
     return out_html
 
 
-# === GANZ OBEN (nach Imports / Parametern) ===
-# Stelle das auf deine XDAT-Samplingrate ein:
-DEFAULT_FS_XDAT = 32000.0   # <-- ggf. 30000.0, 20000.0, 1000.0 etc.
+# #HTML
+# def export_interactive_lfp_html(
+#     base_tag, save_dir, time_s, y,
+#     pulse_times_1=None, pulse_times_2=None,
+#     *,
+#     up_spont=None,       # Tuple (UP_idx, DOWN_idx) in SAMPLE-INDIZES
+#     up_trig=None,        # Tuple (UP_idx, DOWN_idx)
+#     up_assoc=None,       # Tuple (UP_idx, DOWN_idx)
+#     max_points=300_000,
+#     title="LFP (interaktiv)",
+#     limit_to_last_pulse=False
+# ):
+#     """
+#     Erstellt eine interaktive HTML mit Range-Slider und Zoom/Pan.
+#     - time_s: 1D array (Sekunden)
+#     - y:      1D array (LFP)
+#     - pulse_times_*: Sekunden (optional)
+#     - max_points: wenn Signal sehr lang ist -> decimieren
+#     """
+#     import plotly.graph_objects as go
+#     from plotly.offline import plot as plotly_offline_plot
+#     import os
 
-# --- Defaults (werden vom Wrapper überschrieben) ---
+#     t = np.asarray(time_s, dtype=float)
+#     x = np.asarray(y, dtype=float)
+
+#     # robustes Decimate (nur für die Darstellung, Daten bleiben unverändert)
+#     if t.size > max_points:
+#         step = int(np.ceil(t.size / max_points))
+#         t = t[::step]
+#         x = x[::step]
+
+#     fig = go.Figure()
+#     fig.add_trace(go.Scatter(x=t, y=x, mode="lines", name="LFP"))
+
+#     # Puls-Linien als „Shapes“, damit sie nicht in die y-Skalierung reinpfuschen
+#     shapes = []
+#     def _add_pulses(ts, dash):
+#         if ts is None or len(ts) == 0:
+#             return
+#         # ausdünnen, wenn seeehr viele Pulse
+#         tt = np.asarray(ts, float)
+#         if tt.size > 1200:
+#             tt = tt[::int(np.ceil(tt.size/1200))]
+#         for p in tt:
+#             shapes.append(dict(
+#                 type="line",
+#                 x0=float(p), x1=float(p),
+#                 y0=0, y1=1,                  # relative y (0..1)
+#                 xref="x", yref="paper",
+#                 opacity=0.35,                # <-- HIER (Top-Level)
+#                 line=dict(width=1, dash=dash, color="red")
+#             ))
+
+#     _add_pulses(pulse_times_1, "dot")
+#     _add_pulses(pulse_times_2, "dash")
+
+#     fig.update_layout(
+#         title=title,
+#         xaxis=dict(title="Zeit (s)", rangeslider=dict(visible=True)),
+#         yaxis=dict(title="LFP (a.u.)"),
+#         shapes=shapes,
+#         margin=dict(l=60, r=20, t=50, b=50),
+#         template="plotly_white",
+#     )
+
+#     out_html = os.path.join(save_dir, f"{base_tag}__lfp_interactive.html")
+#     plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+#     print(f"[HTML] interaktiver LFP-Plot: {out_html}")
+#     return out_html
+
+
+# Stelle das auf deine XDAT-Samplingrate ein:
+DEFAULT_FS_XDAT = 32000.0   #ist das richtig?
+
+# Define default session
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/DRD cross/2017-8-9_13-52-30onePulse200msX20per15s"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
 if "LFP_FILENAME" in globals():
@@ -140,10 +297,6 @@ def load_all_parts(parts_dir: Path, usecols=None, dtype=None) -> pd.DataFrame:
     return df_all
 
 
-
-
-# ========= Load LFP =========
-# ========= Load LFP =========
 parts_dir = Path(BASE_PATH) / "_csv_parts"
 if parts_dir.exists() and any(parts_dir.glob("*.part*.csv")):
     print(f"[INFO] Parts erkannt unter {parts_dir} -> lade alle Parts (on-the-fly concat)")
@@ -155,7 +308,7 @@ if parts_dir.exists() and any(parts_dir.glob("*.part*.csv")):
     # Für nachfolgenden Code den erwarteten Dateinamen setzen (nur kosmetisch/log)
     LFP_FILENAME = f"{BASE_TAG}.csv (from parts)"
 else:
-    # Fallback: normales Laden der (nicht-gesplitteten) CSV
+    # normales Laden der (nicht-gesplitteten) CSV
     LFP_df, ch_names, lfp_meta = load_LFP_new(BASE_PATH, LFP_FILENAME)
 
 assert "time" in LFP_df.columns, "CSV braucht eine Spalte 'time'."
@@ -314,7 +467,7 @@ print("[INFO] CSV rows:", len(LFP_df),
 #     pulse_times_1_full = time_full[rising]
 # print(f"[INFO] pulses(full): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)}")
 
-# --- Mini-Helper für "alle Kanal"-Plots als SVG ---
+# helper
 def _decimate_xy(x, Y, max_points=40000):
     """Reduziert Punktezahl, damit SVGs klein bleiben."""
     import numpy as np
@@ -323,7 +476,7 @@ def _decimate_xy(x, Y, max_points=40000):
     step = int(np.ceil(len(x) / max_points))
     return x[::step], Y[:, ::step]
 
-# ========= Pulses (inkl. Auto-Detect) =========
+# Pulses (inkl. Auto-Detect) 
 pulse_times_1_full = np.array([], dtype=float)
 pulse_times_2_full = np.array([], dtype=float)
 stim_like_cols = []  # merken, um sie später NICHT als LFP-Kanäle zu verwenden
@@ -362,7 +515,7 @@ if pulse_times_1_full.size == 0 and "stim" in LFP_df.columns:
         pulse_times_1_full = t
         stim_like_cols.append("stim")
 
-# 2) Auto-Detect: finde (nahezu) binäre Kanäle wie ch07, ch17, ...
+# 2) Auto-Detect: finde (nahezu) binäre Kanäle
 def _is_quasi_binary(col):
     x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
     x = x[np.isfinite(x)]
@@ -395,7 +548,7 @@ print(f"[INFO] pulses(full): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2
 
 
 
-# ========= Channels -> pri_* =========
+# Channels -> pri_* 
 chan_cols = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
 assert len(chan_cols) > 0, "Keine Kanalspalten gefunden."
 LFP_df_ds = pd.DataFrame({"timesamples": time_full})
@@ -424,24 +577,20 @@ def _name_to_idx(name, chan_cols_local=None, num_channels=None):
         return None
 
 
-#name_to_idx = {col: i for i, col in enumerate(chan_cols)}  # chan_cols stammt aus deinem Build der pri_i
 
-
-# ========= Downsample =========
+# Downsample 
 time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(
     DOWNSAMPLE_FACTOR, LFP_df_ds, NUM_CHANNELS,
     pulse_times_1=pulse_times_1_full,
     pulse_times_2=pulse_times_2_full,
     snap_pulses=True
 )
-# ----- NACH dem Downsampling -----
-# time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(...)
 
-# Wenn dt offensichtlich "Samples" ist (z.B. 50), rechne in Sekunden um:
+
+# Wenn dt offensichtlich "Samples" ist, rechne in Sekunden um:
 if dt > 1.0:  # dt in SAMPLES -> Sekunden
     dt = dt / DEFAULT_FS_XDAT
 
-# Falls der Zeitvektor noch wie "Samples" aussieht (sehr große Zahlen),
 # ebenfalls auf Sekunden bringen:
 if np.nanmax(time_s) > 1e6:
     time_s = time_s / DEFAULT_FS_XDAT
@@ -456,7 +605,6 @@ print(f"[DS][FIXED] dt={dt:.9f} s, Nyquist={0.5/dt:.3f} Hz, "
       f"time_s: {float(time_s[0]):.3f}->{float(time_s[-1]):.3f} s")
 
 
-
 assert LFP_array.shape[0] == NUM_CHANNELS
 assert LFP_array.shape[1] == len(time_s)
 print(f"[DS] time {time_s[0]:.3f}->{time_s[-1]:.3f}s, N={len(time_s)}, dt={dt:.6f}s, "
@@ -464,10 +612,7 @@ print(f"[DS] time {time_s[0]:.3f}->{time_s[-1]:.3f}s, N={len(time_s)}, dt={dt:.6
 
 
 
-# ... direkt nach dem Downsampling-Block:
-# time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(...)
-
-# Kanalnamen ableiten (wie du’s auch für die Analyse tust)
+# Kanalnamen ableiten 
 ch_names_for_plot = [f"pri_{i}" for i in range(LFP_array.shape[0])]
 svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED.svg")
 
@@ -483,8 +628,20 @@ svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED.svg")
 # )
 # print("[SVG] all channels stacked:", svg_path)
 
+def _ensure_main_channel(LFP_array, preferred_idx=10):
+    """
+    Liefert (main_channel, used_idx).
+    Bevorzugt preferred_idx, sonst Kanal 0.
+    Unabhängig von good_idx, damit früh nutzbar (z.B. fürs Spektrogramm).
+    """
+    num_ch = int(LFP_array.shape[0])
+    if isinstance(preferred_idx, int) and 0 <= preferred_idx < num_ch:
+        return LFP_array[preferred_idx, :], preferred_idx
+    return LFP_array[0, :], 0
 
-# ========= Stimulus-Fenster bestimmen & ALLES croppen =========
+
+
+# Stimulus-Fenster bestimmen & alles croppen 
 def _stim_window(p1, p2):
     ts = []
     if p1 is not None and len(p1): ts.append([np.min(p1), np.max(p1)])
@@ -509,46 +666,59 @@ if win is not None:
     # Zeit/Signale croppen (ALLE synchron!)
     time_s       = time_s[i0:i1]
     LFP_array    = LFP_array[:, i0:i1]
-    # main_channel = LFP_array[0, :]  # falls du später einen anderen Hauptkanal willst, setz das nach get_main_channel
+    # main_channel = LFP_array[0, :]  
 
-    # === Hauptkanal festlegen (hier: fix Kanal 10) ===
-    ch_idx = 10
-    if ch_idx < 0 or ch_idx >= NUM_CHANNELS:
-        raise ValueError(f"Channel {ch_idx} existiert nicht (nur {NUM_CHANNELS} Kanäle vorhanden).")
-
-    main_channel = LFP_array[ch_idx, :]
-    print(f"[INFO] main_channel = pri_{ch_idx}, len={len(main_channel)}, time_len={len(time_s)}")
+    # # Hauptkanal festlegen 
+    # ch_idx = 10
+    # if ch_idx < 0 or ch_idx >= NUM_CHANNELS:
+    #     raise ValueError(f"Channel {ch_idx} existiert nicht (nur {NUM_CHANNELS} Kanäle vorhanden).")
+    # main_channel = LFP_array[ch_idx, :]
+    # print(f"[INFO] main_channel = pri_{ch_idx}, len={len(main_channel)}, time_len={len(time_s)}")
     
-        # Interaktiver Plot (gesamtes Signal)
-    export_interactive_lfp_html(
-        BASE_TAG, SAVE_DIR, time_s, main_channel,
-        pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
-        max_points=300_000,  # ggf. erhöhen/verringern
-        title=f"{BASE_TAG} — Main LFP (interaktiv)"
-    )
+#         # Interaktiver Plot (gesamtes Signal)
+#     export_interactive_lfp_html(
+#     BASE_TAG, SAVE_DIR, time_s, main_channel,
+#     pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
+#     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
+#     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
+#     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
+#     limit_to_last_pulse=True,  # optional
+#     title=f"{BASE_TAG} — Main LFP (interaktiv)"
+# )
 
-    # Pulse-Zeiten aufs Fenster begrenzen (Sekunden bleiben Sekunden)
+
+    # export_interactive_lfp_html(
+    #     BASE_TAG, SAVE_DIR, time_s, main_channel,
+    #     pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
+    #     max_points=300_000,  # ggf. erhöhen/verringern
+    #     title=f"{BASE_TAG} — Main LFP (interaktiv)"
+    # )
+
+    # Pulse-Zeiten aufs Fenster begrenzen 
     if pulse_times_1 is not None:
         pulse_times_1 = pulse_times_1[(pulse_times_1 >= time_s[0]) & (pulse_times_1 <= time_s[-1])]
     if pulse_times_2 is not None:
         pulse_times_2 = pulse_times_2[(pulse_times_2 >= time_s[0]) & (pulse_times_2 <= time_s[-1])]
 
     print(f"[CROP] window {t0:.3f}–{t1:.3f} s -> time_s len={len(time_s)}, LFP_array={LFP_array.shape}, p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
+# else:
+#     print("[CROP] no pulses -> no cropping")
+
+#     #     # auch ohne Crop: main_channel definieren
+#     ch_idx = 10
+#     if ch_idx < 0 or ch_idx >= NUM_CHANNELS:
+#         raise ValueError(f"Channel {ch_idx} existiert nicht (nur {NUM_CHANNELS} Kanäle vorhanden).")
+#     main_channel = LFP_array[ch_idx, :]
+#     print(f"[INFO] main_channel = pri_{ch_idx}, len={len(main_channel)}, time_len={len(time_s)}")
 else:
     print("[CROP] no pulses -> no cropping")
-
-        # auch ohne Crop: main_channel definieren
-    ch_idx = 10
-    if ch_idx < 0 or ch_idx >= NUM_CHANNELS:
-        raise ValueError(f"Channel {ch_idx} existiert nicht (nur {NUM_CHANNELS} Kanäle vorhanden).")
-    main_channel = LFP_array[ch_idx, :]
-    print(f"[INFO] main_channel = pri_{ch_idx}, len={len(main_channel)}, time_len={len(time_s)}")
+  
+# --- main_channel robust auswählen (nach evtl. Cropping) ---
+main_channel, ch_idx_used = _ensure_main_channel(LFP_array, preferred_idx=10)
+print(f"[INFO] main_channel = pri_{ch_idx_used}, len={len(main_channel)}, time_len={len(time_s)}")
 
 
-
-# ========= Kanal-Qualitätsfilter (nach Cropping/No-Crop, dt & LFP_array vorhanden) =========
-from scipy.signal import welch
-
+#  Kanal-Qualitätsfilter (nach Cropping/No-Crop, dt & LFP_array vorhanden) 
 bad_idx, reasons = set(), []
 fs = 1.0 / dt
 
@@ -640,70 +810,7 @@ except Exception as e:
     print("[ALL-CH][DS] skip:", e)
 
 
-
-def save_all_channels_stacked_svg_realamp(
-    out_svg_path,
-    time_s,
-    X,                        # shape: (n_ch, n_s)
-    ch_names=None,
-    width_in=12.0,
-    height_per_channel=0.5,   # Seite füllen: bei 38 ch z.B. 0.55–0.7
-    gain=1.0,                 # globale Verstärkung der Amplitude
-    spacing_mult=1.2,         # 1.0 = minimaler Abstand, >1 = mehr Luft
-    lw=0.6
-):
-    """
-    Gestapelte Darstellung mit *echter* Amplitude.
-    Abstand wird pro Kanal aus robuster Spannweite abgeleitet.
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    X = np.asarray(X, float)
-    n_ch, n_s = X.shape
-    if ch_names is None or len(ch_names) != n_ch:
-        ch_names = [f"ch{i:02d}" for i in range(n_ch)]
-
-    # robuste Spannweite je Kanal (um Ausreißer zu ignorieren)
-    q25 = np.nanpercentile(X, 25, axis=1)
-    q75 = np.nanpercentile(X, 75, axis=1)
-    iqr = (q75 - q25)
-    # Fallback, falls irgendwo konstante Kanäle sind
-    iqr[iqr <= 0] = np.nan
-    base_span = np.nanmedian(iqr)  # typischer Kanalhub
-    if not np.isfinite(base_span) or base_span == 0:
-        base_span = 1.0
-
-    # vertikaler Abstand zwischen Kanälen
-    spacing = spacing_mult * base_span * gain
-
-    # Offsets (0, spacing, 2*spacing, …)
-    offsets = np.arange(n_ch, dtype=float) * spacing
-
-    # globale Verstärkung anwenden
-    Y = X * gain + offsets[:, None]
-
-    # Figur so hoch wie nötig machen
-    height_in = max(3.0, n_ch * height_per_channel)
-    fig, ax = plt.subplots(figsize=(width_in, height_in))
-
-    ax.plot(time_s, Y.T, lw=lw)
-
-    ax.set_xlim(float(time_s[0]), float(time_s[-1]))
-    ax.set_ylim(-0.5 * spacing, offsets[-1] + 0.5 * spacing)
-    ax.set_yticks(offsets)
-    ax.set_yticklabels(ch_names, fontsize=8)
-    ax.set_xlabel("Zeit (s)")
-    ax.set_ylabel("Kanal")
-    ax.set_title(f"Alle Kanäle (gestapelt, echte Amplitude) — n={n_ch}")
-
-    fig.tight_layout()
-    fig.savefig(out_svg_path, format="svg")
-    plt.close(fig)
-
-
-
-# ========= State detection =========
+# State detection
 try:
     Up = classify_states(
         Spect_dat, time_s, pulse_times_1, pulse_times_2, dt,
@@ -713,7 +820,6 @@ try:
 except IndexError as e:
     print(f"[WARN] classify_states skipped due to IndexError: {e}")
 
-    # Minimal-Dummy, damit die restlichen Plots laufen:
     Up = {
         "Spontaneous_UP":        np.array([], dtype=int),
         "Spontaneous_DOWN":      np.array([], dtype=int),
@@ -740,7 +846,134 @@ Total_power           = Up.get("Total_power",           None)
 up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", None))
 print("[COUNTS] sponUP:", len(Spontaneous_UP), " trigUP:", len(Pulse_triggered_UP), " assocUP:", len(Pulse_associated_UP))
 
-# ========= Extras für Plots =========
+
+def _upstate_amplitudes(signal, up_idx, down_idx):
+    """
+    Misst pro UP-Event die Amplitude (max - min) im Rohsignal.
+    up_idx/down_idx: Sample-Indizes in 'signal' (wie aus classify_states).
+    Rückgabe: np.ndarray [n_events] (float), NaN-frei gefiltert.
+    """
+    import numpy as np
+    sig = np.asarray(signal, float)
+    U = np.asarray(up_idx, dtype=int)
+    D = np.asarray(down_idx, dtype=int)
+    m = min(U.size, D.size)
+    if m == 0:
+        return np.array([], dtype=float)
+
+    U, D = U[:m], D[:m]
+    # chronologisch sortieren (optional)
+    order = np.argsort(U)
+    U, D = U[order], D[order]
+
+    amps = []
+    n = sig.size
+    for u, d in zip(U, D):
+        if not (0 <= u < n and 0 < d <= n and d > u):
+            continue
+        seg = sig[u:d]
+        seg = seg[np.isfinite(seg)]
+        if seg.size == 0:
+            continue
+        amps.append(float(np.nanmax(seg) - np.nanmin(seg)))
+    return np.array(amps, dtype=float)
+
+
+def _sem(x):
+    import numpy as np
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    return np.nanstd(x) / np.sqrt(max(1, x.size)) if x.size else np.nan
+
+
+def upstate_amplitude_compare_ax(spont_amp, trig_amp, ax=None, title="UP Amplituden: Spontan vs. Getriggert"):
+    """
+    Boxplot + Jitterpunkte + Mittelwert±SEM.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    rng = np.random.default_rng(42)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    else:
+        fig = ax.figure
+
+    data = []
+    labels = []
+    if spont_amp is not None and len(spont_amp):
+        data.append(np.asarray(spont_amp, float))
+        labels.append("Spontan")
+    if trig_amp is not None and len(trig_amp):
+        data.append(np.asarray(trig_amp, float))
+        labels.append("Getriggert")
+
+    if not data:
+        ax.text(0.5, 0.5, "keine Amplituden gefunden", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    # Boxplots
+    bp = ax.boxplot(data, labels=labels, whis=[5, 95], showfliers=False)
+
+    # Jitter-Punkte
+    for i, arr in enumerate(data, start=1):
+        x = i + (rng.random(arr.size) - 0.5) * 0.18
+        ax.plot(x, arr, "o", ms=3, alpha=0.5)
+
+    # Mittelwert ± SEM
+    for i, arr in enumerate(data, start=1):
+        m = float(np.nanmean(arr))
+        se = float(_sem(arr))
+        ax.errorbar(i+0.28, m, yerr=se, fmt="s", ms=5, capsize=4)
+
+    ax.set_ylabel("Amplitude (max - min, a.u.)")
+    ax.set_title(title)
+    ax.grid(alpha=0.15, linestyle=":")
+    return fig
+
+
+# --- Amplituden pro UP-Typ (max - min) berechnen + CSV ablegen ---
+spont_amp = _upstate_amplitudes(main_channel, Spontaneous_UP,     Spontaneous_DOWN)
+trig_amp  = _upstate_amplitudes(main_channel, Pulse_triggered_UP, Pulse_triggered_DOWN)
+
+amp_df = pd.DataFrame({
+    "group": (["spontaneous"] * len(spont_amp)) + (["triggered"] * len(trig_amp)),
+    "amplitude": np.concatenate([spont_amp, trig_amp]) if (len(spont_amp) or len(trig_amp)) else np.array([], float)
+})
+amp_csv_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_amplitudes.csv")
+amp_df.to_csv(amp_csv_path, index=False)
+print(f"[CSV] UP-Amplituden geschrieben: {amp_csv_path}  (spont={len(spont_amp)}, trig={len(trig_amp)})")
+
+
+# --- separate SVG mit dem Amplitudenvergleich ---
+amp_svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_amplitude_compare.svg")
+fig_amp, ax_amp = plt.subplots(figsize=(6.5, 3.4))
+upstate_amplitude_compare_ax(
+    spont_amp, trig_amp, ax=ax_amp,
+    title="UP Amplitude (max-min): Spontan vs. Getriggert"
+)
+fig_amp.tight_layout()
+fig_amp.savefig(amp_svg_path, format="svg", bbox_inches="tight")
+plt.close(fig_amp)
+print("[SVG] amplitude compare:", amp_svg_path)
+
+
+# --- Interaktive HTML immer erzeugen (mit UP-Schattierung) ---
+export_interactive_lfp_html(
+    BASE_TAG, SAVE_DIR, time_s, main_channel,
+    pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
+    up_spont=(Spontaneous_UP, Spontaneous_DOWN),
+    up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
+    up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
+    limit_to_last_pulse=True,  # bei Sessions mit Pulsen praktisch
+    title=f"{BASE_TAG} — Main LFP (interaktiv)"
+)
+
+
+
+
+# Extras für Plots
 pulse_windows = extract_upstate_windows(Pulse_triggered_UP, main_channel[None, :], dt, window_s=1.0)
 spont_windows = extract_upstate_windows(Spontaneous_UP, main_channel[None, :], dt, window_s=1.0)
 freqs = spont_mean = pulse_mean = p_vals = None
@@ -771,7 +1004,7 @@ if NUM_CHANNELS >= 7:
 else:
     print(f"[INFO] CSD skipped: only {NUM_CHANNELS} channels (<7).")
 
-# nach compare_spectra(...)
+# nach compare_spectra
 if freqs is not None and spont_mean is not None:
     pd.DataFrame({"freq": freqs, "power": spont_mean}).to_csv(
         os.path.join(SAVE_DIR, "spectrum_spont.csv"), index=False)
@@ -779,17 +1012,11 @@ if freqs is not None and pulse_mean is not None:
     pd.DataFrame({"freq": freqs, "power": pulse_mean}).to_csv(
         os.path.join(SAVE_DIR, "spectrum_trig.csv"), index=False)
 
-# # nach Generate_CSD_mean(...)
-# if isinstance(CSD_spont, np.ndarray):
-#     np.save(os.path.join(SAVE_DIR, "csd_spont.npy"), CSD_spont)
-# if isinstance(CSD_trig, np.ndarray):
-#     np.save(os.path.join(SAVE_DIR, "csd_trig.npy"), CSD_trig)
 
 
 
 
-
-# ========= Ax-fähige Mini-Plotter =========
+# Ax-fähige Mini-Plotter 
 def lfp_overview_with_labels_ax(
     time_s,
     main_channel,
@@ -813,7 +1040,6 @@ def lfp_overview_with_labels_ax(
 
     # y-Limits vom Signal holen und für Puls-Linien verwenden
     y0, y1 = ax.get_ylim()
-
 
     # 2) Helper zum sicheren Zeichnen
     def _shade_intervals(up_idx, down_idx, color, label):
@@ -839,7 +1065,7 @@ def lfp_overview_with_labels_ax(
     _shade_intervals(Pulse_triggered_UP,   Pulse_triggered_DOWN,   "#ff7f0e", "UP triggered")
     _shade_intervals(Pulse_associated_UP,  Pulse_associated_DOWN,  "#1f77b4", "UP associated")
 
-    # 4) Pulsezeiten (falls vorhanden) – in aktuelle y-Limits zeichnen
+    # 4) Pulsezeiten, falls vorhanden, in aktuelle y-Limits zeichnen
     if pulse_times_1 is not None and len(pulse_times_1):
         t1 = np.asarray(pulse_times_1, float)
         # Bei extrem vielen Pulsen ausdünnen (max ~800 Linien)
@@ -936,40 +1162,6 @@ def Total_power_plot_ax(Spect_dat, Total_power=None, ax=None, title="Gesamtleist
         ax.text(0.5, 0.5, f"Power-Plot fehlgeschlagen:\n{e}", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
     return fig
-
-
-# def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=0.05, ax=None):
-#     if ax is None:
-#         fig, ax = plt.subplots(figsize=(8,3))
-#     else:
-#         fig = ax.figure
-
-#     # Robustheit
-#     if freqs is None or spont_mean is None or pulse_mean is None or len(freqs) == 0:
-#         ax.text(0.5, 0.5, "no spectra", ha="center", va="center", transform=ax.transAxes)
-#         return fig
-
-#     ax.plot(freqs, spont_mean, label="Spontan", lw=2)
-#     ax.plot(freqs, pulse_mean, label="Getriggert", lw=2)
-
-#     # Signifikanz-Bänder (optional)
-#     import numpy as np
-#     if p_vals is not None and np.size(p_vals) == np.size(freqs):
-#         sig = (p_vals < alpha)
-#         if np.any(sig):
-#             idx = np.where(sig)[0]
-#             start = idx[0]
-#             for i in range(1, len(idx) + 1):
-#                 if i == len(idx) or idx[i] != idx[i-1] + 1:
-#                     ax.axvspan(freqs[start], freqs[idx[i-1]], alpha=0.12)
-#                     if i < len(idx):
-#                         start = idx[i]
-
-#     ax.set_xlabel("Hz")
-#     ax.set_ylabel("Power (a.u.)")
-#     ax.set_title("Power (Spontan vs. Getriggert)")
-#     ax.legend()
-#     return fig
 
 
 def CSD_compare_side_by_side_ax(
@@ -1102,8 +1294,6 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         df.to_csv(path, sep=";", index=False, encoding="utf-8")
 
-    # Verzeichnisse ableiten:
-    #   summary_path = …/For David/<Parent>/<Experiment>/upstate_summary.csv
     exp_dir       = os.path.dirname(summary_path)
     parent_dir    = os.path.dirname(exp_dir)        
     for_david_dir = os.path.dirname(parent_dir)     
@@ -1134,30 +1324,6 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
 
 
 
-# svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED_realamp.svg")
-# ch_names_for_plot = [f"pri_{i}" for i in range(LFP_array.shape[0])]
-# save_all_channels_stacked_svg_realamp(
-#     svg_path,
-#     time_s,
-#     LFP_array,
-#     ch_names=ch_names_for_plot,
-#     height_per_channel=0.6,  # mehr Platz -> Seite füllt sich
-#     gain=1.0,                # z.B. 0.7 kleiner / 1.5 größer
-#     spacing_mult=1.4,        # mehr Luft zwischen Kanälen
-#     lw=0.6
-# )
-# print("[SVG] all channels (real amp):", svg_path)
-
-# --- Gefilterte Variante (nach Kanal-Qualitätsfilter) ---
-# svg_path_good = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED_realamp_GOOD.svg")
-# save_all_channels_stacked_svg_realamp(
-#     svg_path_good, time_s, LFP_array_good, ch_names=ch_names_good,
-#     height_per_channel=0.6, gain=1.0, spacing_mult=1.4, lw=0.6
-# )
-# print("[SVG] all channels (real amp, filtered):", svg_path_good)
-
-
-
 def save_all_channels_small_multiples_svg(
     out_svg_path,
     time_s,
@@ -1183,14 +1349,14 @@ def save_all_channels_small_multiples_svg(
         ax.grid(alpha=0.15)
 
     axes[-1].set_xlabel("Zeit (s)")
-    fig.suptitle(f"Alle Kanäle — Small Multiples (echte Amplitude), n={n_ch}", y=0.995)
+    fig.suptitle(f"Alle Kanäle, n={n_ch}", y=0.995)
     fig.tight_layout(rect=[0,0,1,0.985])
     fig.savefig(out_svg_path, format="svg")
     plt.close(fig)
 
 
 
-svg_path2 = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_SMALLMULT.svg")
+svg_path2 = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_.svg")
 save_all_channels_small_multiples_svg(
     svg_path2,
     time_s,
@@ -1201,20 +1367,16 @@ save_all_channels_small_multiples_svg(
 )
 print("[SVG] all channels small-multiples:", svg_path2)
 
-# --- Gefilterte Variante (nach Kanal-Qualitätsfilter) ---
-svg_path2_good = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_SMALLMULT_GOOD.svg")
+#  Gefilterte Variante (nach Kanal-Qualitätsfilter)
+svg_path2_good = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_GOOD.svg")
 save_all_channels_small_multiples_svg(
     svg_path2_good, time_s, LFP_array_good, ch_names=ch_names_good,
     height_per_channel=0.7, lw=1.0
 )
 print("[SVG] all channels small-multiples (filtered):", svg_path2_good)
 
-# === am Datei-Anfang einmalig sicherstellen ===
-# pip: pip install plotly
-import numpy as np
 
-
-# Helfer (rasterize 0-Arg-Plots & PDF-Grid) 
+# Helper
 def _render_plotfunc_to_image(plot_func):
     before = set(plt.get_fignums())
     ret = plot_func()
@@ -1289,7 +1451,7 @@ def export_onepage_custom(
             ax_midL.text(0.5, 0.5, f"Plot error (durations):\n{e}", ha="center", va="center", transform=ax_midL.transAxes)
             ax_midL.set_axis_off()
 
-        # MIDDLE RIGHT – Power spectrum compare (fallback, falls Daten fehlen)
+        # MIDDLE RIGHT – Power spectrum compare (f
         ax_midR = fig.add_subplot(gs[1, 1])
         try:
             if (freqs is not None) and (spont_mean is not None) and (pulse_mean is not None) and len(freqs):
@@ -1298,7 +1460,7 @@ def export_onepage_custom(
                 ax_midR.text(0.5, 0.5, "no spectra", ha="center", va="center", transform=ax_midR.transAxes)
                 ax_midR.set_axis_off()
         except NameError:
-            # falls die Funktion in deiner Datei fehlt
+            # falls die Funktion in Datei fehlt
             ax_midR.text(0.5, 0.5, "Power_spectrum_compare_ax() nicht definiert", ha="center", va="center", transform=ax_midR.transAxes)
             ax_midR.set_axis_off()
         except Exception as e:
@@ -1327,22 +1489,7 @@ def export_onepage_custom(
     print(f"[PDF] geschrieben: {out_pdf}")
 
 
-# ==== AUFRUF (statt export_vertical_stacked_pages_vector(...)) ====
-# export_onepage_custom(
-#     BASE_TAG, SAVE_DIR,
-#     main_channel=main_channel, time_s=time_s,
-#     Spontaneous_UP=Spontaneous_UP, Spontaneous_DOWN=Spontaneous_DOWN,
-#     Pulse_triggered_UP=Pulse_triggered_UP, Pulse_triggered_DOWN=Pulse_triggered_DOWN,
-#     Pulse_associated_UP=Pulse_associated_UP, Pulse_associated_DOWN=Pulse_associated_DOWN,
-#     pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
-#     dt=dt, freqs=freqs, spont_mean=spont_mean, pulse_mean=pulse_mean, p_vals=p_vals,
-#     CSD_spont=CSD_spont, CSD_trig=CSD_trig,
-#     align_pre=align_pre, align_post=align_post,
-#     dz_um=100.0, cmap="turbo", sat_pct=90, interp="bilinear", contours=True
-# )
 
-
-from matplotlib import gridspec
 
 def plot_up_classification_ax(
     main_channel, time_s,
@@ -1354,16 +1501,8 @@ def plot_up_classification_ax(
     Spon_Peaks=None, Trig_Peaks=None,
     ax=None, title="Main channel with UP classification"
 ):
-    """
-    Zeichnet den Hauptkanal (LFP) und markiert Bereiche:
-      grün = Spontaneous UP
-      blau = Triggered UP
-      orange = Associated UP
-    Zusätzlich: Pulse als vlines, optionale Peak-Marker.
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-    import numpy as np
+  
+   
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(10, 3))
@@ -1445,61 +1584,6 @@ def plot_up_classification_ax(
 
     return fig
 
-# def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None,
-#                               alpha=0.05, ax=None, title="Power (Spon vs. Trig)"):
-#     import numpy as np
-#     import matplotlib.pyplot as plt
-
-#     if ax is None:
-#         fig, ax = plt.subplots(figsize=(8,3))
-#     else:
-#         fig = ax.figure
-
-#     # Existenz + Arrays glätten
-#     if freqs is None or spont_mean is None or pulse_mean is None:
-#         ax.text(0.5,0.5,"no spectra", ha="center", va="center", transform=ax.transAxes)
-#         return fig
-#     freqs      = np.asarray(freqs).ravel()
-#     spont_mean = np.asarray(spont_mean).ravel()
-#     pulse_mean = np.asarray(pulse_mean).ravel()
-
-#     # Längen abgleichen, NaNs filtern
-#     m = min(freqs.size, spont_mean.size, pulse_mean.size)
-#     if m < 3:
-#         ax.text(0.5,0.5,"invalid/empty spectra", ha="center", va="center", transform=ax.transAxes)
-#         return fig
-#     freqs, spont_mean, pulse_mean = freqs[:m], spont_mean[:m], pulse_mean[:m]
-#     good = np.isfinite(freqs) & np.isfinite(spont_mean) & np.isfinite(pulse_mean)
-#     if good.sum() < 3:
-#         ax.text(0.5,0.5,"spectra have too many NaNs", ha="center", va="center", transform=ax.transAxes)
-#         return fig
-#     freqs, spont_mean, pulse_mean = freqs[good], spont_mean[good], pulse_mean[good]
-
-#     # Plot
-#     ax.plot(freqs, spont_mean, label="Spontan",  lw=2)
-#     ax.plot(freqs, pulse_mean, label="Getriggert", lw=2)
-
-#     # Optional: Signifikanzschattierung
-#     if p_vals is not None:
-#         p_vals = np.asarray(p_vals).ravel()[:len(freqs)]
-#         sig = np.isfinite(p_vals) & (p_vals < alpha)
-#         if sig.any():
-#             idx = np.where(sig)[0]
-#             starts = [idx[0]]
-#             for i in range(1, len(idx)):
-#                 if idx[i] != idx[i-1] + 1:
-#                     starts.append(idx[i])
-#             ends = []
-#             for s in starts[1:] + [None]:
-#                 ends.append(idx[np.where(idx < s)[0][-1]] if s is not None else idx[-1])
-#             for s, e in zip(starts, ends):
-#                 ax.axvspan(freqs[s], freqs[e], alpha=0.12, lw=0)
-
-#     ax.set_xlabel("Frequenz (Hz)")
-#     ax.set_ylabel("Power (a.u.)")
-#     ax.set_title(title)
-#     ax.legend()
-#     return fig
 
 def _blank_ax(ax, msg=None):
     ax.axis("off")
@@ -1530,13 +1614,9 @@ def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=
     ax.set_title("Power (Spontan vs. Getriggert)"); ax.legend()
     return fig
 
+
+
 def _save_all_channels_svg_from_df(df, out_svg, *, max_points=20000):
-    """
-    df: DataFrame mit Spalten [time, ch* / pri_* / ...]
-    Plottet alle nicht-zeit Kanäle gestapelt und speichert als SVG.
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
 
     assert "time" in df.columns, "CSV braucht 'time'-Spalte"
     t = pd.to_numeric(df["time"], errors="coerce").to_numpy(dtype=float)
@@ -1629,84 +1709,7 @@ def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *
 
 
 
-
-# ========= plot_specs (ax-basierte Lambdas; NICHT überschreiben) =========
-# plot_specs = [
-#     # 1) Hauptkanal mit Klassifikationen (der gewünschte Plot)
-#     # 1) Hauptkanal mit Klassifikationen (der gewünschte Plot mit Pulsen)
-#     lambda ax: plot_up_classification_ax(
-#         main_channel, time_s,
-#         Spontaneous_UP, Spontaneous_DOWN,
-#         Pulse_triggered_UP, Pulse_triggered_DOWN,
-#         Pulse_associated_UP, Pulse_associated_DOWN,
-#         pulse_times_1=pulse_times_1,           # <— HINZU
-#         pulse_times_2=pulse_times_2,           # <— HINZU
-#         #Spon_Peaks=Spon_Peaks,                 # optional
-#         #Trig_Peaks=Up.get("Trig_Peaks", np.array([], int)),  # optional
-#         ax=ax
-#     ),
-
-#      lambda ax: _blank_ax(ax),
-#  # Zeile 2 — zwei zusammen
-#     lambda ax: upstate_duration_compare_ax(
-#         Pulse_triggered_UP, Pulse_triggered_DOWN,
-#         Spontaneous_UP, Spontaneous_DOWN, dt, ax=ax
-#     ),
-#     # Power spectrum nur anhängen, wenn vorhanden
-#     (lambda ax: Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax))
-#       if (freqs is not None and spont_mean is not None and pulse_mean is not None and len(freqs))
-#       else (lambda ax: _blank_ax(ax, "no spectra")),
-
-#     # Zeile 3 — groß (CSD)
-#     (lambda ax: CSD_compare_side_by_side_ax(
-#         CSD_spont, CSD_trig, dt,
-#         dz_um=100.0, align_pre=align_pre, align_post=align_post,
-#         cmap="turbo", sat_pct=90, interp="bilinear", contours=True,
-#         ax=ax, title="CSD (Spont vs. Trig; gemeinsame Zeitachse, 0 mm oben)"
-#     )) if (
-#         CSD_spont is not None and getattr(CSD_spont, "ndim", 0) == 2 and
-#         CSD_trig  is not None and getattr(CSD_trig,  "ndim",  0) == 2
-#     ) else (lambda ax: _blank_ax(ax, "no CSD")),
-#     lambda ax: _blank_ax(ax),
-# ]
-
-# # 6) Power-Spektrum (nur falls vorhanden)
-# if (freqs is not None) and (spont_mean is not None) and (pulse_mean is not None) and len(freqs):
-#     plot_specs.append(lambda ax: Power_spectrum_compare_ax(
-#         freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax
-#     ))
-
-# # 7) CSD: zwei Panels, gleiche Zeitachse, 0 mm oben
-# if (CSD_spont is not None and getattr(CSD_spont, "ndim", 0) == 2 and
-#     CSD_trig  is not None and getattr(CSD_trig,  "ndim",  0) == 2):
-#     plot_specs.append(lambda ax: CSD_compare_side_by_side_ax(
-#         CSD_spont, CSD_trig, dt,
-#         dz_um=100.0,                # ggf. an dein Kanalabstand anpassen
-#         align_pre=align_pre,        # kommt aus pre_post_condition(dt)
-#         align_post=align_post,
-#         cmap="turbo",
-#         sat_pct=90,
-#         interp="bilinear",
-#         contours=True,  
-#         ax=ax,
-#         title="CSD (Spont vs. Trig)"
-#     ))
-
-
-
-
-
-
-# Export (
-#export_vertical_stacked_pages_vector(
-#    BASE_TAG, SAVE_DIR, plot_specs,
-#    cols=2, rows_per_page=2,
-#    tile_w=5.6, tile_h=4.0,
-#    also_save_each_svg=True
-#)
-
-
-# ========= Layout definieren (Zeilen) =========
+#  Layout definieren (Zeilen)
 layout_rows = [
     # REIHE 1: Main channel (volle Breite)
     [lambda ax: plot_up_classification_ax(
@@ -1727,8 +1730,13 @@ layout_rows = [
      lambda ax: Power_spectrum_compare_ax(
         freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax
     )],
+    
+ # REIHE 3: Amplituden-Vergleich (volle Breite)
+    [lambda ax: upstate_amplitude_compare_ax(
+        spont_amp, trig_amp, ax=ax, title="UP Amplitude (max-min): Spontan vs. Getriggert"
+    )],
 
-    # REIHE 3: CSD (volle Breite)
+    # REIHE 4: CSD (volle Breite)
     [lambda ax: CSD_compare_side_by_side_ax(
         CSD_spont, CSD_trig, dt,
         dz_um=100.0,                     # bei Bedarf anpassen
@@ -1743,10 +1751,10 @@ layout_rows = [
 
 def _write_summary_csv():
     import csv, io
-    # --- 1) Zielpfad
+    # Zielpfad
     summary_path = os.path.join(BASE_PATH, "upstate_summary.csv")
 
-    # --- 2) Delimiter erkennen (falls Datei existiert), sonst Standard = ';'
+    # Delimiter erkennen (falls Datei existiert), sonst Standard = ';'
     delimiter = ';'
     if os.path.isfile(summary_path):
         with open(summary_path, "r", newline="", encoding="utf-8") as f:
@@ -1757,7 +1765,7 @@ def _write_summary_csv():
         except Exception:
             pass  # bleibt bei ';'
 
-    # --- 3) Feldnamen (Schema)
+    # Feldnamen (Schema)
     FIELDNAMES = [
         "Parent","Experiment","Dauer [s]","Samplingrate [Hz]","Kanäle",
         "Pulse count 1","Pulse count 2",
@@ -1767,10 +1775,10 @@ def _write_summary_csv():
         "Datum Analyse",
     ]
 
-    # --- 4) Helfer: numpy/NaN -> plain
+    # Helfer: numpy/NaN -> plain
     def _py(v):
+        import numpy as _np 
         try:
-            import numpy as _np
             if isinstance(v, (_np.floating, _np.float32, _np.float64)):
                 f = float(v);  return "" if (f != f) else f  # NaN -> ""
             if isinstance(v, (_np.integer,)): return int(v)
@@ -1780,7 +1788,7 @@ def _write_summary_csv():
         if isinstance(v, float): return "" if (v != v) else round(v, 6)
         return v
 
-    # --- 5) aktuelle Zeile bauen
+    # aktuelle Zeile bauen
     experiment_name = os.path.basename(BASE_PATH)
     parent_folder   = os.path.basename(os.path.dirname(BASE_PATH))
 
@@ -1829,12 +1837,12 @@ def _write_summary_csv():
         "Datum Analyse": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
     }
 
-    # ---- Debug: zeig die Zeile im Log
+    # Debug: zeig die Zeile im Log
     print("[SUMMARY] target:", summary_path)
     print("[SUMMARY] delimiter:", repr(delimiter))
     print("[SUMMARY] row:", {k: _py(v) for k,v in row.items()})
 
-    # --- 6) vorhandene Zeilen laden & aufs Schema mappen
+    # vorhandene Zeilen laden & aufs Schema mappen
     rows = []
     if os.path.isfile(summary_path):
         with open(summary_path, "r", newline="", encoding="utf-8") as f:
@@ -1842,7 +1850,7 @@ def _write_summary_csv():
             for r in rdr:
                 rows.append({k: r.get(k, "") for k in FIELDNAMES})
 
-    # --- 7) updaten oder anhängen (Match: Parent+Experiment)
+    # updaten oder anhängen (Match: Parent+Experiment)
     updated = False
     for r in rows:
         if r.get("Experiment","") == experiment_name and r.get("Parent","") == parent_folder:
@@ -1853,7 +1861,7 @@ def _write_summary_csv():
     if not updated:
         rows.append({k: _py(row.get(k, "")) for k in FIELDNAMES})
 
-    # --- 8) zurückschreiben mit erkanntem Delimiter
+    # zurückschreiben mit erkanntem Delimiter
     with open(summary_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDNAMES, delimiter=delimiter)
         w.writeheader()
@@ -1870,7 +1878,7 @@ def _write_summary_csv():
         print("[SUMMARY][ROLLUP][ERROR]", e)
 
 
-def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=3, also_save_each_svg=True):
+def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_save_each_svg=True):
     """
     layout_rows: Liste von Zeilen.
       - [callable]                -> 1 Plot, volle Breite (spannt 2 Spalten)
@@ -1937,10 +1945,11 @@ def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=3, also_sa
 
 
 
-# ========= Export aufrufen =========
+# Export aufrufen 
 export_with_layout(
     BASE_TAG, SAVE_DIR, layout_rows,
     rows_per_page=3,          # 3 Zeilen -> alles auf eine Seite
     also_save_each_svg=True
 )
+
 

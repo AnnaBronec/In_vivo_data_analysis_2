@@ -125,7 +125,7 @@ def plot_upstate_amplitude_mean(main_channel, UP_start_i, DOWN_start_i, start_id
         fig.tight_layout()
         print(f"✅ Durchschnittliche Amplitude von UPs {start_idx}–{end_idx}: {avg_amp:.4f}")
     else:
-        print("❌ Keine gültigen UP-Zustände gefunden.")
+        print("Keine gültigen UP-Zustände gefunden.")
     return fig
 
 def plot_upstate_amplitude_blocks_colored(main_channel, UP_start_i, DOWN_start_i, index_blocks, filename):
