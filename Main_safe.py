@@ -4,15 +4,18 @@
 # ========= Imports =========
 import os, math
 import numpy as np
+_np = np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm, SymLogNorm
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Patch
 from loader_old import load_LFP_new
 from matplotlib import gridspec
 from scipy.signal import welch
+from matplotlib.colors import SymLogNorm
 try:
     from preprocessing import downsampling_old as _ds_fun
 except ImportError:
@@ -50,7 +53,8 @@ def export_interactive_lfp_html(
     up_assoc=None,       # Tuple (UP_idx, DOWN_idx)
     max_points=300_000,
     title="LFP (interaktiv)",
-    limit_to_last_pulse=False
+    limit_to_last_pulse=False,
+    y_label="LFP (µV)"
 ):
     """
     Erstellt eine interaktive HTML mit Range-Slider und Zoom/Pan.
@@ -179,7 +183,7 @@ def export_interactive_lfp_html(
     fig.update_layout(
         title=title,
         xaxis=dict(title="Zeit (s)", rangeslider=dict(visible=True)),
-        yaxis=dict(title="LFP (a.u.)"),
+        yaxis=dict(title=y_label),
         shapes=shapes,
         margin=dict(l=60, r=20, t=50, b=50),
         template="plotly_white",
@@ -190,79 +194,6 @@ def export_interactive_lfp_html(
     plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
     print(f"[HTML] interaktiver LFP-Plot: {out_html}")
     return out_html
-
-
-# #HTML
-# def export_interactive_lfp_html(
-#     base_tag, save_dir, time_s, y,
-#     pulse_times_1=None, pulse_times_2=None,
-#     *,
-#     up_spont=None,       # Tuple (UP_idx, DOWN_idx) in SAMPLE-INDIZES
-#     up_trig=None,        # Tuple (UP_idx, DOWN_idx)
-#     up_assoc=None,       # Tuple (UP_idx, DOWN_idx)
-#     max_points=300_000,
-#     title="LFP (interaktiv)",
-#     limit_to_last_pulse=False
-# ):
-#     """
-#     Erstellt eine interaktive HTML mit Range-Slider und Zoom/Pan.
-#     - time_s: 1D array (Sekunden)
-#     - y:      1D array (LFP)
-#     - pulse_times_*: Sekunden (optional)
-#     - max_points: wenn Signal sehr lang ist -> decimieren
-#     """
-#     import plotly.graph_objects as go
-#     from plotly.offline import plot as plotly_offline_plot
-#     import os
-
-#     t = np.asarray(time_s, dtype=float)
-#     x = np.asarray(y, dtype=float)
-
-#     # robustes Decimate (nur für die Darstellung, Daten bleiben unverändert)
-#     if t.size > max_points:
-#         step = int(np.ceil(t.size / max_points))
-#         t = t[::step]
-#         x = x[::step]
-
-#     fig = go.Figure()
-#     fig.add_trace(go.Scatter(x=t, y=x, mode="lines", name="LFP"))
-
-#     # Puls-Linien als „Shapes“, damit sie nicht in die y-Skalierung reinpfuschen
-#     shapes = []
-#     def _add_pulses(ts, dash):
-#         if ts is None or len(ts) == 0:
-#             return
-#         # ausdünnen, wenn seeehr viele Pulse
-#         tt = np.asarray(ts, float)
-#         if tt.size > 1200:
-#             tt = tt[::int(np.ceil(tt.size/1200))]
-#         for p in tt:
-#             shapes.append(dict(
-#                 type="line",
-#                 x0=float(p), x1=float(p),
-#                 y0=0, y1=1,                  # relative y (0..1)
-#                 xref="x", yref="paper",
-#                 opacity=0.35,                # <-- HIER (Top-Level)
-#                 line=dict(width=1, dash=dash, color="red")
-#             ))
-
-#     _add_pulses(pulse_times_1, "dot")
-#     _add_pulses(pulse_times_2, "dash")
-
-#     fig.update_layout(
-#         title=title,
-#         xaxis=dict(title="Zeit (s)", rangeslider=dict(visible=True)),
-#         yaxis=dict(title="LFP (a.u.)"),
-#         shapes=shapes,
-#         margin=dict(l=60, r=20, t=50, b=50),
-#         template="plotly_white",
-#     )
-
-#     out_html = os.path.join(save_dir, f"{base_tag}__lfp_interactive.html")
-#     plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
-#     print(f"[HTML] interaktiver LFP-Plot: {out_html}")
-#     return out_html
-
 
 # Stelle das auf deine XDAT-Samplingrate ein:
 DEFAULT_FS_XDAT = 32000.0   #ist das richtig?
@@ -315,6 +246,53 @@ assert "time" in LFP_df.columns, "CSV braucht eine Spalte 'time'."
 time_full = LFP_df["time"].to_numpy(float)
 print("[INFO] CSV rows:", len(LFP_df),
       "time range:", float(LFP_df["time"].iloc[0]), "->", float(LFP_df["time"].iloc[-1]))
+
+
+
+# ========= KALIBRATION zu echten Einheiten =========
+# Stelle das exakt für dein Setup ein:
+CALIB_MODE = "counts"   # "counts" | "volts" | "uV"
+ADC_BITS   = 16         # z.B. 16-bit
+ADC_VPP    = 10.0       # Peak-to-Peak des ADC in Volt (±5V => 10.0)
+PREAMP_GAIN = 1000.0    # Gesamt-Gain vor dem ADC (z.B. 1000x). Falls kanal-spezifisch, unten 'PER_CH_GAIN' nutzen.
+
+# optional: kanal-spezifische Gains (Original-Spaltennamen nutzen, vor 'pri_*' Umbenennung)
+PER_CH_GAIN = {
+    # "CSC1_values": 2000.0,
+    # "CSC2_values": 1000.0,
+}
+
+UNIT_LABEL = "µV/mm²"          # wird für Plot-Labels genutzt
+PSD_UNIT_LABEL = "µV²/Hz"
+
+def _counts_to_uV(x, bits, vpp, gain):
+    # x = integer/float "counts" (LSB), vpp = Volt p-p
+    lsb_volt = float(vpp) / (2**bits)          # Volt pro LSB
+    return (np.asarray(x, float) * lsb_volt / float(gain)) * 1e6  # -> µV
+
+def _volts_to_uV(x):
+    return np.asarray(x, float) * 1e6
+
+def convert_df_to_uV(df, mode):
+    df = df.copy()
+    chan_cols_orig = [c for c in df.columns if c not in ("time","stim","din_1","din_2")]
+    if mode == "uV":
+        # bereits µV – nichts tun
+        return df
+    elif mode == "volts":
+        for c in chan_cols_orig:
+            df[c] = _volts_to_uV(pd.to_numeric(df[c], errors="coerce"))
+        return df
+    elif mode == "counts":
+        for c in chan_cols_orig:
+            g = PER_CH_GAIN.get(c, PREAMP_GAIN)
+            df[c] = _counts_to_uV(pd.to_numeric(df[c], errors="coerce"), ADC_BITS, ADC_VPP, g)
+        return df
+    else:
+        raise ValueError(f"Unbekannter CALIB_MODE: {mode}")
+
+# ---- Anwenden: LFP_df in µV bringen (vor weiterer Verarbeitung) ----
+LFP_df = convert_df_to_uV(LFP_df, CALIB_MODE)
 
 
 # def _is_quasi_binary_trace(x):
@@ -651,7 +629,7 @@ def _stim_window(p1, p2):
     t0 = min(x[0] for x in ts)
     t1 = max(x[1] for x in ts)
     # ein kleines Polster ist oft hilfreich:
-    pad = 0.0  # z.B. 0.5 wenn gewünscht
+    pad = 0.5  # z.B. 0.5 wenn gewünscht
     return t0 - pad, t1 + pad
 
 win = _stim_window(pulse_times_1, pulse_times_2)
@@ -666,33 +644,7 @@ if win is not None:
     # Zeit/Signale croppen (ALLE synchron!)
     time_s       = time_s[i0:i1]
     LFP_array    = LFP_array[:, i0:i1]
-    # main_channel = LFP_array[0, :]  
 
-    # # Hauptkanal festlegen 
-    # ch_idx = 10
-    # if ch_idx < 0 or ch_idx >= NUM_CHANNELS:
-    #     raise ValueError(f"Channel {ch_idx} existiert nicht (nur {NUM_CHANNELS} Kanäle vorhanden).")
-    # main_channel = LFP_array[ch_idx, :]
-    # print(f"[INFO] main_channel = pri_{ch_idx}, len={len(main_channel)}, time_len={len(time_s)}")
-    
-#         # Interaktiver Plot (gesamtes Signal)
-#     export_interactive_lfp_html(
-#     BASE_TAG, SAVE_DIR, time_s, main_channel,
-#     pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
-#     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
-#     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
-#     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
-#     limit_to_last_pulse=True,  # optional
-#     title=f"{BASE_TAG} — Main LFP (interaktiv)"
-# )
-
-
-    # export_interactive_lfp_html(
-    #     BASE_TAG, SAVE_DIR, time_s, main_channel,
-    #     pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
-    #     max_points=300_000,  # ggf. erhöhen/verringern
-    #     title=f"{BASE_TAG} — Main LFP (interaktiv)"
-    # )
 
     # Pulse-Zeiten aufs Fenster begrenzen 
     if pulse_times_1 is not None:
@@ -786,19 +738,37 @@ LFP_array_good    = LFP_array[good_idx, :]
 ch_names_good     = [f"pri_{j}" for j in good_idx]
 NUM_CHANNELS_GOOD = len(good_idx)
 
+# Physikalische Tiefe für die behaltenen Kanäle (good_idx) 
+DZ_UM = 100.0  # dein Elektrodenabstand (um)
+z_mm = (np.asarray(good_idx, float) - float(np.min(good_idx))) * (DZ_UM / 1000.0)
+z_mm_csd = z_mm[1:-1]
+
+
 if reasons:
     print("[CHAN-FILTER] excluded:", ", ".join([f"pri_{j}({r})" for j, r in reasons]))
 print(f"[CHAN-FILTER] kept {NUM_CHANNELS_GOOD}/{NUM_CHANNELS} Kanäle:", ch_names_good[:10], ("..." if NUM_CHANNELS_GOOD>10 else ""))
 
 
-b_lp, a_lp, b_hp, a_hp = filtering(HIGH_CUTOFF, LOW_CUTOFF, dt)
+b_lp, a_lp, b_hp, a_hp = filtering(LOW_CUTOFF, HIGH_CUTOFF, dt)  # 2, 10
+
 
 
 print(f"[INFO] NUM_CHANNELS={NUM_CHANNELS}, main_channel_len={len(main_channel)}")
-
 pre, post, win_len, align_pre, align_post, align_len = pre_post_condition(dt)
-Spect_dat = Run_spectrogram(main_channel, time_s)
 
+# identisches Zeitfenster wie im alten Code (±0.5 s um den Peak) ---
+FIXED_ALIGN_PRE_S  = 0.5   # 0.5 s vor Peak
+FIXED_ALIGN_POST_S = 0.5   # 0.5 s nach Peak
+
+align_pre  = int(round(FIXED_ALIGN_PRE_S  / dt))
+align_post = int(round(FIXED_ALIGN_POST_S / dt))
+align_len  = align_pre + align_post
+
+align_pre_s  = FIXED_ALIGN_PRE_S
+align_post_s = FIXED_ALIGN_POST_S
+
+
+Spect_dat = Run_spectrogram(main_channel, time_s)
 
 try:
     _save_all_channels_svg_from_array(
@@ -927,7 +897,7 @@ def upstate_amplitude_compare_ax(spont_amp, trig_amp, ax=None, title="UP Amplitu
         se = float(_sem(arr))
         ax.errorbar(i+0.28, m, yerr=se, fmt="s", ms=5, capsize=4)
 
-    ax.set_ylabel("Amplitude (max - min, a.u.)")
+    ax.set_ylabel(f"Amplitude ({UNIT_LABEL})")
     ax.set_title(title)
     ax.grid(alpha=0.15, linestyle=":")
     return fig
@@ -966,8 +936,9 @@ export_interactive_lfp_html(
     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
-    limit_to_last_pulse=True,  # bei Sessions mit Pulsen praktisch
-    title=f"{BASE_TAG} — Main LFP (interaktiv)"
+    limit_to_last_pulse=False,  # bei Sessions mit Pulsen praktisch
+    title=f"{BASE_TAG} — Main LFP (interaktiv)",
+    y_label=f"LFP ({UNIT_LABEL})"
 )
 
 
@@ -984,8 +955,21 @@ try:
 except Exception as e:
     print("[WARN] spectra compare skipped:", e)
 
+
+def _valid_peaks(peaks, n):
+    import numpy as np
+    p = np.asarray(peaks, int)
+    return p[(p >= 0) & (p < n)]
+
+# ...
+# Vor CSD-Berechnung:
+n_time = LFP_array_good.shape[1]
+Spon_Peaks = _valid_peaks(Up.get("Spon_Peaks", []), n_time)
+Trig_Peaks = _valid_peaks(Up.get("Trig_Peaks", []), n_time)
+
+
 CSD_spont = CSD_trig = None
-if NUM_CHANNELS >= 7:
+if NUM_CHANNELS >= 3:
     try:
         Trig_Peaks = Up.get("Trig_Peaks", np.array([], float))
         CSD_spont = CSD_trig = None
@@ -997,12 +981,72 @@ if NUM_CHANNELS >= 7:
             except Exception as e:
                 print("[WARN] CSD skipped:", e)
         else:
-            print(f"[INFO] CSD skipped: only {NUM_CHANNELS_GOOD} good channels (<7).")
+            print(f"[INFO] CSD skipped: only {NUM_CHANNELS_GOOD} good channels (<3).")
 
     except Exception as e:
         print("[WARN] CSD skipped:", e)
 else:
-    print(f"[INFO] CSD skipped: only {NUM_CHANNELS} channels (<7).")
+    print(f"[INFO] CSD skipped: only {NUM_CHANNELS} channels (<3).")
+
+# ====== DIAGNOSE: Spont vs Triggered CSD ======
+def _nan_stats(name, arr):
+    import numpy as np
+    if arr is None:
+        print(f"[DIAG] {name}: None"); return
+    a = np.asarray(arr, float)
+    print(f"[DIAG] {name}: shape={a.shape}, NaN%={np.mean(~np.isfinite(a))*100:.2f}%")
+    if a.size:
+        aa = np.abs(a[np.isfinite(a)])
+        qs = np.nanpercentile(aa, [50, 90, 99, 99.9])
+        print(f"[DIAG] {name} |abs| quantiles: 50%={qs[0]:.3g}, 90%={qs[1]:.3g}, 99%={qs[2]:.3g}, 99.9%={qs[3]:.3g}")
+
+def _rms(a):
+    import numpy as np
+    a = np.asarray(a, float); a = a[np.isfinite(a)]
+    return float(np.sqrt(np.mean(a*a))) if a.size else np.nan
+
+def _check_peak_indices(label, peaks, n):
+    import numpy as np
+    p = np.asarray(peaks, int)
+    bad = np.sum((p < 0) | (p >= n))
+    print(f"[DIAG] {label}: count={p.size}, out_of_bounds={bad} (n_time={n})")
+
+# 0) Event-Zahlen + Index-Gültigkeit
+_check_peak_indices("Spon_Peaks", Up.get("Spon_Peaks", []), LFP_array_good.shape[1])
+_check_peak_indices("Trig_Peaks", Up.get("Trig_Peaks", []), LFP_array_good.shape[1])
+
+# 1) CSD-Grundstats
+_nan_stats("CSD_spont", CSD_spont)
+_nan_stats("CSD_trig",  CSD_trig)
+print(f"[DIAG] RMS CSD: spont={_rms(CSD_spont):.4g}, trig={_rms(CSD_trig):.4g}")
+
+# 2) Gleiche Event-Anzahl erzwingen (fairer Vergleich)
+Spon_Peaks_eq = Up.get("Spon_Peaks", np.array([], float))
+Trig_Peaks_eq = Up.get("Trig_Peaks", np.array([], float))
+m = min(len(Spon_Peaks_eq), len(Trig_Peaks_eq))
+if m >= 3:
+    Spon_Peaks_eq = np.asarray(Spon_Peaks_eq, int)[:m]
+    Trig_Peaks_eq  = np.asarray(Trig_Peaks_eq,  int)[:m]
+    try:
+        CSD_spont_eq = Generate_CSD_mean(Spon_Peaks_eq, LFP_array_good, dt)
+        CSD_trig_eq  = Generate_CSD_mean(Trig_Peaks_eq,  LFP_array_good, dt)
+        print(f"[DIAG] RMS CSD (equal N={m}): spont={_rms(CSD_spont_eq):.4g}, trig={_rms(CSD_trig_eq):.4g}")
+        _nan_stats("CSD_spont_eq", CSD_spont_eq)
+        _nan_stats("CSD_trig_eq",  CSD_trig_eq)
+    except Exception as e:
+        print("[DIAG][WARN] Equal-N CSD failed:", e)
+else:
+    print(f"[DIAG] Equal-N Skip: not enough events (spon={len(Spon_Peaks_eq)}, trig={len(Trig_Peaks_eq)})")
+
+# 3) Prüfen, ob Cropping Spontan-Events stark reduziert
+print(f"[DIAG] Cropped time_s: {time_s[0]:.3f}..{time_s[-1]:.3f} s, pulses p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
+print(f"[DIAG] Counts: sponUP={len(Spontaneous_UP)}, trigUP={len(Pulse_triggered_UP)}, assocUP={len(Pulse_associated_UP)}")
+
+# 4) Gleiche Zeitfenster/Alignment sicher? (pre/post)
+print(f"[DIAG] align_pre={align_pre_s:.3f}s, align_post={align_post_s:.3f}s, dt={dt:.6f}s")
+
+# ====== ENDE DIAGNOSE ======
+
 
 # nach compare_spectra
 if freqs is not None and spont_mean is not None:
@@ -1012,6 +1056,62 @@ if freqs is not None and pulse_mean is not None:
     pd.DataFrame({"freq": freqs, "power": pulse_mean}).to_csv(
         os.path.join(SAVE_DIR, "spectrum_trig.csv"), index=False)
 
+
+# ====== DIAGNOSE: Spont vs Triggered CSD ======
+def _nan_stats(name, arr):
+    import numpy as np
+    if arr is None:
+        print(f"[DIAG] {name}: None"); return
+    a = np.asarray(arr, float)
+    print(f"[DIAG] {name}: shape={a.shape}, NaN%={np.mean(~np.isfinite(a))*100:.2f}%")
+    if a.size:
+        aa = np.abs(a[np.isfinite(a)])
+        qs = np.nanpercentile(aa, [50, 90, 99, 99.9])
+        print(f"[DIAG] {name} |abs| quantiles: 50%={qs[0]:.3g}, 90%={qs[1]:.3g}, 99%={qs[2]:.3g}, 99.9%={qs[3]:.3g}")
+
+def _rms(a):
+    import numpy as np
+    a = np.asarray(a, float); a = a[np.isfinite(a)]
+    return float(np.sqrt(np.mean(a*a))) if a.size else np.nan
+
+def _check_peak_indices(label, peaks, n):
+    import numpy as np
+    p = np.asarray(peaks, int)
+    bad = np.sum((p < 0) | (p >= n))
+    print(f"[DIAG] {label}: count={p.size}, out_of_bounds={bad} (n_time={n})")
+
+# 0) Event-Zahlen + Index-Gültigkeit
+_check_peak_indices("Spon_Peaks", Up.get("Spon_Peaks", []), LFP_array_good.shape[1])
+_check_peak_indices("Trig_Peaks", Up.get("Trig_Peaks", []), LFP_array_good.shape[1])
+
+# 1) CSD-Grundstats
+_nan_stats("CSD_spont", CSD_spont)
+_nan_stats("CSD_trig",  CSD_trig)
+print(f"[DIAG] RMS CSD: spont={_rms(CSD_spont):.4g}, trig={_rms(CSD_trig):.4g}")
+
+# 2) Gleiche Event-Anzahl erzwingen (fairer Vergleich)
+Spon_Peaks_eq = Up.get("Spon_Peaks", np.array([], float))
+Trig_Peaks_eq = Up.get("Trig_Peaks", np.array([], float))
+m = min(len(Spon_Peaks_eq), len(Trig_Peaks_eq))
+if m >= 3:  # brauchbare Mindestzahl
+    Spon_Peaks_eq = np.asarray(Spon_Peaks_eq, int)[:m]
+    Trig_Peaks_eq = np.asarray(Trig_Peaks_eq, int)[:m]
+    try:
+        CSD_spont_eq = Generate_CSD_mean(Spon_Peaks_eq, LFP_array_good, dt)
+        CSD_trig_eq  = Generate_CSD_mean(Trig_Peaks_eq,  LFP_array_good, dt)
+        print(f"[DIAG] RMS CSD (equal N={m}): spont={_rms(CSD_spont_eq):.4g}, trig={_rms(CSD_trig_eq):.4g}")
+        _nan_stats("CSD_spont_eq", CSD_spont_eq)
+        _nan_stats("CSD_trig_eq",  CSD_trig_eq)
+    except Exception as e:
+        print("[DIAG][WARN] Equal-N CSD failed:", e)
+else:
+    print(f"[DIAG] Equal-N Skip: not enough events (spon={len(Spon_Peaks_eq)}, trig={len(Trig_Peaks_eq)})")
+
+# 3) Prüfen, ob Cropping Spontan-Events stark reduziert
+print(f"[DIAG] Cropped time_s: {time_s[0]:.3f}..{time_s[-1]:.3f} s, pulses p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
+print(f"[DIAG] Counts: sponUP={len(Spontaneous_UP)}, trigUP={len(Pulse_triggered_UP)}, assocUP={len(Pulse_associated_UP)}")
+
+print(f"[DIAG] align_pre={align_pre_s:.3f}s, align_post={align_post_s:.3f}s, dt={dt:.6f}s")
 
 
 
@@ -1093,7 +1193,7 @@ def lfp_overview_with_labels_ax(
 
     # 6) Achsen/Kleinkram
     ax.set_xlabel("Zeit (s)")
-    ax.set_ylabel("LFP (a.u.)")
+    ax.set_ylabel(f"LFP ({UNIT_LABEL})")
     ax.set_title("Main channel with UP labels (spont / triggered / associated)")
     if xlim is not None:
         ax.set_xlim(*xlim)
@@ -1123,7 +1223,7 @@ def spont_up_mean_ax(main_channel, time_s, dt, Spon_Peaks, ax=None):
         ax.text(0.5,0.5,"no spontaneous peaks", ha="center", va="center", transform=ax.transAxes); return fig
     tr=np.vstack(traces); m=np.nanmean(tr,0); se=np.nanstd(tr,0)/np.sqrt(tr.shape[0]); t=(np.arange(-half,half)*dt)
     ax.plot(t,m,lw=2); ax.fill_between(t,m-se,m+se,alpha=0.3); ax.axvline(0,ls="--",lw=1)
-    ax.set_xlabel("Time (s)"); ax.set_ylabel("LFP (a.u.)"); ax.set_title("Spontaneous UP – mean ± SEM")
+    ax.set_xlabel("Time (s)"); ax.set_ylabel(f"LFP ({UNIT_LABEL})"); ax.set_title("Spontaneous UP – mean ± SEM")
     return fig
 
 def upstate_duration_compare_ax(PU, PD, SU, SD, dt, ax=None):
@@ -1156,106 +1256,197 @@ def Total_power_plot_ax(Spect_dat, Total_power=None, ax=None, title="Gesamtleist
             raise ValueError("Empty power or t_vec")
         ax.plot(t_vec[:m], y[:m], lw=1.5)
         ax.set_xlabel("Zeit (s)")
-        ax.set_ylabel("Power (a.u.)")
+        ax.set_ylabel(f"Power ({UNIT_LABEL})")
         ax.set_title(title)
     except Exception as e:
         ax.text(0.5, 0.5, f"Power-Plot fehlgeschlagen:\n{e}", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
     return fig
 
+from matplotlib.colors import SymLogNorm, TwoSlopeNorm
 
 def CSD_compare_side_by_side_ax(
     CSD_spont, CSD_trig, dt,
-    *, dz_um=100.0, align_pre=0.5, align_post=0.5,
-    cmap="viridis", sat_pct=95, interp="bilinear",  
-    contours=False, n_contours=10,                
-    ax=None, title="CSD (Spon vs. Trig)"
+    *, z_mm=None,
+    align_pre=0.5, align_post=0.5,
+    cmap="turbo", sat_pct=98, interp="bilinear",
+    contours=False, ax=None, title="CSD (Spon vs. Trig)",
+    norm_mode="symlog",          # "symlog" | "linear"
+    linthresh_frac=0.03,         # <— NEU: Anteil von vmax für linearen Bereich
+    **_unused                    # <— NEU: toleriert unbekannte Extra-Args
 ):
-    import numpy as np
+
     import matplotlib.pyplot as plt
-    from matplotlib.colors import TwoSlopeNorm
 
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 3))
-    else:
-        fig = ax.figure
+    def _edges_from_centers(c):
+        c = _np.asarray(c, float)
+        if c.size == 1:
+            d = 0.5
+            return _np.array([c[0]-d, c[0]+d], float)
+        mid = 0.5*(c[:-1]+c[1:])
+        first = c[0] - (mid[0]-c[0])
+        last  = c[-1] + (c[-1]-mid[-1])
+        return _np.concatenate([[first], mid, [last]])
 
-    # Robustheit
-    if not (isinstance(CSD_spont, np.ndarray) and CSD_spont.ndim == 2 and
-            isinstance(CSD_trig,  np.ndarray) and CSD_trig.ndim  == 2):
-        ax.text(0.5, 0.5, "no CSD", ha="center", va="center", transform=ax.transAxes)
-        ax.set_axis_off()
+    def _robust_vmax(A, pct):
+        A = _np.asarray(A, float)
+        A = _np.abs(A[_np.isfinite(A)])
+        return float(_np.nanpercentile(A, pct)) if A.size else _np.nan
+
+    ok = lambda A: (isinstance(A, _np.ndarray) and A.ndim == 2 and A.size > 0)
+    if not (ok(CSD_spont) and ok(CSD_trig)):
+        if ax is None: fig, ax = plt.subplots(figsize=(8,3))
+        else:          fig = ax.figure
+        ax.axis("off"); ax.text(0.5,0.5,"no CSD", ha="center", va="center", transform=ax.transAxes)
         return fig
 
-    # Gemeinsame Dynamik (robustes Clipping) + Zero Center
-    stack = np.concatenate([CSD_spont.ravel(), CSD_trig.ravel()])
-    stack = stack[np.isfinite(stack)]
-    if stack.size == 0:
-        ax.text(0.5, 0.5, "invalid CSD values", ha="center", va="center", transform=ax.transAxes)
-        ax.set_axis_off()
-        return fig
-    vmax = float(np.nanpercentile(np.abs(stack), sat_pct))
-    if vmax <= 0 or not np.isfinite(vmax):
-        vmax = 1.0
-    vmin = -vmax
-    norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+    if ax is None: fig, ax = plt.subplots(figsize=(8,3))
+    else:          fig = ax.figure
 
-    # Tiefe in mm, 0 mm oben
-    n_ch_sp, _ = CSD_spont.shape
-    n_ch_tr, _ = CSD_trig.shape
-    depth_mm_max_sp = (n_ch_sp - 1) * (dz_um / 1000.0)
-    depth_mm_max_tr = (n_ch_tr - 1) * (dz_um / 1000.0)
+    # Gemeinsame Skala (robust aus beiden Matrizen)
+    v_sp = _robust_vmax(CSD_spont, sat_pct)
+    v_tr = _robust_vmax(CSD_trig,  sat_pct)
+    vals = [v for v in (v_sp, v_tr) if _np.isfinite(v) and v > 0]
+    if len(vals) == 2: vmax_joint = float(_np.sqrt(vals[0]*vals[1]))   # geometrisches Mittel
+    elif len(vals) == 1: vmax_joint = float(vals[0])
+    else: vmax_joint = 1.0
+    vmin_joint = -vmax_joint
 
-    # Gemeinsame Zeitachse
-    t_min, t_max = -float(align_pre), float(align_post)
+    # === Normierung je nach Mode ===
+    if norm_mode == "linear":
+        norm = TwoSlopeNorm(vmin=vmin_joint, vcenter=0.0, vmax=vmax_joint)
+    else:  # "symlog"
+        lt = max(float(linthresh_frac) * vmax_joint, 1e-12)
+        norm = SymLogNorm(linthresh=lt, vmin=vmin_joint, vmax=vmax_joint)
 
-    # Inset-Achsen + Colorbar
+    # Zeitkanten für pcolormesh/imshow
+    n_t = CSD_spont.shape[1]
+    t_centers = _np.linspace(-float(align_pre), float(align_post), n_t)
+    t_edges   = _edges_from_centers(t_centers)
+
     ax_left  = ax.inset_axes([0.00, 0.0, 0.45, 1.0])
     ax_right = ax.inset_axes([0.50, 0.0, 0.45, 1.0])
     cax      = ax.inset_axes([0.955, 0.1, 0.02, 0.8])
     ax.set_axis_off()
 
-    # Spont
-    imL = ax_left.imshow(
-        CSD_spont, aspect="auto", origin="upper",
-        extent=[t_min, t_max, 0.0, depth_mm_max_sp],
-        cmap=cmap, norm=norm, interpolation=interp
-    )
+    if z_mm is not None:
+        z_mm = _np.asarray(z_mm, float)
+        if z_mm.size != CSD_spont.shape[0]:
+            raise ValueError(f"z_mm hat {z_mm.size} Werte, CSD hat {CSD_spont.shape[0]} Zeilen.")
+        z_edges = _edges_from_centers(z_mm)
+        imL = ax_left.pcolormesh(t_edges, z_edges, CSD_spont, shading="auto", cmap=cmap, norm=norm)
+        imR = ax_right.pcolormesh(t_edges, z_edges, CSD_trig,  shading="auto", cmap=cmap, norm=norm)
+        for a in (ax_left, ax_right):
+            a.set_xlim(t_edges[0], t_edges[-1]); a.set_ylim(z_edges[0], z_edges[-1])
+            a.invert_yaxis(); a.set_xlabel("Zeit (s)")
+        ax_left.set_ylabel("Tiefe (mm)")
+    else:
+        extent = [-float(align_pre), float(align_post), 0.0, float((CSD_spont.shape[0]-1))]
+        imL = ax_left.imshow(CSD_spont, aspect="auto", origin="upper", extent=extent, cmap=cmap, norm=norm, interpolation=interp)
+        imR = ax_right.imshow(CSD_trig,  aspect="auto", origin="upper", extent=extent, cmap=cmap, norm=norm, interpolation=interp)
+        for a in (ax_left, ax_right): a.set_xlabel("Zeit (s)")
+        ax_left.set_ylabel("Tiefe (arb.)")
+
     ax_left.set_title("Spontaneous", fontsize=10)
-    ax_left.set_xlabel("Zeit (s)")
-    ax_left.set_ylabel("Tiefe (mm)")
-    ax_left.set_xlim(t_min, t_max)
-
-    # Trig
-    imR = ax_right.imshow(
-        CSD_trig, aspect="auto", origin="upper",
-        extent=[t_min, t_max, 0.0, depth_mm_max_tr],
-        cmap=cmap, norm=norm, interpolation=interp
-    )
     ax_right.set_title("Triggered", fontsize=10)
-    ax_right.set_xlabel("Zeit (s)")
-    ax_right.set_yticks([])
-    ax_right.set_xlim(t_min, t_max)
-
-    # Optional: Konturen (für “Paper”-Haptik)
-    if contours:
-        try:
-            levels = np.linspace(vmin, vmax, n_contours)
-            ax_left.contour(CSD_spont, levels=levels, colors="k",
-                            linewidths=0.3, origin="upper",
-                            extent=[t_min, t_max, 0.0, depth_mm_max_sp])
-            ax_right.contour(CSD_trig, levels=levels, colors="k",
-                             linewidths=0.3, origin="upper",
-                             extent=[t_min, t_max, 0.0, depth_mm_max_tr])
-        except Exception:
-            pass
-
-    cb = fig.colorbar(imR, cax=cax)
-    cb.set_label("CSD (a.u.)", rotation=90)
-
-    # Gesamttitel
+    cb = fig.colorbar(imR, cax=cax); cb.set_label(f"CSD ({UNIT_LABEL})", rotation=90)
     ax_left.set_title(title, fontsize=11, pad=22)
     return fig
+
+
+# def CSD_compare_side_by_side_ax(
+#     CSD_spont, CSD_trig, dt,
+#     *, dz_um=100.0, align_pre=0.5, align_post=0.5,
+#     cmap="viridis", sat_pct=95, interp="bilinear",  
+#     contours=False, n_contours=10,                
+#     ax=None, title="CSD (Spon vs. Trig)"
+# ):
+#     import numpy as np
+#     import matplotlib.pyplot as plt
+#     from matplotlib.colors import TwoSlopeNorm
+
+#     if ax is None:
+#         fig, ax = plt.subplots(figsize=(8, 3))
+#     else:
+#         fig = ax.figure
+
+#     # Robustheit
+#     if not (isinstance(CSD_spont, np.ndarray) and CSD_spont.ndim == 2 and
+#             isinstance(CSD_trig,  np.ndarray) and CSD_trig.ndim  == 2):
+#         ax.text(0.5, 0.5, "no CSD", ha="center", va="center", transform=ax.transAxes)
+#         ax.set_axis_off()
+#         return fig
+
+#     # Gemeinsame Dynamik (robustes Clipping) + Zero Center
+#     stack = np.concatenate([CSD_spont.ravel(), CSD_trig.ravel()])
+#     stack = stack[np.isfinite(stack)]
+#     if stack.size == 0:
+#         ax.text(0.5, 0.5, "invalid CSD values", ha="center", va="center", transform=ax.transAxes)
+#         ax.set_axis_off()
+#         return fig
+#     vmax = float(np.nanpercentile(np.abs(stack), sat_pct))
+#     if vmax <= 0 or not np.isfinite(vmax):
+#         vmax = 1.0
+#     vmin = -vmax
+#     norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+
+#     # Tiefe in mm, 0 mm oben
+#     n_ch_sp, _ = CSD_spont.shape
+#     n_ch_tr, _ = CSD_trig.shape
+#     depth_mm_max_sp = (n_ch_sp - 1) * (dz_um / 1000.0)
+#     depth_mm_max_tr = (n_ch_tr - 1) * (dz_um / 1000.0)
+
+#     # Gemeinsame Zeitachse
+#     t_min, t_max = -float(align_pre), float(align_post)
+
+#     # Inset-Achsen + Colorbar
+#     ax_left  = ax.inset_axes([0.00, 0.0, 0.45, 1.0])
+#     ax_right = ax.inset_axes([0.50, 0.0, 0.45, 1.0])
+#     cax      = ax.inset_axes([0.955, 0.1, 0.02, 0.8])
+#     ax.set_axis_off()
+
+#     # Spont
+#     imL = ax_left.imshow(
+#         CSD_spont, aspect="auto", origin="upper",
+#         extent=[t_min, t_max, 0.0, depth_mm_max_sp],
+#         cmap=cmap, norm=norm, interpolation=interp
+#     )
+#     ax_left.set_title("Spontaneous", fontsize=10)
+#     ax_left.set_xlabel("Zeit (s)")
+#     ax_left.set_ylabel("Tiefe (mm)")
+#     ax_left.set_xlim(t_min, t_max)
+
+#     # Trig
+#     imR = ax_right.imshow(
+#         CSD_trig, aspect="auto", origin="upper",
+#         extent=[t_min, t_max, 0.0, depth_mm_max_tr],
+#         cmap=cmap, norm=norm, interpolation=interp
+#     )
+#     ax_right.set_title("Triggered", fontsize=10)
+#     ax_right.set_xlabel("Zeit (s)")
+#     ax_right.set_yticks([])
+#     ax_right.set_xlim(t_min, t_max)
+
+#     # Optional: Konturen (für “Paper”-Haptik)
+#     if contours:
+#         try:
+#             levels = np.linspace(vmin, vmax, n_contours)
+#             ax_left.contour(CSD_spont, levels=levels, colors="k",
+#                             linewidths=0.3, origin="upper",
+#                             extent=[t_min, t_max, 0.0, depth_mm_max_sp])
+#             ax_right.contour(CSD_trig, levels=levels, colors="k",
+#                              linewidths=0.3, origin="upper",
+#                              extent=[t_min, t_max, 0.0, depth_mm_max_tr])
+#         except Exception:
+#             pass
+
+#     cb = fig.colorbar(imR, cax=cax)
+#     cb.set_label("CSD (µV/mm²)")
+    
+
+#     # Gesamttitel
+#     ax_left.set_title(title, fontsize=11, pad=22)
+#     return fig
 
 def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
     import os, glob
@@ -1522,7 +1713,7 @@ def plot_up_classification_ax(
     # 1) LFP trace
     ax.plot(time_s, main_channel, lw=0.8, color="black", label="LFP (main)")
     ax.set_xlabel("Zeit (s)")
-    ax.set_ylabel("LFP (a.u.)")
+    ax.set_ylabel(f"LFP ({UNIT_LABEL})")
 
     # 2) Helper zum sicheren Schattieren
     def _shade(UP, DOWN, color, label):
@@ -1610,7 +1801,7 @@ def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=
                 if i==len(idx) or idx[i] != idx[i-1]+1:
                     ax.axvspan(freqs[start], freqs[idx[i-1]], alpha=0.12)
                     if i < len(idx): start = idx[i]
-    ax.set_xlabel("Hz"); ax.set_ylabel("Power (a.u.)")
+    ax.set_xlabel("Hz"); ax.set_ylabel(PSD_UNIT_LABEL) 
     ax.set_title("Power (Spontan vs. Getriggert)"); ax.legend()
     return fig
 
@@ -1738,15 +1929,20 @@ layout_rows = [
 
     # REIHE 4: CSD (volle Breite)
     [lambda ax: CSD_compare_side_by_side_ax(
-        CSD_spont, CSD_trig, dt,
-        dz_um=100.0,                     # bei Bedarf anpassen
-        align_pre=align_pre, align_post=align_post,
-        cmap="turbo", sat_pct=90, interp="bilinear",
-        contours=True,
-        ax=ax,
-        title="CSD (Spon vs. Trig; gemeinsame Zeitachse, 0 mm oben)"
+    CSD_spont, CSD_trig, dt,
+    z_mm=None,
+    align_pre=align_pre_s, align_post=align_post_s,
+    cmap="turbo", sat_pct=98,
+    norm_mode="symlog",           # gemeinsame Skala, kleine Werte sichtbar
+    linthresh_frac=0.02,
+    exclude_for_scaling_ms=(0.0, 15.0),  # Stim-Artefakt beim Schätzen ignorieren
+    ax=ax,
+    title="CSD (Spont vs. Trig; gemeinsame Skala)"
     )],
 ]
+
+print("CSD_spont mean ± std:", np.nanmean(CSD_spont), np.nanstd(CSD_spont))
+print("CSD_trig mean ± std :", np.nanmean(CSD_trig), np.nanstd(CSD_trig))
 
 
 def _write_summary_csv():
