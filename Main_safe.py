@@ -41,7 +41,18 @@ from plotter import (
 DOWNSAMPLE_FACTOR = 50
 HIGH_CUTOFF = 10
 LOW_CUTOFF  = 2
+ANALYSE_IN_AU = True           
+HTML_IN_uV    = True           
 
+# === Onset-Helper: startet jedes UP beim Beginn, nicht beim Peak ===
+def _up_onsets(UP_idx, DOWN_idx):
+    import numpy as np
+    U = np.asarray(UP_idx, int); D = np.asarray(DOWN_idx, int)
+    m = min(U.size, D.size)
+    if m == 0:
+        return np.array([], int)
+    U, D = U[:m], D[:m]
+    return np.sort(U)
 
 
 def export_interactive_lfp_html(
@@ -108,7 +119,7 @@ def export_interactive_lfp_html(
         if m == 0:
             return []
         UP, DOWN = UP[:m], DOWN[:m]
-        # sortiert nach Startzeit
+        # sortiert nach StartzeitStartzeit
         order = np.argsort(UP)
         UP, DOWN = UP[order], DOWN[order]
         out = []
@@ -292,8 +303,11 @@ def convert_df_to_uV(df, mode):
         raise ValueError(f"Unbekannter CALIB_MODE: {mode}")
 
 # ---- Anwenden: LFP_df in µV bringen (vor weiterer Verarbeitung) ----
-LFP_df = convert_df_to_uV(LFP_df, CALIB_MODE)
+#LFP_df = convert_df_to_uV(LFP_df, CALIB_MODE)
 
+if ANALYSE_IN_AU:
+    UNIT_LABEL = "a.u."
+    PSD_UNIT_LABEL = "a.u.^2/Hz"
 
 # def _is_quasi_binary_trace(x):
 #     x = np.asarray(x, float)
@@ -525,14 +539,40 @@ if pulse_times_1_full.size == 0 and pulse_times_2_full.size == 0:
 print(f"[INFO] pulses(full): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)}")
 
 
+# --- NACH dem Laden von LFP_df ---
+# 1) Kanalspalten extrahieren
+chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
 
-# Channels -> pri_* 
-chan_cols = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
-assert len(chan_cols) > 0, "Keine Kanalspalten gefunden."
+# 2) Numerische Schlüssel aus Spaltennamen ziehen (z.B. "CSC10_values" -> 10, "8" -> 8)
+def _key_num(s):
+    import re
+    m = re.findall(r"\d+", s)
+    return int(m[-1]) if m else 0
+
+# 3) Sortierte Reihenfolge (flach -> tief). Wenn du tief->flach willst: am Ende [::-1].
+order_idx = sorted(range(len(chan_cols_raw)), key=lambda i: _key_num(chan_cols_raw[i]))
+# optional: flippen, falls benötigt
+FLIP_DEPTH = False   # <- bei Bedarf True
+if FLIP_DEPTH:
+    order_idx = order_idx[::-1]
+
+chan_cols = [chan_cols_raw[i] for i in order_idx]  # ab hier NUR noch diese Reihenfolge verwenden
+
+# 4) pri_* in *sortierter* Reihenfolge aufbauen
 LFP_df_ds = pd.DataFrame({"timesamples": time_full})
 for i, col in enumerate(chan_cols):
     LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
 NUM_CHANNELS = len(chan_cols)
+
+
+
+# # Channels -> pri_* 
+# chan_cols = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
+# assert len(chan_cols) > 0, "Keine Kanalspalten gefunden."
+# LFP_df_ds = pd.DataFrame({"timesamples": time_full})
+# for i, col in enumerate(chan_cols):
+#     LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
+# NUM_CHANNELS = len(chan_cols)
 
 def _name_to_idx(name, chan_cols_local=None, num_channels=None):
     # pri_7 -> 7
@@ -564,10 +604,21 @@ time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(
     snap_pulses=True
 )
 
+NUM_CHANNELS = LFP_array.shape[0]
+good_idx = list(range(NUM_CHANNELS))  # Fallback: alle Kanäle
+reasons = []                          # für Log-Ausgaben des Kanalfilters
+
+
 
 # Wenn dt offensichtlich "Samples" ist, rechne in Sekunden um:
-if dt > 1.0:  # dt in SAMPLES -> Sekunden
-    dt = dt / DEFAULT_FS_XDAT
+# if dt > 1.0:  # dt in SAMPLES -> Sekunden
+#     dt = dt / DEFAULT_FS_XDAT
+
+if dt and (dt > 0) and ((1.0/dt) > 1e4 or dt > 1.0):  # sehr grob: "zu klein" => Sekunden, "zu groß" => Samples
+    dt = dt / DEFAULT_FS_XDAT  # dt war in Samples
+
+print("[CHECK] dt(s)=", dt, " median Δt from time_s=", float(np.median(np.diff(time_s))))
+
 
 # ebenfalls auf Sekunden bringen:
 if np.nanmax(time_s) > 1e6:
@@ -667,86 +718,121 @@ else:
   
 # --- main_channel robust auswählen (nach evtl. Cropping) ---
 main_channel, ch_idx_used = _ensure_main_channel(LFP_array, preferred_idx=10)
+
+# --- Für HTML: Main-Channel in µV (ohne die Analyse anzurühren) ---
+main_channel_uV = None
+if HTML_IN_uV:
+    # welches Gain für diesen physikalischen Kanal?
+    orig_name = chan_cols[ch_idx_used] if (0 <= ch_idx_used < len(chan_cols)) else None
+    gain_used = PER_CH_GAIN.get(orig_name, PREAMP_GAIN)
+
+    if CALIB_MODE == "counts":
+        main_channel_uV = _counts_to_uV(main_channel, ADC_BITS, ADC_VPP, gain_used)
+    elif CALIB_MODE == "volts":
+        main_channel_uV = _volts_to_uV(main_channel)
+    elif CALIB_MODE == "uV":
+        main_channel_uV = main_channel.copy()
+    else:
+        # Fallback: zeige eben a.u., falls unbekannter Modus
+        main_channel_uV = main_channel.copy()
+
+
+
 print(f"[INFO] main_channel = pri_{ch_idx_used}, len={len(main_channel)}, time_len={len(time_s)}")
 
 
-#  Kanal-Qualitätsfilter (nach Cropping/No-Crop, dt & LFP_array vorhanden) 
-bad_idx, reasons = set(), []
-fs = 1.0 / dt
 
-# Stim-ähnliche Kanäle optional vorab ausschließen:
-stim_idx = []
-for s in stim_like_cols:
-    i = _name_to_idx(s, num_channels=NUM_CHANNELS)
-    if i is not None:
-        stim_idx.append(i)
-bad_idx.update(stim_idx)
+# --- XDAT-Erkennung (heuristisch) ---
+def _is_xdat_format():
+    """
+    Liefert True, wenn die Kanalnamen stark nach XDAT/Intan aussehen,
+    z.B. 'ch00', 'ch1', 'ch17' etc. oder wenn der Dateipfad 'xdat' enthält.
+    Nutzt die *originalen* Spaltennamen vor dem pri_* Mapping.
+    """
+    import re
+    # 1) Dateipfad-/Dateiname-Heuristik
+    try:
+        path_str = str(BASE_PATH).lower() + " " + str(LFP_FILENAME).lower()
+        if "xdat" in path_str or path_str.endswith(".xdat"):
+            return True
+    except Exception:
+        pass
 
-def _is_quasi_binary_trace(x):
-    x = np.asarray(x, float)
-    x = x[np.isfinite(x)]
-    if x.size < 10:
-        return False
-    vals = np.unique(np.round(x, 3))
-    if len(vals) <= 4:
-        return True
-    p01 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
-    return p01 >= 0.95
+    # 2) Kanalnamen-Heuristik (originale Namen bevorzugt)
+    try:
+        cols = chan_cols_raw  # aus dem Code weiter oben
+    except NameError:
+        # Fallback: aus dem DataFrame ableiten (ohne time/stim/din)
+        cols = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
 
-def _line_noise_ratio(x, fs):
-    f, Pxx = welch(np.nan_to_num(x, nan=0.0), fs=fs, nperseg=min(len(x), 4096))
-    def bp(f1, f2):
-        m = (f>=f1) & (f<=f2)
-        return float(np.trapz(Pxx[m], f[m])) if m.any() else 0.0
-    total = bp(0.5, 120.0)
-    line  = bp(49.0, 51.0)
-    return line / (total + 1e-12)
+    # Muster wie 'ch00', 'ch0', 'ch17', 'CH31' usw. oder reine Ziffern
+    pat = re.compile(r"^(ch)?\d{1,3}$", re.IGNORECASE)
+    hits = sum(1 for c in cols if pat.match(str(c).strip()))
+    # Wenn ein deutlicher Teil der Kanäle so heißt, ist es sehr wahrscheinlich XDAT
+    return (len(cols) >= 8 and hits / max(1, len(cols)) >= 0.6)
 
-for i in range(LFP_array.shape[0]):
-    if i in bad_idx:
-        continue
-    x = LFP_array[i]
-    finite = np.isfinite(x)
-    if finite.mean() < 0.95:
-        bad_idx.add(i); reasons.append((i, "zu viele NaNs")); continue
-    std = np.nanstd(x)
-    if not np.isfinite(std) or std == 0:
-        bad_idx.add(i); reasons.append((i, "konstant/0-Std")); continue
-    if _is_quasi_binary_trace(x):
-        bad_idx.add(i); reasons.append((i, "quasi-binär")); continue
-    z = (x - np.nanmedian(x)) / (std if std else 1.0)
-    if np.mean(np.abs(z) > 8) > 0.02:
-        bad_idx.add(i); reasons.append((i, "Artefakte (>2% |z|>8)")); continue
-    if _line_noise_ratio(x, fs) > 0.3:
-        bad_idx.add(i); reasons.append((i, "50Hz-dominant")); continue
 
-# Optional: manuelle Whitelist/Blacklist
-MANUAL_KEEP = None
-MANUAL_DROP = None
-if MANUAL_DROP:
-    for j in MANUAL_DROP:
-        bad_idx.add(int(j))
-if MANUAL_KEEP:
-    bad_idx = {j for j in bad_idx if j not in set(map(int, MANUAL_KEEP))}
+# ==== Feste Kanalwahl für .xdat: nur pri_1 .. pri_17 ====
+if _is_xdat_format():
+    fixed_idx = [i for i in range(1, 15) if i < LFP_array.shape[0]]  # pri_1..pri_17
+    good_idx = fixed_idx[:]  # überschreibe Fallback
+    print(f"[XDAT] GOOD_IDX override -> {good_idx} (n={len(good_idx)})")
+else:
+    # ===== Kanalqualitäts-Filter =====
+    bad_idx, reasons = set(), []
+    fs = 1.0 / dt
 
-good_idx = [j for j in range(NUM_CHANNELS) if j not in bad_idx]
-if len(good_idx) < 2:
-    print("[CHAN-FILTER][WARN] zu wenige 'gute' Kanäle – benutze alle.")
-    good_idx = list(range(NUM_CHANNELS))
+    def _is_quasi_binary_trace(x):
+        x = np.asarray(x, float); x = x[np.isfinite(x)]
+        if x.size < 10: return False
+        vals = np.unique(np.round(x, 3))
+        if len(vals) <= 4: return True
+        p01 = (np.isclose(x,0).sum() + np.isclose(x,1).sum()) / x.size
+        return p01 >= 0.95
+
+    def _line_noise_ratio(x, fs):
+        f, Pxx = welch(np.nan_to_num(x, nan=0.0), fs=fs, nperseg=min(len(x), 4096))
+        def bp(f1,f2):
+            m = (f>=f1) & (f<=f2)
+            return float(np.trapz(Pxx[m], f[m])) if m.any() else 0.0
+        total = bp(0.5, 120.0)
+        line  = bp(49.0, 51.0)
+        return line / (total + 1e-12)
+
+    for i in range(NUM_CHANNELS):
+        x = LFP_array[i]
+        finite = np.isfinite(x)
+        if finite.mean() < 0.95:
+            bad_idx.add(i); reasons.append((i, "zu viele NaNs")); continue
+        std = np.nanstd(x)
+        if not np.isfinite(std) or std == 0:
+            bad_idx.add(i); reasons.append((i, "konstant/0-Std")); continue
+        if _is_quasi_binary_trace(x):
+            bad_idx.add(i); reasons.append((i, "quasi-binär")); continue
+        z = (x - np.nanmedian(x)) / (std if std else 1.0)
+        if np.mean(np.abs(z) > 8) > 0.02:
+            bad_idx.add(i); reasons.append((i, "Artefakte (>2% |z|>8)")); continue
+        if _line_noise_ratio(x, fs) > 0.3:
+            bad_idx.add(i); reasons.append((i, "50Hz-dominant")); continue
+
+    good_idx = [j for j in range(NUM_CHANNELS) if j not in bad_idx]
+    if len(good_idx) < 2:
+        print("[CHAN-FILTER][WARN] zu wenige 'gute' Kanäle – benutze alle.")
+        good_idx = list(range(NUM_CHANNELS))
 
 LFP_array_good    = LFP_array[good_idx, :]
 ch_names_good     = [f"pri_{j}" for j in good_idx]
 NUM_CHANNELS_GOOD = len(good_idx)
 
-# Physikalische Tiefe für die behaltenen Kanäle (good_idx) 
-DZ_UM = 100.0  # dein Elektrodenabstand (um)
-z_mm = (np.asarray(good_idx, float) - float(np.min(good_idx))) * (DZ_UM / 1000.0)
+# Tiefe aus den *behaltenen* Kanälen ableiten:
+DZ_UM = 100.0
+z_mm = (np.arange(NUM_CHANNELS_GOOD, dtype=float)) * (DZ_UM / 1000.0)
 z_mm_csd = z_mm[1:-1]
-
 
 if reasons:
     print("[CHAN-FILTER] excluded:", ", ".join([f"pri_{j}({r})" for j, r in reasons]))
 print(f"[CHAN-FILTER] kept {NUM_CHANNELS_GOOD}/{NUM_CHANNELS} Kanäle:", ch_names_good[:10], ("..." if NUM_CHANNELS_GOOD>10 else ""))
+
 
 
 b_lp, a_lp, b_hp, a_hp = filtering(LOW_CUTOFF, HIGH_CUTOFF, dt)  # 2, 10
@@ -931,15 +1017,17 @@ print("[SVG] amplitude compare:", amp_svg_path)
 
 # --- Interaktive HTML immer erzeugen (mit UP-Schattierung) ---
 export_interactive_lfp_html(
-    BASE_TAG, SAVE_DIR, time_s, main_channel,
+    BASE_TAG, SAVE_DIR, time_s,
+    main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
     pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
-    limit_to_last_pulse=False,  # bei Sessions mit Pulsen praktisch
+    limit_to_last_pulse=False,
     title=f"{BASE_TAG} — Main LFP (interaktiv)",
-    y_label=f"LFP ({UNIT_LABEL})"
+    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})")
 )
+
 
 
 
@@ -964,29 +1052,54 @@ def _valid_peaks(peaks, n):
 # ...
 # Vor CSD-Berechnung:
 n_time = LFP_array_good.shape[1]
-Spon_Peaks = _valid_peaks(Up.get("Spon_Peaks", []), n_time)
-Trig_Peaks = _valid_peaks(Up.get("Trig_Peaks", []), n_time)
 
+# --- Onsets aus UP/DOWN-Listen (zeitlich stabiler als Peaks) ---
+Spon_Onsets = _up_onsets(Spontaneous_UP,       Spontaneous_DOWN)
+Trig_Onsets = _up_onsets(Pulse_triggered_UP,   Pulse_triggered_DOWN)
 
+# Gültigkeitsgrenzen
+Spon_Onsets = Spon_Onsets[(Spon_Onsets >= 0) & (Spon_Onsets < LFP_array_good.shape[1])]
+Trig_Onsets = Trig_Onsets[(Trig_Onsets >= 0) & (Trig_Onsets < LFP_array_good.shape[1])]
+
+# CSD auf Onsets statt Peaks:
 CSD_spont = CSD_trig = None
-if NUM_CHANNELS >= 3:
+if NUM_CHANNELS_GOOD >= 7:
     try:
-        Trig_Peaks = Up.get("Trig_Peaks", np.array([], float))
-        CSD_spont = CSD_trig = None
-        if NUM_CHANNELS_GOOD >= 7:
-            try:
-                Trig_Peaks = Up.get("Trig_Peaks", np.array([], float))
-                CSD_spont  = Generate_CSD_mean(Spon_Peaks, LFP_array_good, dt)
-                CSD_trig   = Generate_CSD_mean(Trig_Peaks,  LFP_array_good, dt)
-            except Exception as e:
-                print("[WARN] CSD skipped:", e)
-        else:
-            print(f"[INFO] CSD skipped: only {NUM_CHANNELS_GOOD} good channels (<3).")
-
+        CSD_spont = Generate_CSD_mean(Spon_Onsets, LFP_array_good, dt)
+        CSD_trig  = Generate_CSD_mean(Trig_Onsets,  LFP_array_good, dt)
     except Exception as e:
         print("[WARN] CSD skipped:", e)
 else:
-    print(f"[INFO] CSD skipped: only {NUM_CHANNELS} channels (<3).")
+    print(f"[INFO] CSD skipped: only {NUM_CHANNELS_GOOD} good channels (<7).")
+
+
+def _even_subsample(idx, k):
+    idx = np.asarray(idx, int)
+    if idx.size <= k: return idx
+    pos = np.linspace(0, idx.size-1, k).round().astype(int)
+    return idx[pos]
+
+USE_EQUAL_N_FOR_PLOT = True
+spon_all = np.asarray(Spon_Onsets, int)
+trig_all = np.asarray(Trig_Onsets,  int)
+m = int(min(spon_all.size, trig_all.size))
+
+if USE_EQUAL_N_FOR_PLOT and m >= 3:
+    spon_sel = np.sort(_even_subsample(spon_all, m))
+    trig_sel = np.sort(_even_subsample(trig_all, m))
+    try:
+        CSD_spont_eq = Generate_CSD_mean(spon_sel, LFP_array_good, dt)
+        CSD_trig_eq  = Generate_CSD_mean(trig_sel,  LFP_array_good, dt)
+        CSD_spont_plot = CSD_spont_eq
+        CSD_trig_plot  = CSD_trig_eq
+        print(f"[Equal-N] using m={m} events (spont:{spon_all.size}→{m}, trig:{trig_all.size}→{m})")
+    except Exception as e:
+        print("[WARN] Equal-N CSD failed:", e)
+        CSD_spont_plot = CSD_spont
+        CSD_trig_plot  = CSD_trig
+else:
+    CSD_spont_plot = CSD_spont
+    CSD_trig_plot  = CSD_trig
 
 # ====== DIAGNOSE: Spont vs Triggered CSD ======
 def _nan_stats(name, arr):
@@ -1046,6 +1159,9 @@ print(f"[DIAG] Counts: sponUP={len(Spontaneous_UP)}, trigUP={len(Pulse_triggered
 print(f"[DIAG] align_pre={align_pre_s:.3f}s, align_post={align_post_s:.3f}s, dt={dt:.6f}s")
 
 # ====== ENDE DIAGNOSE ======
+
+
+
 
 
 # nach compare_spectra
@@ -1272,11 +1388,13 @@ def CSD_compare_side_by_side_ax(
     cmap="turbo", sat_pct=98, interp="bilinear",
     contours=False, ax=None, title="CSD (Spon vs. Trig)",
     norm_mode="symlog",          # "symlog" | "linear"
-    linthresh_frac=0.03,         # <— NEU: Anteil von vmax für linearen Bereich
-    **_unused                    # <— NEU: toleriert unbekannte Extra-Args
+    linthresh_frac=0.03,         # Anteil von vmax für linearen Bereich
+    flip_y=True,                 # <--- NEU: Kanal 0 oben?
+    **_unused
 ):
-
     import matplotlib.pyplot as plt
+    import numpy as _np
+    from matplotlib.colors import TwoSlopeNorm, SymLogNorm
 
     def _edges_from_centers(c):
         c = _np.asarray(c, float)
@@ -1303,23 +1421,23 @@ def CSD_compare_side_by_side_ax(
     if ax is None: fig, ax = plt.subplots(figsize=(8,3))
     else:          fig = ax.figure
 
-    # Gemeinsame Skala (robust aus beiden Matrizen)
+    # === Gemeinsame Skala ===
     v_sp = _robust_vmax(CSD_spont, sat_pct)
     v_tr = _robust_vmax(CSD_trig,  sat_pct)
     vals = [v for v in (v_sp, v_tr) if _np.isfinite(v) and v > 0]
-    if len(vals) == 2: vmax_joint = float(_np.sqrt(vals[0]*vals[1]))   # geometrisches Mittel
+    if len(vals) == 2: vmax_joint = float(_np.sqrt(vals[0]*vals[1]))
     elif len(vals) == 1: vmax_joint = float(vals[0])
     else: vmax_joint = 1.0
     vmin_joint = -vmax_joint
 
-    # === Normierung je nach Mode ===
+    # === Normierung ===
     if norm_mode == "linear":
         norm = TwoSlopeNorm(vmin=vmin_joint, vcenter=0.0, vmax=vmax_joint)
-    else:  # "symlog"
+    else:
         lt = max(float(linthresh_frac) * vmax_joint, 1e-12)
         norm = SymLogNorm(linthresh=lt, vmin=vmin_joint, vmax=vmax_joint)
 
-    # Zeitkanten für pcolormesh/imshow
+    # === Zeit-Achse ===
     n_t = CSD_spont.shape[1]
     t_centers = _np.linspace(-float(align_pre), float(align_post), n_t)
     t_edges   = _edges_from_centers(t_centers)
@@ -1329,6 +1447,7 @@ def CSD_compare_side_by_side_ax(
     cax      = ax.inset_axes([0.955, 0.1, 0.02, 0.8])
     ax.set_axis_off()
 
+    # === Darstellung ===
     if z_mm is not None:
         z_mm = _np.asarray(z_mm, float)
         if z_mm.size != CSD_spont.shape[0]:
@@ -1337,21 +1456,34 @@ def CSD_compare_side_by_side_ax(
         imL = ax_left.pcolormesh(t_edges, z_edges, CSD_spont, shading="auto", cmap=cmap, norm=norm)
         imR = ax_right.pcolormesh(t_edges, z_edges, CSD_trig,  shading="auto", cmap=cmap, norm=norm)
         for a in (ax_left, ax_right):
-            a.set_xlim(t_edges[0], t_edges[-1]); a.set_ylim(z_edges[0], z_edges[-1])
-            a.invert_yaxis(); a.set_xlabel("Zeit (s)")
+            a.set_xlim(t_edges[0], t_edges[-1])
+            a.set_ylim(z_edges[0], z_edges[-1])
+            a.set_xlabel("Zeit (s)")
+            if flip_y:
+                a.invert_yaxis()  # <--- HIER flip!
         ax_left.set_ylabel("Tiefe (mm)")
     else:
-        extent = [-float(align_pre), float(align_post), 0.0, float((CSD_spont.shape[0]-1))]
-        imL = ax_left.imshow(CSD_spont, aspect="auto", origin="upper", extent=extent, cmap=cmap, norm=norm, interpolation=interp)
-        imR = ax_right.imshow(CSD_trig,  aspect="auto", origin="upper", extent=extent, cmap=cmap, norm=norm, interpolation=interp)
-        for a in (ax_left, ax_right): a.set_xlabel("Zeit (s)")
+        extent = [-float(align_pre), float(align_post),
+                  0.0, float((CSD_spont.shape[0]-1))]
+        imL = ax_left.imshow(CSD_spont, aspect="auto",
+                             origin="upper" if flip_y else "lower",
+                             extent=extent, cmap=cmap, norm=norm,
+                             interpolation=interp)
+        imR = ax_right.imshow(CSD_trig,  aspect="auto",
+                             origin="upper" if flip_y else "lower",
+                             extent=extent, cmap=cmap, norm=norm,
+                             interpolation=interp)
+        for a in (ax_left, ax_right):
+            a.set_xlabel("Zeit (s)")
         ax_left.set_ylabel("Tiefe (arb.)")
 
     ax_left.set_title("Spontaneous", fontsize=10)
     ax_right.set_title("Triggered", fontsize=10)
-    cb = fig.colorbar(imR, cax=cax); cb.set_label(f"CSD ({UNIT_LABEL})", rotation=90)
+    cb = fig.colorbar(imR, cax=cax)
+    cb.set_label("CSD (a.u.)", rotation=90)
     ax_left.set_title(title, fontsize=11, pad=22)
     return fig
+
 
 
 # def CSD_compare_side_by_side_ax(
@@ -1930,7 +2062,7 @@ layout_rows = [
     # REIHE 4: CSD (volle Breite)
     [lambda ax: CSD_compare_side_by_side_ax(
     CSD_spont, CSD_trig, dt,
-    z_mm=None,
+    z_mm=z_mm,
     align_pre=align_pre_s, align_post=align_post_s,
     cmap="turbo", sat_pct=98,
     norm_mode="symlog",           # gemeinsame Skala, kleine Werte sichtbar
@@ -2148,4 +2280,12 @@ export_with_layout(
     also_save_each_svg=True
 )
 
+print("[ORDER]", chan_cols)  # Originalnamen der LFP-Spalten
+print("[GOOD_IDX]", good_idx)
 
+print("[ORDER raw]", chan_cols_raw)
+print("[ORDER sorted]", chan_cols)
+print("[DEPTH flip?]", FLIP_DEPTH)
+
+print("[CHAN-FILTER] kept:", good_idx)
+print("[CHAN-FILTER] reasons:", reasons)
