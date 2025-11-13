@@ -1,8 +1,19 @@
 import numpy as np
 import plotly.graph_objects as go
 from plotly.offline import plot as plotly_offline_plot
+from datetime import datetime
+from matplotlib.colors import SymLogNorm
 import os
+import sys, os
 
+
+ANALYSE_IN_AU = True
+HTML_IN_uV    = True
+
+_DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
+BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
+SAVE_DIR = BASE_PATH
+LOGFILE = os.path.join(SAVE_DIR, "runlog.txt")
 
 
 def export_interactive_lfp_html(
@@ -143,3 +154,39 @@ def export_interactive_lfp_html(
     plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
     print(f"[HTML] interaktiver LFP-Plot: {out_html}")
     return out_html
+
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    with open(LOGFILE, "a", encoding="utf-8") as f:
+        f.write(line)
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+
+def _nan_stats(name, arr):
+    import numpy as np
+    if arr is None:
+        print(f"[DIAG] {name}: None"); return
+    a = np.asarray(arr, float)
+    nan_rate = np.mean(~np.isfinite(a))*100.0 if a.size else 100.0
+    print(f"[DIAG] {name}: shape={a.shape}, NaN%={nan_rate:.2f}%")
+    if a.size == 0 or not np.isfinite(a).any():
+        print(f"[DIAG] {name}: empty/invalid -> skip quantiles")
+        return
+    aa = np.abs(a[np.isfinite(a)])
+    if aa.size == 0:
+        print(f"[DIAG] {name}: no finite values -> skip quantiles")
+        return
+    try:
+        qs = np.nanpercentile(aa, [50, 90, 99, 99.9])
+        print(f"[DIAG] {name} |abs| quantiles: 50%={qs[0]:.3g}, 90%={qs[1]:.3g}, 99%={qs[2]:.3g}, 99.9%={qs[3]:.3g}")
+    except Exception as e:
+        print(f"[DIAG] {name}: quantiles failed: {e}")
+
+
+def _rms(a):
+    a = np.asarray(a, float); a = a[np.isfinite(a)]
+    return float(np.sqrt(np.mean(a*a))) if a.size else np.nan
