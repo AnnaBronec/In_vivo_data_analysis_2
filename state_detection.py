@@ -217,8 +217,15 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
     Pulse_associated_UP = Pulse_associated_up[Pulse_associated_UP]
     Pulse_associated_DOWN = Pulse_associated_down[Pulse_associated_DOWN]
 
+
     Pulse_coincident_UP = np.append(Pulse_triggered_UP, Pulse_associated_UP)
     Pulse_coincident_DOWN = np.append(Pulse_triggered_DOWN, Pulse_associated_DOWN)
+
+
+        # Priorität umkehren:
+    Pulse_triggered_UP = np.setdiff1d(Pulse_triggered_UP, Pulse_associated_UP)
+
+
 
     # 7. Identify spontaneous UP states
     Spontaneous_UP = UP_start_i[~np.isin(UP_start_i, Pulse_coincident_UP)]
@@ -595,3 +602,13 @@ def plot_LFP_average_around_peaks(peaks, LFP_array, dt, window_s=1.0, channel_id
 
     plt.plot(t, mean_trace, label=label)
     plt.fill_between(t, mean_trace - sem_trace, mean_trace + sem_trace, alpha=0.3)
+
+
+def _up_onsets(UP_idx, DOWN_idx):
+    import numpy as np
+    U = np.asarray(UP_idx, int); D = np.asarray(DOWN_idx, int)
+    m = min(U.size, D.size)
+    if m == 0:
+        return np.array([], int)
+    U, D = U[:m], D[:m]
+    return np.sort(U)

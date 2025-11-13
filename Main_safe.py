@@ -9,6 +9,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
+
+
 from matplotlib.colors import TwoSlopeNorm, SymLogNorm
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Patch
@@ -24,7 +26,7 @@ from preprocessing import filtering, get_main_channel, pre_post_condition
 from TimeFreq_plot import Run_spectrogram
 from state_detection import (
     classify_states, Generate_CSD_mean, extract_upstate_windows,
-    compare_spectra
+    compare_spectra, _up_onsets
 )
 from pathlib import Path
 from plotter import (
@@ -34,15 +36,21 @@ from plotter import (
     plot_upstate_amplitude_blocks_colored,
 )
 
+import sys, os
+from datetime import datetime
 
+from Exports import export_interactive_lfp_html
+# pulse_times_1_full = np.array([], float)
+# pulse_times_2_full = np.array([], float)
 
 #Konstanten
-
 DOWNSAMPLE_FACTOR = 50
 HIGH_CUTOFF = 10
 LOW_CUTOFF  = 2
-ANALYSE_IN_AU = True           
-HTML_IN_uV    = True           
+ANALYSE_IN_AU = True
+HTML_IN_uV    = True
+
+
 
 # === Onset-Helper: startet jedes UP beim Beginn, nicht beim Peak ===
 def _up_onsets(UP_idx, DOWN_idx):
@@ -54,157 +62,6 @@ def _up_onsets(UP_idx, DOWN_idx):
     U, D = U[:m], D[:m]
     return np.sort(U)
 
-
-def export_interactive_lfp_html(
-    base_tag, save_dir, time_s, y,
-    pulse_times_1=None, pulse_times_2=None,
-    *,
-    up_spont=None,       # Tuple (UP_idx, DOWN_idx) in SAMPLE-INDIZES
-    up_trig=None,        # Tuple (UP_idx, DOWN_idx)
-    up_assoc=None,       # Tuple (UP_idx, DOWN_idx)
-    max_points=300_000,
-    title="LFP (interaktiv)",
-    limit_to_last_pulse=False,
-    y_label="LFP (µV)"
-):
-    """
-    Erstellt eine interaktive HTML mit Range-Slider und Zoom/Pan.
-    Zusätzlich können UP-Intervalle (spont/triggered/associated) schattiert werden.
-    - time_s: 1D array (Sekunden)
-    - y:      1D array (LFP)
-    - *_times_*: Sekunden (optional)
-    - up_*: Tuple (UP_idx, DOWN_idx) mit Indizes in time_s
-    """
-
-    import numpy as np
-    import plotly.graph_objects as go
-    from plotly.offline import plot as plotly_offline_plot
-    import os
-
-    t = np.asarray(time_s, dtype=float)
-    x = np.asarray(y, dtype=float)
-
-    # optional auf letzten Puls begrenzen
-    if limit_to_last_pulse:
-        last_p = None
-        if pulse_times_1 is not None and len(pulse_times_1):
-            last_p = float(np.max(pulse_times_1))
-        if pulse_times_2 is not None and len(pulse_times_2):
-            lp2 = float(np.max(pulse_times_2))
-            last_p = lp2 if (last_p is None or lp2 > last_p) else last_p
-        if last_p is not None and len(t):
-            i1 = int(np.searchsorted(t, last_p, side="right"))
-            i1 = max(1, min(i1, len(t)))
-            t = t[:i1]
-            x = x[:i1]
-
-    # robustes Decimate (nur Darstellung)
-    if t.size > max_points:
-        step = int(np.ceil(t.size / max_points))
-        t = t[::step]
-        x = x[::step]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t, y=x, mode="lines", name="LFP"))
-
-    shapes = []
-
-    # --- Helper: UP/DOWN-Indizes -> Zeitintervalle (Sekunden)
-    def _mk_intervals(UP, DOWN):
-        if UP is None or DOWN is None:
-            return []
-        UP   = np.asarray(UP,   dtype=int)
-        DOWN = np.asarray(DOWN, dtype=int)
-        m = min(len(UP), len(DOWN))
-        if m == 0:
-            return []
-        UP, DOWN = UP[:m], DOWN[:m]
-        # sortiert nach StartzeitStartzeit
-        order = np.argsort(UP)
-        UP, DOWN = UP[order], DOWN[order]
-        out = []
-        for u, d in zip(UP, DOWN):
-            if 0 <= u < len(time_s) and 0 < d <= len(time_s) and d > u:
-                out.append((float(time_s[u]), float(time_s[d-1])))
-        return out
-
-    # --- UP-Intervalle vorbereiten (Farben an deine Matplotlib-Plots angelehnt)
-    intervals = []
-    if up_spont:
-        intervals.append(("UP spontaneous", _mk_intervals(*up_spont), "rgba(46, 204, 113, 0.22)"))  # grün
-    if up_trig:
-        intervals.append(("UP triggered",   _mk_intervals(*up_trig),  "rgba(31, 119, 180, 0.22)"))  # blau
-    if up_assoc:
-        intervals.append(("UP associated",  _mk_intervals(*up_assoc), "rgba(255, 127, 14, 0.22)"))  # orange
-
-    # --- Schattierungen als Shapes (über gesamte Plot-Höhe)
-    for label, spans, fill in intervals:
-        for (t0, t1) in spans:
-            # auf ggf. gekürzte Zeitachse clippen
-            if len(t) and (t1 < t[0] or t0 > t[-1]):
-                continue
-            shapes.append(dict(
-                type="rect",
-                x0=t0, x1=t1,
-                y0=0, y1=1,
-                xref="x", yref="paper",
-                line=dict(width=0),
-                fillcolor=fill
-            ))
-
-    # --- Pulse-Linien
-    def _add_pulses(ts, dash):
-        if ts is None or len(ts) == 0:
-            return
-        tt = np.asarray(ts, float)
-        if tt.size > 1200:
-            tt = tt[::int(np.ceil(tt.size/1200))]
-        for p in tt:
-            shapes.append(dict(
-                type="line",
-                x0=float(p), x1=float(p),
-                y0=0, y1=1,
-                xref="x", yref="paper",
-                opacity=0.35,
-                line=dict(width=1, dash=dash, color="red")
-            ))
-
-    _add_pulses(pulse_times_1, "dot")
-    _add_pulses(pulse_times_2, "dash")
-
-    # --- Dummy-Traces für Legende (damit Shapes in der Legende erscheinen)
-    if intervals:
-        for label, _, fill in intervals:
-            fig.add_trace(go.Scatter(
-                x=[None], y=[None],
-                mode="lines",
-                line=dict(width=12, color=fill),
-                name=label,
-                showlegend=True
-            ))
-    if pulse_times_1 is not None and len(pulse_times_1):
-        fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-                                 line=dict(width=1, dash="dot", color="red"),
-                                 name="Pulse 1"))
-    if pulse_times_2 is not None and len(pulse_times_2):
-        fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-                                 line=dict(width=1, dash="dash", color="red"),
-                                 name="Pulse 2"))
-
-    fig.update_layout(
-        title=title,
-        xaxis=dict(title="Zeit (s)", rangeslider=dict(visible=True)),
-        yaxis=dict(title=y_label),
-        shapes=shapes,
-        margin=dict(l=60, r=20, t=50, b=50),
-        template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
-    )
-
-    out_html = os.path.join(save_dir, f"{base_tag}__lfp_interactive.html")
-    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
-    print(f"[HTML] interaktiver LFP-Plot: {out_html}")
-    return out_html
 
 # Stelle das auf deine XDAT-Samplingrate ein:
 DEFAULT_FS_XDAT = 32000.0   #ist das richtig?
@@ -222,41 +79,391 @@ SAVE_DIR = BASE_PATH
 BASE_TAG = os.path.splitext(os.path.basename(LFP_FILENAME))[0]
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-def load_all_parts(parts_dir: Path, usecols=None, dtype=None) -> pd.DataFrame:
-    """
-    Lädt alle *.partXXX.csv in parts_dir und concat't sie zu einem DataFrame.
-    Tipp: usecols/dtype setzen, wenn du RAM sparen willst.
-    """
+# SAVE_DIR = globals().get("SAVE_DIR", "."
+LOGFILE = os.path.join(SAVE_DIR, "runlog.txt")
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    with open(LOGFILE, "a", encoding="utf-8") as f:
+        f.write(line)
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+def load_parts_to_array_streaming(
+    base_path: str,
+    ds_factor: int = 50,
+    stim_cols = ("stim", "din_1", "din_2", "StartStop", "TTL", "DI0", "DI1"),
+    dtype = np.float32,
+):
+    parts_dir = Path(base_path) / "_csv_parts"
     part_files = sorted(parts_dir.glob("*.part*.csv"))
     if not part_files:
         raise FileNotFoundError(f"Keine Parts unter {parts_dir} gefunden.")
-    dfs = []
+
+    time_chunks = []
+    data_chunks = []
+    stim_cols_in_file = None
+    chan_cols = None
+
+    # Puls-Sammler (Listen → am Ende concat)
+    p1_list, p2_list = [], []
+
+    def _edges_from_series(t_vec, x_vec, rising_only=True, thr=None):
+        x = pd.to_numeric(x_vec, errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(x).any():
+            return np.array([], dtype=float)
+        if thr is None:
+            lo, hi = np.nanpercentile(x, [10, 90])
+            thr = (lo + hi) * 0.5
+        b = (x > thr).astype(np.int8)
+        if rising_only:
+            idx = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1
+        else:
+            idx = np.flatnonzero(b[1:] != b[:-1]) + 1
+        idx = idx[(idx >= 0) & (idx < t_vec.size)]
+        return t_vec[idx].astype(float)
+
     for pf in part_files:
-        print(f"[PART] Lade {pf.name} ...")
-        df = pd.read_csv(pf, usecols=usecols, dtype=dtype, low_memory=False, memory_map=True)
-        dfs.append(df)
-    df_all = pd.concat(dfs, ignore_index=True)
-    return df_all
+        df = pd.read_csv(pf, low_memory=False)
+
+        # einmalig: stim-Spalten & Kanalspalten bestimmen
+        if stim_cols_in_file is None:
+            stim_cols_in_file = [c for c in stim_cols if c in df.columns]
+            raw_chan_cols = [c for c in df.columns if c not in ("time", *stim_cols_in_file)]
+            import re
+            def _key_num(s):
+                m = re.findall(r"\d+", s)
+                return int(m[-1]) if m else 0
+            chan_cols = sorted(raw_chan_cols, key=_key_num)
+
+        keep_cols = ["time", *stim_cols_in_file, *chan_cols]
+        df = df[keep_cols]
+
+        if ds_factor > 1:
+            df = df.iloc[::ds_factor, :].reset_index(drop=True)
+
+        t_local = pd.to_numeric(df["time"], errors="coerce").to_numpy(dtype=float)
+
+        # Pulse sammeln
+        if "din_1" in stim_cols_in_file:
+            p1_list.append(_edges_from_series(t_local, df["din_1"]))
+        if "din_2" in stim_cols_in_file:
+            p2_list.append(_edges_from_series(t_local, df["din_2"]))
+        if ("stim" in stim_cols_in_file) and ("din_1" not in stim_cols_in_file) and ("din_2" not in stim_cols_in_file):
+            p1_list.append(_edges_from_series(t_local, df["stim"]))
+
+        # Daten sammeln
+        time_chunks.append(t_local)
+        data_chunks.append(df[chan_cols].to_numpy(dtype=dtype))
+
+        del df  # RAM frei
+
+    time_s = np.concatenate(time_chunks, axis=0)
+    data_all = np.concatenate(data_chunks, axis=0)     # (N, n_ch)
+    LFP_array = data_all.T                              # (n_ch, N)
+
+    # Pulse zusammenführen + entdoppeln
+    pulse_times_1 = np.concatenate(p1_list, axis=0) if p1_list else np.array([], float)
+    pulse_times_2 = np.concatenate(p2_list, axis=0) if p2_list else np.array([], float)
+    if pulse_times_1.size:
+        pulse_times_1 = np.unique(np.round(pulse_times_1, 9))
+    if pulse_times_2.size:
+        pulse_times_2 = np.unique(np.round(pulse_times_2, 9))
+
+    return time_s, LFP_array, chan_cols, pulse_times_1, pulse_times_2
+
+try:
+    print(f"[INFO] pulses(from streaming): p1={len(pulse_times_1_full)}, "
+          f"p2={len(pulse_times_2_full)}, "
+          f"first/last p1: "
+          f"{pulse_times_1_full[0] if len(pulse_times_1_full) else '—'} / "
+          f"{pulse_times_1_full[-1] if len(pulse_times_1_full) else '—'}")
+except NameError:
+    print("[INFO] pulses(from streaming): (Variablen noch nicht definiert)")
+
+
+# def load_parts_to_array_streaming(
+#     base_path: str,
+#     ds_factor: int = 50,
+#     stim_cols = ("stim", "din_1", "din_2"),
+#     dtype = np.float32,
+# ):
+#     parts_dir = Path(base_path) / "_csv_parts"
+#     part_files = sorted(parts_dir.glob("*.part*.csv"))
+#     if not part_files:
+#         raise FileNotFoundError(f"Keine Parts unter {parts_dir} gefunden.")
+
+#     time_chunks = []
+#     data_chunks = []
+#     stim_cols_in_file = None
+#     chan_cols = None
+
+#     for pf in part_files:
+#         df = pd.read_csv(pf, low_memory=False)
+
+#         if stim_cols_in_file is None:
+#             stim_cols_in_file = [c for c in stim_cols if c in df.columns]
+#             raw_chan_cols = [c for c in df.columns if c not in ("time", *stim_cols_in_file)]
+#             import re
+#             def _key_num(s):
+#                 m = re.findall(r"\d+", s)
+#                 return int(m[-1]) if m else 0
+#             chan_cols = sorted(raw_chan_cols, key=_key_num)
+
+#         keep_cols = ["time", *stim_cols_in_file, *chan_cols]
+#         df = df[keep_cols]
+
+#         if ds_factor > 1:
+#             df = df.iloc[::ds_factor, :].reset_index(drop=True)
+
+#         time_chunks.append(df["time"].to_numpy(dtype=np.float64))
+#         data_chunks.append(df[chan_cols].to_numpy(dtype=dtype))
+
+#         del df
+
+#     time_s = np.concatenate(time_chunks, axis=0)
+#     data_all = np.concatenate(data_chunks, axis=0)
+#     LFP_array = data_all.T
+
+#     # Pulse-Erkennung wie bei dir ...
+#     # (die kannst du lassen)
+
+#     return time_s, LFP_array, chan_cols, pulse_times_1, pulse_times_2
+
+
+# == HIER einfügen ==
+def downsample_array_simple(
+    ds_factor: int,
+    time_s: np.ndarray,
+    LFP_array: np.ndarray,
+    pulse_times_1=None,
+    pulse_times_2=None,
+    snap_pulses=True,
+):
+    """
+    Sehr einfache Array-Version vom Downsampling:
+    - nimmt jeden ds_factor-ten Sample
+    - wendet das auf time_s und alle Kanäle an
+    - optional Pulsezeiten auf nächstgelegenen Sample einrasten
+    """
+    time_s = np.asarray(time_s, float)
+    X = np.asarray(LFP_array)
+    step = int(ds_factor) if ds_factor and ds_factor > 1 else 1
+
+    time_ds = time_s[::step]
+    X_ds = X[:, ::step]
+
+    dt = float(time_ds[1] - time_ds[0]) if len(time_ds) > 1 else 1.0
+
+    def _snap(pulses):
+        if pulses is None or len(pulses) == 0:
+            return pulses
+        pulses = np.asarray(pulses, float)
+        if not snap_pulses:
+            return pulses
+        idx = np.searchsorted(time_ds, pulses)
+        idx = np.clip(idx, 0, len(time_ds)-1)
+        return time_ds[idx]
+
+    p1_ds = _snap(pulse_times_1)
+    p2_ds = _snap(pulse_times_2)
+
+    return time_ds, dt, X_ds, p1_ds, p2_ds
+# def load_parts_to_array_streaming(
+#     base_path: str,
+#     ds_factor: int = 50,
+#     stim_cols = ("stim", "din_1", "din_2"),
+#     dtype = np.float32,
+# ):
+#     """
+#     Lädt alle _csv_parts/*.part*.csv nacheinander, dünnt sofort aus und
+#     baut direkt ein (n_channels, n_samples)-Array.
+#     Gibt zurück:
+#         time_s, LFP_array, chan_cols, pulse_times_1, pulse_times_2
+#     """
+#     parts_dir = Path(base_path) / "_csv_parts"
+#     part_files = sorted(parts_dir.glob("*.part*.csv"))
+#     if not part_files:
+#         raise FileNotFoundError(f"Keine Parts unter {parts_dir} gefunden.")
+
+#     time_chunks = []
+#     data_chunks = []
+#     stim_cols_in_file = None
+#     chan_cols = None
+
+#     # 1) Daten laden, sofort ausdünnen, sofort nach numpy
+#     for pf in part_files:
+#         df = pd.read_csv(pf, low_memory=False)
+
+#         # beim ersten Part festlegen, welche Spalten es gibt
+#         if stim_cols_in_file is None:
+#             stim_cols_in_file = [c for c in stim_cols if c in df.columns]
+#             # alle anderen sind LFP-Kanäle
+#             raw_chan_cols = [c for c in df.columns if c not in ("time", *stim_cols_in_file)]
+
+#             # sortieren nach Nummer im Namen
+#             import re
+#             def _key_num(s):
+#                 m = re.findall(r"\d+", s)
+#                 return int(m[-1]) if m else 0
+#             chan_cols = sorted(raw_chan_cols, key=_key_num)
+
+#         # nur die Spalten, die wir wollen
+#         keep_cols = ["time", *stim_cols_in_file, *chan_cols]
+#         df = df[keep_cols]
+
+#         # ausdünnen
+#         if ds_factor > 1:
+#             df = df.iloc[::ds_factor, :].reset_index(drop=True)
+
+#         time_chunks.append(df["time"].to_numpy(dtype=np.float64))
+#         data_chunks.append(df[chan_cols].to_numpy(dtype=dtype))
+
+#         del df  # RAM sofort freigeben
+
+#     # 2) alles zusammenkleben
+#     time_s = np.concatenate(time_chunks, axis=0)
+#     # data_chunks: Liste von (n_samples_part, n_channels) -> erst cat, dann transponieren
+#     data_all = np.concatenate(data_chunks, axis=0)         # (N, n_ch)
+#     LFP_array = data_all.T                                 # (n_ch, N)
+
+#     # 3) Pulszeiten separat aus denselben Parts ermitteln (aber leichtgewichtig)
+#     pulse_times_1 = np.array([], dtype=float)
+#     pulse_times_2 = np.array([], dtype=float)
+
+#     for pf in part_files:
+#         df = pd.read_csv(pf, usecols=["time", *stim_cols_in_file])
+#         if ds_factor > 1:
+#             df = df.iloc[::ds_factor, :]
+#         t_local = df["time"].to_numpy(float)
+
+#         def _edges(col):
+#             x = pd.to_numeric(df[col], errors="coerce").fillna(0).to_numpy(float)
+#             lo, hi = np.nanpercentile(x, [10, 90])
+#             thr = (lo + hi) * 0.5
+#             b = (x > thr).astype(np.int8)
+#             idx = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1
+#             return t_local[idx].astype(float)
+
+#         if "din_1" in stim_cols_in_file:
+#             pulse_times_1 = np.concatenate([pulse_times_1, _edges("din_1")])
+#         if "din_2" in stim_cols_in_file:
+#             pulse_times_2 = np.concatenate([pulse_times_2, _edges("din_2")])
+#         if "stim" in stim_cols_in_file and pulse_times_1.size == 0:
+#             pulse_times_1 = np.concatenate([pulse_times_1, _edges("stim")])
+
+#         del df
+
+#     return time_s, LFP_array, chan_cols, pulse_times_1, pulse_times_2
 
 
 parts_dir = Path(BASE_PATH) / "_csv_parts"
-if parts_dir.exists() and any(parts_dir.glob("*.part*.csv")):
-    print(f"[INFO] Parts erkannt unter {parts_dir} -> lade alle Parts (on-the-fly concat)")
-    # Wenn du nur bestimmte Spalten brauchst, setze usecols=["time","CSC1_values", ...]
-    LFP_df = load_all_parts(parts_dir, usecols=None, dtype=None)
-    # ch_names & Meta minimal ableiten (kompatibel zum restlichen Code)
-    ch_names = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
-    lfp_meta = {"source": "parts", "n_parts": len(list(parts_dir.glob('*.part*.csv')))}
-    # Für nachfolgenden Code den erwarteten Dateinamen setzen (nur kosmetisch/log)
-    LFP_FILENAME = f"{BASE_TAG}.csv (from parts)"
-else:
-    # normales Laden der (nicht-gesplitteten) CSV
-    LFP_df, ch_names, lfp_meta = load_LFP_new(BASE_PATH, LFP_FILENAME)
+is_merged_run = os.environ.get("BATCH_IS_MERGED_RUN", "0") == "1"
+has_explicit_filename = "LFP_FILENAME" in globals()
 
-assert "time" in LFP_df.columns, "CSV braucht eine Spalte 'time'."
-time_full = LFP_df["time"].to_numpy(float)
-print("[INFO] CSV rows:", len(LFP_df),
-      "time range:", float(LFP_df["time"].iloc[0]), "->", float(LFP_df["time"].iloc[-1]))
+
+if (not is_merged_run) and (not has_explicit_filename) and parts_dir.exists() and any(parts_dir.glob("*.part*.csv")):
+    print(f"[INFO] Parts erkannt unter {parts_dir} -> streaming load")
+    time_s, LFP_array, chan_cols, pulse_times_1_full, pulse_times_2_full = \
+        load_parts_to_array_streaming(BASE_PATH, ds_factor=DOWNSAMPLE_FACTOR)
+    lfp_meta = {"source": "parts-streaming"}
+
+    # wichtig: KEIN riesiges DataFrame bauen
+    LFP_df = None
+
+    log(f"MODE: streaming={ (not is_merged_run) and (not has_explicit_filename) } parts_dir={parts_dir}")
+   
+
+else:
+    from loader_old import load_LFP_new
+    LFP_df, chan_cols, lfp_meta = load_LFP_new(BASE_PATH, LFP_FILENAME)
+    time_s = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
+    LFP_array = LFP_df[chan_cols].to_numpy(dtype=np.float32).T
+    log(f"Streaming load OK: time={time_s.shape}, LFP_array={LFP_array.shape}, chans={len(chan_cols)}")
+
+
+if LFP_df is not None:
+    print("[INFO] CSV rows:", len(LFP_df),
+          "time range:", float(LFP_df["time"].iloc[0]), "->", float(LFP_df["time"].iloc[-1]))
+    log(f"Streaming load OK: time={time_s.shape}, LFP_array={LFP_array.shape}, chans={len(chan_cols)}")
+     
+else:
+    print(f"[INFO] streaming-load: time range {float(time_s[0])} -> {float(time_s[-1])}, channels={LFP_array.shape[0]}")
+    log(f"Streaming load OK: time={time_s.shape}, LFP_array={LFP_array.shape}, chans={len(chan_cols)}")
+
+
+FROM_STREAM = (LFP_df is None)
+
+# # ab hier ist 'time_full' garantiert vorhanden
+# assert "time" in LFP_df.columns, "CSV braucht eine Spalte 'time'."
+if not FROM_STREAM:
+    assert "time" in LFP_df.columns, "CSV braucht eine Spalte 'time'."
+
+
+
+if LFP_df is not None:
+    # alter Weg: wir haben ein DataFrame aus einer einzelnen CSV
+    time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
+
+    chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
+    ...
+    LFP_df_ds = pd.DataFrame({"timesamples": time_full})
+    for i, col in enumerate(chan_cols):
+        LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
+    NUM_CHANNELS = len(chan_cols)
+else:
+    # streaming-Weg: wir haben schon Array-Form
+    time_full = time_s
+    NUM_CHANNELS = LFP_array.shape[0]
+    chan_cols = chan_cols  # die kamen aus load_parts_to_array_streaming
+    # und wir können LFP_df_ds ganz weglassen, weil _ds_fun ja schon auf Array arbeitet
+
+
+# time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
+
+# # ========= NEU EINFÜGEN AB HIER =========
+# # Kanalspalten sortieren und sauberes DF aufbauen
+# chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
+
+# def _key_num(s):
+
+#     import re
+#     m = re.findall(r"\d+", s)
+#     return int(m[-1]) if m else 0
+
+# order_idx = sorted(range(len(chan_cols_raw)), key=lambda i: _key_num(chan_cols_raw[i]))
+# FLIP_DEPTH = False
+# if FLIP_DEPTH:
+#     order_idx = order_idx[::-1]
+
+# chan_cols = [chan_cols_raw[i] for i in order_idx]
+# LFP_df_ds = pd.DataFrame({"timesamples": time_full})
+# for i, col in enumerate(chan_cols):
+#     LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
+
+# NUM_CHANNELS = len(chan_cols)
+
+
+
+# if parts_dir.exists() and any(parts_dir.glob("*.part*.csv")):
+#     print(f"[INFO] Parts erkannt unter {parts_dir} -> lade alle Parts (on-the-fly concat)")
+#     # Wenn du nur bestimmte Spalten brauchst, setze usecols=["time","CSC1_values", ...]
+#     LFP_df = load_all_parts(parts_dir, usecols=None, dtype=None)
+#     # ch_names & Meta minimal ableiten (kompatibel zum restlichen Code)
+#     ch_names = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
+#     lfp_meta = {"source": "parts", "n_parts": len(list(parts_dir.glob('*.part*.csv')))}
+#     # Für nachfolgenden Code den erwarteten Dateinamen setzen (nur kosmetisch/log)
+#     LFP_FILENAME = f"{BASE_TAG}.csv (from parts)"
+# else:
+#     # normales Laden der (nicht-gesplitteten) CSV
+#     LFP_df, ch_names, lfp_meta = load_LFP_new(BASE_PATH, LFP_FILENAME)
+
+# assert "time" in LFP_df.columns, "CSV braucht eine Spalte 'time'."
+# time_full = LFP_df["time"].to_numpy(float)
+# print("[INFO] CSV rows:", len(LFP_df),
+#       "time range:", float(LFP_df["time"].iloc[0]), "->", float(LFP_df["time"].iloc[-1]))
 
 
 
@@ -468,101 +675,274 @@ def _decimate_xy(x, Y, max_points=40000):
     step = int(np.ceil(len(x) / max_points))
     return x[::step], Y[:, ::step]
 
-# Pulses (inkl. Auto-Detect) 
-pulse_times_1_full = np.array([], dtype=float)
-pulse_times_2_full = np.array([], dtype=float)
-stim_like_cols = []  # merken, um sie später NICHT als LFP-Kanäle zu verwenden
+# # --- Pulses (inkl. Auto-Detect), ROBUST gegen Reihenfolge -----------------
+# pulse_times_1_full = np.array([], dtype=float)
+# pulse_times_2_full = np.array([], dtype=float)
+# stim_like_cols = []
 
-def _edges_from_col(col, rising_only=True, thr=None):
-    x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
-    if not np.isfinite(x).any():
-        return np.array([], dtype=float)
-    # auto threshold falls nicht gegeben
-    if thr is None:
-        # robust: Median als Basis, 90%-Quantil für high
-        lo, hi = np.nanpercentile(x, [10, 90])
-        thr = (lo + hi) * 0.5
-    b = (x > thr).astype(np.int8)
-    # Flanken
-    idx = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1 if rising_only \
-          else np.flatnonzero(b[1:] != b[:-1]) + 1
-    return time_full[idx]
+# def _edges_from_col(col, rising_only=True, thr=None):
+#     x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+#     if not np.isfinite(x).any():
+#         return np.array([], dtype=float)
+#     if thr is None:
+#         lo, hi = np.nanpercentile(x, [10, 90])
+#         thr = (lo + hi) * 0.5
+#     b = (x > thr).astype(np.int8)
+#     if rising_only:
+#         idx = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1
+#     else:
+#         idx = np.flatnonzero(b[1:] != b[:-1]) + 1
+#     # hier können wir sicher sein, dass time_full existiert,
+#     # weil wir ihn oben direkt nach dem CSV-Laden definiert haben
+#     idx = idx[(idx >= 0) & (idx < time_full.size)]
+#     return time_full[idx].astype(float)
 
-# 1) klassische Fälle
-if "din_1" in LFP_df.columns:
-    t = _edges_from_col("din_1", rising_only=True, thr=None)
-    if t.size: 
-        pulse_times_1_full = t
-        stim_like_cols.append("din_1")
+# def _is_quasi_binary(col):
+#     x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+#     x = x[np.isfinite(x)]
+#     if x.size < 10:
+#         return False
+#     vals, counts = np.unique(np.round(x, 3), return_counts=True)
+#     if len(vals) <= 4:
+#         return True
+#     p0 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
+#     return p0 >= 0.95
 
-if "din_2" in LFP_df.columns:
-    t = _edges_from_col("din_2", rising_only=True, thr=None)
-    if t.size:
-        pulse_times_2_full = t
-        stim_like_cols.append("din_2")
+# # 1) "normale" Namen
+# if "din_1" in LFP_df.columns:
+#     t = _edges_from_col("din_1", rising_only=True, thr=None)
+#     if t.size:
+#         pulse_times_1_full = t
+#         stim_like_cols.append("din_1")
 
-if pulse_times_1_full.size == 0 and "stim" in LFP_df.columns:
-    t = _edges_from_col("stim", rising_only=True, thr=None)
-    if t.size:
-        pulse_times_1_full = t
-        stim_like_cols.append("stim")
+# if "din_2" in LFP_df.columns:
+#     t = _edges_from_col("din_2", rising_only=True, thr=None)
+#     if t.size:
+#         pulse_times_2_full = t
+#         stim_like_cols.append("din_2")
 
-# 2) Auto-Detect: finde (nahezu) binäre Kanäle
-def _is_quasi_binary(col):
-    x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
-    x = x[np.isfinite(x)]
-    if x.size < 10:
-        return False
-    # wenige Unique-Werte (z.B. 0/1/2), oder ~95% der Samples in {0,1}
-    vals, counts = np.unique(np.round(x, 3), return_counts=True)
-    if len(vals) <= 4:
-        return True
-    p0 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
-    return p0 >= 0.95
+# if pulse_times_1_full.size == 0 and "stim" in LFP_df.columns:
+#     t = _edges_from_col("stim", rising_only=True, thr=None)
+#     if t.size:
+#         pulse_times_1_full = t
+#         stim_like_cols.append("stim")
 
-if pulse_times_1_full.size == 0 and pulse_times_2_full.size == 0:
-    candidate_cols = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
-    bin_cols = [c for c in candidate_cols if _is_quasi_binary(c)]
-    if bin_cols:
-        # nimm die mit den meisten Flanken als din_1
-        best_col = None
-        best_count = -1
+# # 2) Auto-Detect nur wenn noch nichts gefunden
+# if pulse_times_1_full.size == 0 and pulse_times_2_full.size == 0:
+#     candidate_cols = [c for c in LFP_df.columns
+#                       if c not in ("time", "stim", "din_1", "din_2")]
+#     bin_cols = [c for c in candidate_cols if _is_quasi_binary(c)]
+#     if bin_cols:
+#         best_col = None
+#         best_count = -1
+#         for c in bin_cols:
+#             t = _edges_from_col(c, rising_only=True, thr=None)
+#             if t.size > best_count:
+#                 best_col, best_count = c, t.size
+#         if best_col is not None:
+#             pulse_times_1_full = _edges_from_col(best_col, rising_only=True, thr=None)
+#             stim_like_cols.append(best_col)
+#             print(f"[INFO] Auto-detected stim channel: {best_col} (rising edges: {len(pulse_times_1_full)})")
+
+# print(f"[INFO] pulses(full): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)}")
+
+
+if FROM_STREAM:
+    # wir haben die Pulse bereits beim Streaming bestimmt
+    # und auch schon auf ds_factor ausgedünnt
+    print(f"[INFO] pulses(from streaming): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)}")
+else:
+    # ALTER WEG: Pulse direkt aus dem DataFrame ziehen
+    pulse_times_1_full = np.array([], dtype=float)
+    pulse_times_2_full = np.array([], dtype=float)
+    stim_like_cols = []
+
+    # time_full existiert im nicht-Streaming-Zweig bereits weiter oben
+    time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
+
+    def _edges_from_col(col, rising_only=True, thr=None):
+        x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(x).any():
+            return np.array([], dtype=float)
+        if thr is None:
+            lo, hi = np.nanpercentile(x, [10, 90])
+            thr = (lo + hi) * 0.5
+        b = (x > thr).astype(np.int8)
+        idx = (np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1) if rising_only \
+              else (np.flatnonzero(b[1:] != b[:-1]) + 1)
+        idx = idx[(idx >= 0) & (idx < time_full.size)]
+        return time_full[idx].astype(float)
+
+    def _is_quasi_binary(col):
+        x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+        x = x[np.isfinite(x)]
+        if x.size < 10:
+            return False
+        vals = np.unique(np.round(x, 3))
+        if len(vals) <= 4:
+            return True
+        p01 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
+        return p01 >= 0.95
+
+    # 1) Bevorzugte Spaltennamen durchgehen
+    preferred = [c for c in ["din_1","din_2","stim","StartStop","TTL","DI0","DI1"] if c in LFP_df.columns]
+    if "din_1" in preferred:
+        t = _edges_from_col("din_1", rising_only=True, thr=None)
+        if t.size: pulse_times_1_full, stim_like_cols = t, stim_like_cols+["din_1"]
+    if "din_2" in preferred:
+        t = _edges_from_col("din_2", rising_only=True, thr=None)
+        if t.size: pulse_times_2_full, stim_like_cols = t, stim_like_cols+["din_2"]
+    if pulse_times_1_full.size == 0 and "stim" in preferred:
+        t = _edges_from_col("stim", rising_only=True, thr=None)
+        if t.size: pulse_times_1_full, stim_like_cols = t, stim_like_cols+["stim"]
+    # Falls StartStop/TTL nur eine Spur ist → als p1 nehmen
+    if pulse_times_1_full.size == 0:
+        for cand in ["StartStop","TTL","DI0","DI1"]:
+            if cand in preferred:
+                t = _edges_from_col(cand, rising_only=True, thr=None)
+                if t.size:
+                    pulse_times_1_full, stim_like_cols = t, stim_like_cols+[cand]
+                    break
+
+    # 2) Auto-Detect (wenn bisher nichts gefunden): nimm (nahezu) binäre Spalte mit meisten Flanken
+    if pulse_times_1_full.size == 0 and pulse_times_2_full.size == 0:
+        candidates = [c for c in LFP_df.columns if c not in ("time",)]
+        bin_cols = [c for c in candidates if _is_quasi_binary(c)]
+        best_col, best_count = None, -1
         for c in bin_cols:
             t = _edges_from_col(c, rising_only=True, thr=None)
             if t.size > best_count:
                 best_col, best_count = c, t.size
-        if best_col is not None:
+        if best_col is not None and best_count > 0:
             pulse_times_1_full = _edges_from_col(best_col, rising_only=True, thr=None)
             stim_like_cols.append(best_col)
             print(f"[INFO] Auto-detected stim channel: {best_col} (rising edges: {len(pulse_times_1_full)})")
 
-print(f"[INFO] pulses(full): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)}")
+    print(f"[INFO] pulses(full): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)} "
+          f"| from columns: {', '.join(stim_like_cols) if stim_like_cols else '—'}")
 
 
-# --- NACH dem Laden von LFP_df ---
-# 1) Kanalspalten extrahieren
-chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
+# # Pulses (inkl. Auto-Detect) 
+# pulse_times_1_full = np.array([], dtype=float)
+# pulse_times_2_full = np.array([], dtype=float)
+# stim_like_cols = []  # merken, um sie später NICHT als LFP-Kanäle zu verwenden
 
-# 2) Numerische Schlüssel aus Spaltennamen ziehen (z.B. "CSC10_values" -> 10, "8" -> 8)
-def _key_num(s):
-    import re
-    m = re.findall(r"\d+", s)
-    return int(m[-1]) if m else 0
+# def _edges_from_col(col, rising_only=True, thr=None):
+#     x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+#     if not np.isfinite(x).any():
+#         return np.array([], dtype=float)
+#     # auto threshold falls nicht gegeben
+#     if thr is None:
+#         # robust: Median als Basis, 90%-Quantil für high
+#         lo, hi = np.nanpercentile(x, [10, 90])
+#         thr = (lo + hi) * 0.5
+#     b = (x > thr).astype(np.int8)
+#     # Flanken
+#     idx = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1 if rising_only \
+#           else np.flatnonzero(b[1:] != b[:-1]) + 1
+#     return time_full[idx]
 
-# 3) Sortierte Reihenfolge (flach -> tief). Wenn du tief->flach willst: am Ende [::-1].
-order_idx = sorted(range(len(chan_cols_raw)), key=lambda i: _key_num(chan_cols_raw[i]))
-# optional: flippen, falls benötigt
-FLIP_DEPTH = False   # <- bei Bedarf True
-if FLIP_DEPTH:
-    order_idx = order_idx[::-1]
+# # 1) klassische Fälle
+# if "din_1" in LFP_df.columns:
+#     t = _edges_from_col("din_1", rising_only=True, thr=None)
+#     if t.size: 
+#         pulse_times_1_full = t
+#         stim_like_cols.append("din_1")
 
-chan_cols = [chan_cols_raw[i] for i in order_idx]  # ab hier NUR noch diese Reihenfolge verwenden
+# if "din_2" in LFP_df.columns:
+#     t = _edges_from_col("din_2", rising_only=True, thr=None)
+#     if t.size:
+#         pulse_times_2_full = t
+#         stim_like_cols.append("din_2")
 
-# 4) pri_* in *sortierter* Reihenfolge aufbauen
-LFP_df_ds = pd.DataFrame({"timesamples": time_full})
-for i, col in enumerate(chan_cols):
-    LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
-NUM_CHANNELS = len(chan_cols)
+# if pulse_times_1_full.size == 0 and "stim" in LFP_df.columns:
+#     t = _edges_from_col("stim", rising_only=True, thr=None)
+#     if t.size:
+#         pulse_times_1_full = t
+#         stim_like_cols.append("stim")
+
+# # 2) Auto-Detect: finde (nahezu) binäre Kanäle
+# def _is_quasi_binary(col):
+#     x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+#     x = x[np.isfinite(x)]
+#     if x.size < 10:
+#         return False
+#     # wenige Unique-Werte (z.B. 0/1/2), oder ~95% der Samples in {0,1}
+#     vals, counts = np.unique(np.round(x, 3), return_counts=True)
+#     if len(vals) <= 4:
+#         return True
+#     p0 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
+#     return p0 >= 0.95
+
+# if pulse_times_1_full.size == 0 and pulse_times_2_full.size == 0:
+#     candidate_cols = [c for c in LFP_df.columns if c not in ("time", "stim", "din_1", "din_2")]
+#     bin_cols = [c for c in candidate_cols if _is_quasi_binary(c)]
+#     if bin_cols:
+#         # nimm die mit den meisten Flanken als din_1
+#         best_col = None
+#         best_count = -1
+#         for c in bin_cols:
+#             t = _edges_from_col(c, rising_only=True, thr=None)
+#             if t.size > best_count:
+#                 best_col, best_count = c, t.size
+#         if best_col is not None:
+#             pulse_times_1_full = _edges_from_col(best_col, rising_only=True, thr=None)
+#             stim_like_cols.append(best_col)
+#             print(f"[INFO] Auto-detected stim channel: {best_col} (rising edges: {len(pulse_times_1_full)})")
+
+# print(f"[INFO] pulses(full): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)}")
+
+
+
+if not FROM_STREAM:
+    chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
+    # 2) Numerische Schlüssel aus Spaltennamen ziehen (z.B. "CSC10_values" -> 10, "8" -> 8)
+    def _key_num(s):
+        import re
+        m = re.findall(r"\d+", s)
+        return int(m[-1]) if m else 0
+
+    # 3) Sortierte Reihenfolge (flach -> tief). Wenn du tief->flach willst: am Ende [::-1].
+    order_idx = sorted(range(len(chan_cols_raw)), key=lambda i: _key_num(chan_cols_raw[i]))
+    # optional: flippen, falls benötigt
+    FLIP_DEPTH = False   # <- bei Bedarf True
+    if FLIP_DEPTH:
+        order_idx = order_idx[::-1]
+
+    
+    LFP_df_ds = pd.DataFrame({"timesamples": time_full})
+    for i, col in enumerate(chan_cols):
+        LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
+    NUM_CHANNELS = len(chan_cols)
+else:
+    # wir haben schon: time_s, LFP_array, chan_cols aus dem Streaming
+    NUM_CHANNELS = LFP_array.shape[0]
+
+
+# # --- NACH dem Laden von LFP_df ---
+# # 1) Kanalspalten extrahieren
+# chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
+
+# # 2) Numerische Schlüssel aus Spaltennamen ziehen (z.B. "CSC10_values" -> 10, "8" -> 8)
+# def _key_num(s):
+#     import re
+#     m = re.findall(r"\d+", s)
+#     return int(m[-1]) if m else 0
+
+# # 3) Sortierte Reihenfolge (flach -> tief). Wenn du tief->flach willst: am Ende [::-1].
+# order_idx = sorted(range(len(chan_cols_raw)), key=lambda i: _key_num(chan_cols_raw[i]))
+# # optional: flippen, falls benötigt
+# FLIP_DEPTH = False   # <- bei Bedarf True
+# if FLIP_DEPTH:
+#     order_idx = order_idx[::-1]
+
+# chan_cols = [chan_cols_raw[i] for i in order_idx]  # ab hier NUR noch diese Reihenfolge verwenden
+
+# # 4) pri_* in *sortierter* Reihenfolge aufbauen
+# LFP_df_ds = pd.DataFrame({"timesamples": time_full})
+# for i, col in enumerate(chan_cols):
+#     LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
+# NUM_CHANNELS = len(chan_cols)
 
 
 
@@ -594,21 +974,54 @@ def _name_to_idx(name, chan_cols_local=None, num_channels=None):
     except ValueError:
         return None
 
+# LFP_df_ds = pd.DataFrame({"timesamples": time_s})
+# for i, ch in enumerate(chan_cols):
+#     LFP_df_ds[f"pri_{i}"] = LFP_array[i].astype(np.float32, copy=False)
+
+if FROM_STREAM:
+    # NEU: direktes Array-Downsampling, KEIN DataFrame
+    time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = downsample_array_simple(
+        DOWNSAMPLE_FACTOR,
+        time_s,
+        LFP_array,
+        pulse_times_1=pulse_times_1_full,
+        pulse_times_2=pulse_times_2_full,
+        snap_pulses=True,
+    )
+else:
+    # alter Weg für nicht-gesplittete CSV
+    time_s = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
+    LFP_array = LFP_df[chan_cols].to_numpy(dtype=np.float32).T
+    # hier kannst du _ds_fun weiter benutzen, weil es ja ein DF hat
+    time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(
+        DOWNSAMPLE_FACTOR, LFP_df_ds, NUM_CHANNELS,
+        pulse_times_1=pulse_times_1_full,
+        pulse_times_2=pulse_times_2_full,
+        snap_pulses=True
+    )
+
+log(f"DS done: N={len(time_s)}, dt={dt}, shape={LFP_array.shape}, p1={0 if pulse_times_1 is None else len(pulse_times_1)}, p2={0 if pulse_times_2 is None else len(pulse_times_2)}")
+
+# alles, was wir für die weitere Analyse nicht mehr brauchen, weg
+if 'LFP_df' in globals() and LFP_df is not None:
+    del LFP_df
+if 'LFP_df_ds' in globals():
+    del LFP_df_ds
+import gc
+gc.collect()
 
 
-# Downsample 
-time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(
-    DOWNSAMPLE_FACTOR, LFP_df_ds, NUM_CHANNELS,
-    pulse_times_1=pulse_times_1_full,
-    pulse_times_2=pulse_times_2_full,
-    snap_pulses=True
-)
+
+# # WICHTIG: Full-Kopien für Analyse behalten
+# time_s_full        = time_s.copy()
+# LFP_array_full     = LFP_array.copy()
+pulse_times_1_full = None if pulse_times_1 is None else np.array(pulse_times_1, float)
+pulse_times_2_full = None if pulse_times_2 is None else np.array(pulse_times_2, float)
+
 
 NUM_CHANNELS = LFP_array.shape[0]
 good_idx = list(range(NUM_CHANNELS))  # Fallback: alle Kanäle
 reasons = []                          # für Log-Ausgaben des Kanalfilters
-
-
 
 # Wenn dt offensichtlich "Samples" ist, rechne in Sekunden um:
 # if dt > 1.0:  # dt in SAMPLES -> Sekunden
@@ -669,53 +1082,121 @@ def _ensure_main_channel(LFP_array, preferred_idx=10):
     return LFP_array[0, :], 0
 
 
+def _ensure_seconds(ts, time_ref, fs_xdat=DEFAULT_FS_XDAT):
+    """
+    Bringt ts (Pulszeiten) in die gleiche Einheit wie time_ref (Sekunden).
+    Erkennt 'zu große' Werte heuristisch und teilt dann durch fs_xdat.
+    """
+    import numpy as np
+    if ts is None: 
+        return None
+    ts = np.asarray(ts, float)
+    if ts.size == 0 or time_ref is None or len(time_ref) == 0:
+        return ts
+    # Heuristik: Wenn Pulse deutlich außerhalb der time_s-Skala liegen -> in Samples
+    tr_min, tr_max = float(time_ref[0]), float(time_ref[-1])
+    if np.nanmax(ts) > 100.0 * max(1.0, tr_max):   # sehr konservativ
+        return ts / float(fs_xdat)
+    return ts
+
+# direkt nach _ds_fun(...)
+pulse_times_1 = _ensure_seconds(pulse_times_1, time_s, DEFAULT_FS_XDAT)
+pulse_times_2 = _ensure_seconds(pulse_times_2, time_s, DEFAULT_FS_XDAT)
+
+
 
 # Stimulus-Fenster bestimmen & alles croppen 
-def _stim_window(p1, p2):
+def _stim_window(p1, p2, pad=0.5):
     ts = []
-    if p1 is not None and len(p1): ts.append([np.min(p1), np.max(p1)])
-    if p2 is not None and len(p2): ts.append([np.min(p2), np.max(p2)])
+    if p1 is not None and len(p1): ts.append([float(np.min(p1)), float(np.max(p1))])
+    if p2 is not None and len(p2): ts.append([float(np.min(p2)), float(np.max(p2))])
     if not ts:
-        return None  # kein Crop
-    t0 = min(x[0] for x in ts)
-    t1 = max(x[1] for x in ts)
-    # ein kleines Polster ist oft hilfreich:
-    pad = 0.5  # z.B. 0.5 wenn gewünscht
-    return t0 - pad, t1 + pad
+        return None
+    t0 = min(x[0] for x in ts) - pad
+    t1 = max(x[1] for x in ts) + pad
+    return (t0, t1)
 
-win = _stim_window(pulse_times_1, pulse_times_2)
-if win is not None:
-    t0, t1 = win
-    # Indizes im Zeitvektor
-    i0 = int(np.searchsorted(time_s, t0, side="left"))
-    i1 = int(np.searchsorted(time_s, t1, side="right"))
-    i0 = max(0, min(i0, len(time_s)))
-    i1 = max(i0+1, min(i1, len(time_s)))
+def _safe_crop_to_pulses(time_s, LFP_array, p1, p2, pad=0.5):
+    import numpy as np
+    t = np.asarray(time_s, float)
+    if t.size == 0:
+        print("[CROP] skip: empty time_s")
+        return time_s, LFP_array, p1, p2
 
-    # Zeit/Signale croppen (ALLE synchron!)
-    time_s       = time_s[i0:i1]
-    LFP_array    = LFP_array[:, i0:i1]
+    tmin, tmax = float(t[0]), float(t[-1])
+
+    def _clamp(ts):
+        if ts is None: return None
+        ts = np.asarray(ts, float)
+        if ts.size == 0: return ts
+        return ts[(ts >= tmin) & (ts <= tmax)]
+
+    p1c = _clamp(p1)
+    p2c = _clamp(p2)
+
+    if (p1c is None or p1c.size == 0) and (p2c is None or p2c.size == 0):
+        print("[CROP] no pulses in range -> no cropping")
+        return time_s, LFP_array, p1, p2
+
+    spans = []
+    if p1c is not None and p1c.size: spans.append((float(np.min(p1c)), float(np.max(p1c))))
+    if p2c is not None and p2c.size: spans.append((float(np.min(p2c)), float(np.max(p2c))))
+    if not spans:
+        print("[CROP] no valid spans -> no cropping")
+        return time_s, LFP_array, p1, p2
+
+    t0 = max(min(s[0] for s in spans) - pad, tmin)
+    t1 = min(max(s[1] for s in spans) + pad, tmax)
+    if not (t1 > t0):
+        print(f"[CROP] invalid window {t0}..{t1} -> no cropping")
+        return time_s, LFP_array, p1, p2
+
+    i0 = int(np.searchsorted(t, t0, side="left"))
+    i1 = int(np.searchsorted(t, t1, side="right"))
+    i0 = max(0, min(i0, t.size))
+    i1 = max(i0 + 1, min(i1, t.size))
+
+    time_new = time_s[i0:i1]
+    LFP_new  = LFP_array[:, i0:i1]
+
+    def _keep_in(ts):
+        if ts is None: return None
+        ts = np.asarray(ts, float)
+        if ts.size == 0: return ts
+        return ts[(ts >= time_new[0]) & (ts <= time_new[-1])]
+
+    p1_new = _keep_in(p1c)
+    p2_new = _keep_in(p2c)
+
+    print(f"[CROP] window {t0:.3f}–{t1:.3f} s -> time_s len={len(time_new)}, "
+          f"LFP_array={LFP_new.shape}, p1={0 if p1_new is None else len(p1_new)}, "
+          f"p2={0 if p2_new is None else len(p2_new)}")
+    return time_new, LFP_new, p1_new, p2_new
 
 
-    # Pulse-Zeiten aufs Fenster begrenzen 
-    if pulse_times_1 is not None:
-        pulse_times_1 = pulse_times_1[(pulse_times_1 >= time_s[0]) & (pulse_times_1 <= time_s[-1])]
-    if pulse_times_2 is not None:
-        pulse_times_2 = pulse_times_2[(pulse_times_2 >= time_s[0]) & (pulse_times_2 <= time_s[-1])]
-
-    print(f"[CROP] window {t0:.3f}–{t1:.3f} s -> time_s len={len(time_s)}, LFP_array={LFP_array.shape}, p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
-# else:
-#     print("[CROP] no pulses -> no cropping")
-
-#     #     # auch ohne Crop: main_channel definieren
-#     ch_idx = 10
-#     if ch_idx < 0 or ch_idx >= NUM_CHANNELS:
-#         raise ValueError(f"Channel {ch_idx} existiert nicht (nur {NUM_CHANNELS} Kanäle vorhanden).")
-#     main_channel = LFP_array[ch_idx, :]
-#     print(f"[INFO] main_channel = pri_{ch_idx}, len={len(main_channel)}, time_len={len(time_s)}")
+# vor dem Crop:
+if ((pulse_times_1 is None or len(pulse_times_1)==0) and
+    (pulse_times_2 is None or len(pulse_times_2)==0)):
+    print("[CROP] skip: no pulses -> keep full time range")
 else:
-    print("[CROP] no pulses -> no cropping")
-  
+    time_s, LFP_array, pulse_times_1, pulse_times_2 = _safe_crop_to_pulses(
+        time_s, LFP_array, pulse_times_1, pulse_times_2, pad=0.5
+    )
+
+
+
+
+
+
+
+
+# Anwenden (benutze NUR die normalisierten pulse_times_1/2 – NICHT *_full):
+time_s, LFP_array, pulse_times_1, pulse_times_2 = _safe_crop_to_pulses(
+    time_s, LFP_array, pulse_times_1, pulse_times_2, pad=0.5
+)
+
+log(f"Crop done: time={time_s[0]:.3f}->{time_s[-1]:.3f}, shape={LFP_array.shape}, p1={len(pulse_times_1) if pulse_times_1 is not None else 0}, p2={len(pulse_times_2) if pulse_times_2 is not None else 0}")
+
 # --- main_channel robust auswählen (nach evtl. Cropping) ---
 main_channel, ch_idx_used = _ensure_main_channel(LFP_array, preferred_idx=10)
 
@@ -736,9 +1217,6 @@ if HTML_IN_uV:
         # Fallback: zeige eben a.u., falls unbekannter Modus
         main_channel_uV = main_channel.copy()
 
-
-
-print(f"[INFO] main_channel = pri_{ch_idx_used}, len={len(main_channel)}, time_len={len(time_s)}")
 
 
 
@@ -833,6 +1311,7 @@ if reasons:
     print("[CHAN-FILTER] excluded:", ", ".join([f"pri_{j}({r})" for j, r in reasons]))
 print(f"[CHAN-FILTER] kept {NUM_CHANNELS_GOOD}/{NUM_CHANNELS} Kanäle:", ch_names_good[:10], ("..." if NUM_CHANNELS_GOOD>10 else ""))
 
+log(f"Channel filter: kept={NUM_CHANNELS_GOOD}/{NUM_CHANNELS}, good_idx={good_idx}")
 
 
 b_lp, a_lp, b_hp, a_hp = filtering(LOW_CUTOFF, HIGH_CUTOFF, dt)  # 2, 10
@@ -853,8 +1332,12 @@ align_len  = align_pre + align_post
 align_pre_s  = FIXED_ALIGN_PRE_S
 align_post_s = FIXED_ALIGN_POST_S
 
+if len(time_s) >= 2 and LFP_array.shape[1] >= 2:
+    Spect_dat = Run_spectrogram(main_channel, time_s)
+else:
+    raise RuntimeError("Spectrogram skipped: empty/too short segment after cropping.")
 
-Spect_dat = Run_spectrogram(main_channel, time_s)
+
 
 try:
     _save_all_channels_svg_from_array(
@@ -866,7 +1349,57 @@ except Exception as e:
     print("[ALL-CH][DS] skip:", e)
 
 
-# State detection
+# --- Init vor Spektren/States, damit Namen garantiert existieren ---
+freqs = spont_mean = pulse_mean = p_vals = None
+
+try:
+    res = compare_spectra(pulse_windows, spont_windows, dt, ignore_start_s=0.3)
+    freqs, spont_mean, pulse_mean, p_vals = res
+except Exception as e:
+    print("[WARN] spectra compare skipped:", e)
+
+def _empty_updict():
+    import numpy as np
+    ZI = np.array([], dtype=int); ZF = np.array([], dtype=float)
+    return {
+        "Spontaneous_UP": ZI, "Spontaneous_DOWN": ZI,
+        "Pulse_triggered_UP": ZI, "Pulse_triggered_DOWN": ZI,
+        "Pulse_associated_UP": ZI, "Pulse_associated_DOWN": ZI,
+        "Spon_Peaks": ZF, "Trig_Peaks": ZF,
+        "UP_start_i": ZI, "DOWN_start_i": ZI,
+        "Total_power": None, "up_state_binary": None,
+    }
+
+def _clip_pairs(U, D, n):
+    import numpy as np
+    U = np.asarray(U, int); D = np.asarray(D, int)
+    m = min(U.size, D.size)
+    if m == 0: return U[:0], D[:0]
+    U, D = U[:m], D[:m]
+    mask = (U >= 0) & (D > U) & (D <= n)
+    return U[mask], D[mask]
+
+# --- Events/Pulse boundary-sicher machen ---
+def _clip_events_to_bounds(pulse_times, time_s, pre_s, post_s):
+    import numpy as np
+    if pulse_times is None: 
+        return np.array([], dtype=float)
+    t = np.asarray(pulse_times, float)
+    if t.size == 0 or len(time_s) == 0:
+        return np.array([], dtype=float)
+    lo = float(time_s[0]) + float(pre_s)
+    hi = float(time_s[-1]) - float(post_s)
+    if hi <= lo:
+        return np.array([], dtype=float)
+    return t[(t >= lo) & (t <= hi)]
+
+pulse_times_1 = _clip_events_to_bounds(pulse_times_1, time_s, align_pre_s, align_post_s)
+pulse_times_2 = _clip_events_to_bounds(pulse_times_2, time_s, align_pre_s, align_post_s)
+
+log(f"Calling classify_states: len(time_s)={len(time_s)}, main_len={len(main_channel)}, dt={dt}, p1={len(pulse_times_1) if pulse_times_1 is not None else 0}, p2={len(pulse_times_2) if pulse_times_2 is not None else 0}")
+
+
+# --- classify_states robust aufrufen ---
 try:
     Up = classify_states(
         Spect_dat, time_s, pulse_times_1, pulse_times_2, dt,
@@ -874,22 +1407,21 @@ try:
         align_pre, align_post, align_len
     )
 except IndexError as e:
+    log(f"classify_states FAILED: {e}")
     print(f"[WARN] classify_states skipped due to IndexError: {e}")
+    Up = _empty_updict()
 
-    Up = {
-        "Spontaneous_UP":        np.array([], dtype=int),
-        "Spontaneous_DOWN":      np.array([], dtype=int),
-        "Pulse_triggered_UP":    np.array([], dtype=int),
-        "Pulse_triggered_DOWN":  np.array([], dtype=int),
-        "Pulse_associated_UP":   np.array([], dtype=int),
-        "Pulse_associated_DOWN": np.array([], dtype=int),
-        "Spon_Peaks":            np.array([], dtype=float),
-        "Total_power":           None,
-        "up_state_binary":       None,
-        # Optional-Felder, falls später abgefragt:
-        "UP_start_i":            np.array([], dtype=int),
-        "DOWN_start_i":          np.array([], dtype=int),
-    }
+# Falls das Modul doch mal Out-of-range Indizes liefert, bändige sie hier:
+nT = LFP_array.shape[1]
+for kU, kD in [
+    ("Spontaneous_UP","Spontaneous_DOWN"),
+    ("Pulse_triggered_UP","Pulse_triggered_DOWN"),
+    ("Pulse_associated_UP","Pulse_associated_DOWN"),
+]:
+    Uc, Dc = _clip_pairs(Up.get(kU, []), Up.get(kD, []), nT)
+    Up[kU], Up[kD] = Uc, Dc
+
+
 
 Spontaneous_UP        = Up.get("Spontaneous_UP",        np.array([], int))
 Spontaneous_DOWN      = Up.get("Spontaneous_DOWN",      np.array([], int))
@@ -901,6 +1433,8 @@ Spon_Peaks            = Up.get("Spon_Peaks",            np.array([], float))
 Total_power           = Up.get("Total_power",           None)
 up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", None))
 print("[COUNTS] sponUP:", len(Spontaneous_UP), " trigUP:", len(Pulse_triggered_UP), " assocUP:", len(Pulse_associated_UP))
+
+log(f"States: spon={len(Spontaneous_UP)}, trig={len(Pulse_triggered_UP)}, assoc={len(Pulse_associated_UP)}")
 
 
 def _upstate_amplitudes(signal, up_idx, down_idx):
@@ -1013,6 +1547,7 @@ fig_amp.tight_layout()
 fig_amp.savefig(amp_svg_path, format="svg", bbox_inches="tight")
 plt.close(fig_amp)
 print("[SVG] amplitude compare:", amp_svg_path)
+del fig_amp
 
 
 # --- Interaktive HTML immer erzeugen (mit UP-Schattierung) ---
@@ -1061,18 +1596,17 @@ Trig_Onsets = _up_onsets(Pulse_triggered_UP,   Pulse_triggered_DOWN)
 Spon_Onsets = Spon_Onsets[(Spon_Onsets >= 0) & (Spon_Onsets < LFP_array_good.shape[1])]
 Trig_Onsets = Trig_Onsets[(Trig_Onsets >= 0) & (Trig_Onsets < LFP_array_good.shape[1])]
 
-# CSD auf Onsets statt Peaks:
 CSD_spont = CSD_trig = None
-if NUM_CHANNELS_GOOD >= 7:
+if NUM_CHANNELS_GOOD >= 7 and (Spon_Onsets.size >= 3 or Trig_Onsets.size >= 3):
     try:
-        CSD_spont = Generate_CSD_mean(Spon_Onsets, LFP_array_good, dt)
-        CSD_trig  = Generate_CSD_mean(Trig_Onsets,  LFP_array_good, dt)
+        if Spon_Onsets.size >= 3:
+            CSD_spont = Generate_CSD_mean(Spon_Onsets, LFP_array_good, dt)
+        if Trig_Onsets.size >= 3:
+            CSD_trig  = Generate_CSD_mean(Trig_Onsets,  LFP_array_good, dt)
     except Exception as e:
         print("[WARN] CSD skipped:", e)
 else:
-    print(f"[INFO] CSD skipped: only {NUM_CHANNELS_GOOD} good channels (<7).")
-
-
+    print(f"[INFO] CSD skipped: channels={NUM_CHANNELS_GOOD}, spon_onsets={Spon_Onsets.size}, trig_onsets={Trig_Onsets.size}")
 def _even_subsample(idx, k):
     idx = np.asarray(idx, int)
     if idx.size <= k: return idx
@@ -1090,16 +1624,22 @@ if USE_EQUAL_N_FOR_PLOT and m >= 3:
     try:
         CSD_spont_eq = Generate_CSD_mean(spon_sel, LFP_array_good, dt)
         CSD_trig_eq  = Generate_CSD_mean(trig_sel,  LFP_array_good, dt)
-        CSD_spont_plot = CSD_spont_eq
-        CSD_trig_plot  = CSD_trig_eq
+        CSD_spont_plot = CSD_spont_eq if 'CSD_spont_eq' in locals() else CSD_spont
+        CSD_trig_plot  = CSD_trig_eq  if 'CSD_trig_eq'  in locals() else CSD_trig
+# …und diese in layout_rows an CSD_compare_side_by_side_ax übergeben.
+
         print(f"[Equal-N] using m={m} events (spont:{spon_all.size}→{m}, trig:{trig_all.size}→{m})")
     except Exception as e:
         print("[WARN] Equal-N CSD failed:", e)
-        CSD_spont_plot = CSD_spont
-        CSD_trig_plot  = CSD_trig
+        CSD_spont_plot = CSD_spont_eq if 'CSD_spont_eq' in locals() else CSD_spont
+        CSD_trig_plot  = CSD_trig_eq  if 'CSD_trig_eq'  in locals() else CSD_trig
+# …und diese in layout_rows an CSD_compare_side_by_side_ax übergeben.
+
 else:
-    CSD_spont_plot = CSD_spont
-    CSD_trig_plot  = CSD_trig
+    CSD_spont_plot = CSD_spont_eq if 'CSD_spont_eq' in locals() else CSD_spont
+    CSD_trig_plot  = CSD_trig_eq  if 'CSD_trig_eq'  in locals() else CSD_trig
+    # …und diese in layout_rows an CSD_compare_side_by_side_ax übergeben.
+
 
 # ====== DIAGNOSE: Spont vs Triggered CSD ======
 def _nan_stats(name, arr):
@@ -1107,11 +1647,20 @@ def _nan_stats(name, arr):
     if arr is None:
         print(f"[DIAG] {name}: None"); return
     a = np.asarray(arr, float)
-    print(f"[DIAG] {name}: shape={a.shape}, NaN%={np.mean(~np.isfinite(a))*100:.2f}%")
-    if a.size:
-        aa = np.abs(a[np.isfinite(a)])
+    nan_rate = np.mean(~np.isfinite(a))*100.0 if a.size else 100.0
+    print(f"[DIAG] {name}: shape={a.shape}, NaN%={nan_rate:.2f}%")
+    if a.size == 0 or not np.isfinite(a).any():
+        print(f"[DIAG] {name}: empty/invalid -> skip quantiles")
+        return
+    aa = np.abs(a[np.isfinite(a)])
+    if aa.size == 0:
+        print(f"[DIAG] {name}: no finite values -> skip quantiles")
+        return
+    try:
         qs = np.nanpercentile(aa, [50, 90, 99, 99.9])
         print(f"[DIAG] {name} |abs| quantiles: 50%={qs[0]:.3g}, 90%={qs[1]:.3g}, 99%={qs[2]:.3g}, 99.9%={qs[3]:.3g}")
+    except Exception as e:
+        print(f"[DIAG] {name}: quantiles failed: {e}")
 
 def _rms(a):
     import numpy as np
@@ -1173,17 +1722,6 @@ if freqs is not None and pulse_mean is not None:
         os.path.join(SAVE_DIR, "spectrum_trig.csv"), index=False)
 
 
-# ====== DIAGNOSE: Spont vs Triggered CSD ======
-def _nan_stats(name, arr):
-    import numpy as np
-    if arr is None:
-        print(f"[DIAG] {name}: None"); return
-    a = np.asarray(arr, float)
-    print(f"[DIAG] {name}: shape={a.shape}, NaN%={np.mean(~np.isfinite(a))*100:.2f}%")
-    if a.size:
-        aa = np.abs(a[np.isfinite(a)])
-        qs = np.nanpercentile(aa, [50, 90, 99, 99.9])
-        print(f"[DIAG] {name} |abs| quantiles: 50%={qs[0]:.3g}, 90%={qs[1]:.3g}, 99%={qs[2]:.3g}, 99.9%={qs[3]:.3g}")
 
 def _rms(a):
     import numpy as np
@@ -1380,7 +1918,6 @@ def Total_power_plot_ax(Spect_dat, Total_power=None, ax=None, title="Gesamtleist
     return fig
 
 from matplotlib.colors import SymLogNorm, TwoSlopeNorm
-
 def CSD_compare_side_by_side_ax(
     CSD_spont, CSD_trig, dt,
     *, z_mm=None,
@@ -1389,7 +1926,11 @@ def CSD_compare_side_by_side_ax(
     contours=False, ax=None, title="CSD (Spon vs. Trig)",
     norm_mode="symlog",          # "symlog" | "linear"
     linthresh_frac=0.03,         # Anteil von vmax für linearen Bereich
-    flip_y=True,                 # <--- NEU: Kanal 0 oben?
+    flip_y=True,                 # Kanal 0 oben?
+    # --- NEU: Anti-Patchiness/Export-Kontrolle ---
+    prefer_imshow=True,          # auch bei z_mm imshow benutzen (weiche Übergänge)
+    rasterize_csd=True,          # CSD-Artists für PDF/SVG rasterisieren
+    pcolor_shading="nearest",    # "nearest" reduziert Seams ggü. "auto"
     **_unused
 ):
     import matplotlib.pyplot as plt
@@ -1405,11 +1946,28 @@ def CSD_compare_side_by_side_ax(
         first = c[0] - (mid[0]-c[0])
         last  = c[-1] + (c[-1]-mid[-1])
         return _np.concatenate([[first], mid, [last]])
+    
+    
+
 
     def _robust_vmax(A, pct):
         A = _np.asarray(A, float)
         A = _np.abs(A[_np.isfinite(A)])
         return float(_np.nanpercentile(A, pct)) if A.size else _np.nan
+
+    def _mask_t0(A, align_pre, align_post, ms0=15.0):
+        import numpy as np
+        A = np.array(A, float, copy=True)
+        n_t = A.shape[1]
+        t = np.linspace(-align_pre, align_post, n_t)
+        m = (t >= 0) & (t <= ms0/1000.0)
+        A[:, m] = np.nan
+        return A
+
+    CSD_sp_for_scale = _mask_t0(CSD_spont, align_pre, align_post, ms0=15)
+    CSD_tr_for_scale = _mask_t0(CSD_trig,  align_pre, align_post, ms0=15)
+    v_sp = _robust_vmax(CSD_sp_for_scale, sat_pct)
+    v_tr = _robust_vmax(CSD_tr_for_scale,  sat_pct)
 
     ok = lambda A: (isinstance(A, _np.ndarray) and A.ndim == 2 and A.size > 0)
     if not (ok(CSD_spont) and ok(CSD_trig)):
@@ -1448,42 +2006,78 @@ def CSD_compare_side_by_side_ax(
     ax.set_axis_off()
 
     # === Darstellung ===
-    if z_mm is not None:
-        z_mm = _np.asarray(z_mm, float)
-        if z_mm.size != CSD_spont.shape[0]:
-            raise ValueError(f"z_mm hat {z_mm.size} Werte, CSD hat {CSD_spont.shape[0]} Zeilen.")
-        z_edges = _edges_from_centers(z_mm)
-        imL = ax_left.pcolormesh(t_edges, z_edges, CSD_spont, shading="auto", cmap=cmap, norm=norm)
-        imR = ax_right.pcolormesh(t_edges, z_edges, CSD_trig,  shading="auto", cmap=cmap, norm=norm)
-        for a in (ax_left, ax_right):
-            a.set_xlim(t_edges[0], t_edges[-1])
-            a.set_ylim(z_edges[0], z_edges[-1])
-            a.set_xlabel("Zeit (s)")
-            if flip_y:
-                a.invert_yaxis()  # <--- HIER flip!
-        ax_left.set_ylabel("Tiefe (mm)")
-    else:
-        extent = [-float(align_pre), float(align_post),
-                  0.0, float((CSD_spont.shape[0]-1))]
+    use_imshow = (z_mm is None) or prefer_imshow
+    artists = []
+
+    if use_imshow:
+        # y-Extent aus z_mm (falls vorhanden) ableiten
+        if z_mm is not None:
+            z_edges = _edges_from_centers(_np.asarray(z_mm, float))
+            y0, y1 = float(z_edges[0]), float(z_edges[-1])
+        else:
+            y0, y1 = 0.0, float((CSD_spont.shape[0]-1))
+
+        extent = [-float(align_pre), float(align_post), y0, y1]
         imL = ax_left.imshow(CSD_spont, aspect="auto",
                              origin="upper" if flip_y else "lower",
                              extent=extent, cmap=cmap, norm=norm,
                              interpolation=interp)
         imR = ax_right.imshow(CSD_trig,  aspect="auto",
-                             origin="upper" if flip_y else "lower",
-                             extent=extent, cmap=cmap, norm=norm,
-                             interpolation=interp)
+                              origin="upper" if flip_y else "lower",
+                              extent=extent, cmap=cmap, norm=norm,
+                              interpolation=interp)
         for a in (ax_left, ax_right):
             a.set_xlabel("Zeit (s)")
-        ax_left.set_ylabel("Tiefe (arb.)")
+            if flip_y:
+                a.invert_yaxis()
+        ax_left.set_ylabel("Tiefe (mm)" if z_mm is not None else "Tiefe (arb.)")
+        artists.extend([imL, imR])
 
+    else:
+        # pcolormesh mit „seam“-freundlichen Settings
+        z_mm = _np.asarray(z_mm, float)
+        if z_mm.size != CSD_spont.shape[0]:
+            raise ValueError(f"z_mm hat {z_mm.size} Werte, CSD hat {CSD_spont.shape[0]} Zeilen.")
+        z_edges = _edges_from_centers(z_mm)
+
+        imL = ax_left.pcolormesh(t_edges, z_edges, CSD_spont,
+                                 shading=pcolor_shading, cmap=cmap, norm=norm)
+        imR = ax_right.pcolormesh(t_edges, z_edges, CSD_trig,
+                                  shading=pcolor_shading, cmap=cmap, norm=norm)
+
+        # Anti-aliasing/Kanten entschärfen
+        for im in (imL, imR):
+            try:
+                im.set_antialiased(False)
+                im.set_edgecolor('face')
+                im.set_linewidth(0.0)
+            except Exception:
+                pass
+
+        for a in (ax_left, ax_right):
+            a.set_xlim(t_edges[0], t_edges[-1])
+            a.set_ylim(z_edges[0], z_edges[-1])
+            a.set_xlabel("Zeit (s)")
+            if flip_y:
+                a.invert_yaxis()
+        ax_left.set_ylabel("Tiefe (mm)")
+        artists.extend([imL, imR])
+
+    # Optional: Rasterisieren für saubere PDF/SVG
+    if rasterize_csd:
+        for im in artists:
+            try:
+                im.set_rasterized(True)
+            except Exception:
+                pass
+
+    # Titel/Colorbar
     ax_left.set_title("Spontaneous", fontsize=10)
     ax_right.set_title("Triggered", fontsize=10)
-    cb = fig.colorbar(imR, cax=cax)
+    cb = fig.colorbar(artists[-1], cax=cax)
     cb.set_label("CSD (a.u.)", rotation=90)
     ax_left.set_title(title, fontsize=11, pad=22)
     return fig
-
 
 
 # def CSD_compare_side_by_side_ax(
@@ -1646,57 +2240,61 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         print("[SUMMARY][ROLLUP For David] keine Quellen gefunden")
 
 
+#muss pot wieder rein 
+# def save_all_channels_small_multiples_svg(
+#     out_svg_path,
+#     time_s,
+#     X,                        # (n_ch, n_s)
+#     ch_names=None,
+#     width_in=20,  #0.6
+#     height_per_channel=50,  # 0.35–0.5 inch pro Kanal
+#     lw=1.2
+# ):
+#     X = np.asarray(X, float)
+#     n_ch, _ = X.shape
+#     if ch_names is None or len(ch_names) != n_ch:
+#         ch_names = [f"ch{i:02d}" for i in range(n_ch)]
 
-def save_all_channels_small_multiples_svg(
-    out_svg_path,
-    time_s,
-    X,                        # (n_ch, n_s)
-    ch_names=None,
-    width_in=20,  #0.6
-    height_per_channel=50,  # 0.35–0.5 inch pro Kanal
-    lw=1.2
-):
-    X = np.asarray(X, float)
-    n_ch, _ = X.shape
-    if ch_names is None or len(ch_names) != n_ch:
-        ch_names = [f"ch{i:02d}" for i in range(n_ch)]
+#     height_in = max(3.0, n_ch * height_per_channel)
+#     fig, axes = plt.subplots(n_ch, 1, figsize=(width_in, height_in), sharex=True)
+#     if n_ch == 1:
+#         axes = [axes]
 
-    height_in = max(3.0, n_ch * height_per_channel)
-    fig, axes = plt.subplots(n_ch, 1, figsize=(width_in, height_in), sharex=True)
-    if n_ch == 1:
-        axes = [axes]
+#     for i, ax in enumerate(axes):
+#         ax.plot(time_s, X[i], lw=lw)
+#         ax.set_ylabel(ch_names[i], rotation=0, ha="right", va="center", labelpad=10, fontsize=8)
+#         ax.grid(alpha=0.15)
 
-    for i, ax in enumerate(axes):
-        ax.plot(time_s, X[i], lw=lw)
-        ax.set_ylabel(ch_names[i], rotation=0, ha="right", va="center", labelpad=10, fontsize=8)
-        ax.grid(alpha=0.15)
-
-    axes[-1].set_xlabel("Zeit (s)")
-    fig.suptitle(f"Alle Kanäle, n={n_ch}", y=0.995)
-    fig.tight_layout(rect=[0,0,1,0.985])
-    fig.savefig(out_svg_path, format="svg")
-    plt.close(fig)
+#     axes[-1].set_xlabel("Zeit (s)")
+#     fig.suptitle(f"Alle Kanäle, n={n_ch}", y=0.995)
+#     fig.tight_layout(rect=[0,0,1,0.985])
+#     fig.savefig(out_svg_path, format="svg")
+#     plt.close(fig)
+#     del fig
 
 
 
-svg_path2 = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_.svg")
-save_all_channels_small_multiples_svg(
-    svg_path2,
-    time_s,
-    LFP_array,
-    ch_names=ch_names_for_plot,
-    height_per_channel=0.7,  # größer = mehr Platz je Kanal
-    lw=1.0
-)
-print("[SVG] all channels small-multiples:", svg_path2)
+# svg_path2 = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_.svg")
+# save_all_channels_small_multiples_svg(
+#     svg_path2,
+#     time_s,
+#     LFP_array,
+#     ch_names=ch_names_for_plot,
+#     height_per_channel=0.7,  # größer = mehr Platz je Kanal
+#     lw=1.0
+# )
+# print("[SVG] all channels small-multiples:", svg_path2)
 
-#  Gefilterte Variante (nach Kanal-Qualitätsfilter)
-svg_path2_good = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_GOOD.svg")
-save_all_channels_small_multiples_svg(
-    svg_path2_good, time_s, LFP_array_good, ch_names=ch_names_good,
-    height_per_channel=0.7, lw=1.0
-)
-print("[SVG] all channels small-multiples (filtered):", svg_path2_good)
+
+
+#muss vllt wieder rein 
+# #  Gefilterte Variante (nach Kanal-Qualitätsfilter)
+# svg_path2_good = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_GOOD.svg")
+# save_all_channels_small_multiples_svg(
+#     svg_path2_good, time_s, LFP_array_good, ch_names=ch_names_good,
+#     height_per_channel=0.7, lw=1.0
+# )
+# print("[SVG] all channels small-multiples (filtered):", svg_path2_good)
 
 
 # Helper
@@ -1722,6 +2320,7 @@ def _render_plotfunc_to_image(plot_func):
             images.append(None)
         finally:
             plt.close(f)
+            del f
     return images
 
 #Custom 1-Page Layout (1 groß, 2 klein, 1 groß) 
@@ -1749,14 +2348,15 @@ def export_onepage_custom(
         ax_top = fig.add_subplot(gs[0, :])
         try:
             plot_up_classification_ax(
-                main_channel, time_s,
+                main_channel, 
                 Spontaneous_UP, Spontaneous_DOWN,
                 Pulse_triggered_UP, Pulse_triggered_DOWN,
                 Pulse_associated_UP, Pulse_associated_DOWN,
-                pulse_times_1=pulse_times_1,
-                pulse_times_2=pulse_times_2,
+                time_s=time_s,
+                pulse_times_1=pulse_times_1_full,
+                pulse_times_2=pulse_times_2_full,
                 ax=ax_top,
-                title="Main channel with UP classification"
+                title="Main channel with UP classification",
             )
         except Exception as e:
             ax_top.text(0.5, 0.5, f"Plot error (UP class):\n{e}", ha="center", va="center", transform=ax_top.transAxes)
@@ -1808,6 +2408,7 @@ def export_onepage_custom(
         fig.tight_layout(rect=[0, 0, 1, 0.985])
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
+        del fig
 
     print(f"[PDF] geschrieben: {out_pdf}")
 
@@ -1986,6 +2587,7 @@ def _save_all_channels_svg_from_df(df, out_svg, *, max_points=20000):
     fig.tight_layout()
     fig.savefig(out_svg, format="svg")
     plt.close(fig)
+    del fig
     print(f"[ALL-CH] SVG geschrieben: {out_svg}")
 
 
@@ -2028,6 +2630,7 @@ def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *
     fig.tight_layout()
     fig.savefig(out_svg, format="svg")
     plt.close(fig)
+    del fig
     print(f"[ALL-CH] SVG geschrieben: {out_svg}")
 
 
@@ -2064,7 +2667,7 @@ layout_rows = [
     CSD_spont, CSD_trig, dt,
     z_mm=z_mm,
     align_pre=align_pre_s, align_post=align_post_s,
-    cmap="turbo", sat_pct=98,
+    cmap="Spectral", sat_pct=98,
     norm_mode="symlog",           # gemeinsame Skala, kleine Werte sichtbar
     linthresh_frac=0.02,
     exclude_for_scaling_ms=(0.0, 15.0),  # Stim-Artefakt beim Schätzen ignorieren
@@ -2073,8 +2676,8 @@ layout_rows = [
     )],
 ]
 
-print("CSD_spont mean ± std:", np.nanmean(CSD_spont), np.nanstd(CSD_spont))
-print("CSD_trig mean ± std :", np.nanmean(CSD_trig), np.nanstd(CSD_trig))
+
+#print("CSD_trig mean ± std :", np.nanmean(CSD_trig), np.nanstd(CSD_trig))
 
 
 def _write_summary_csv():
@@ -2206,7 +2809,7 @@ def _write_summary_csv():
         print("[SUMMARY][ROLLUP][ERROR]", e)
 
 
-def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_save_each_svg=True):
+def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_save_each_svg=False):
     """
     layout_rows: Liste von Zeilen.
       - [callable]                -> 1 Plot, volle Breite (spannt 2 Spalten)
@@ -2233,6 +2836,7 @@ def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_sa
                 fig.savefig(os.path.join(save_dir, f"{base_tag}_plot_{k:02d}.svg"),
                             format="svg", bbox_inches="tight")
                 plt.close(fig); k += 1
+                del fig
             elif len(row) == 2:
                 for spec in row:
                     fig, ax = plt.subplots(figsize=(5, 3.4))
@@ -2240,6 +2844,7 @@ def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_sa
                     fig.savefig(os.path.join(save_dir, f"{base_tag}_plot_{k:02d}.svg"),
                                 format="svg", bbox_inches="tight")
                     plt.close(fig); k += 1
+                    del fig
 
     # PDF Seiten
     with PdfPages(out_pdf) as pdf:
@@ -2267,11 +2872,28 @@ def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_sa
             fig.tight_layout(rect=[0, 0, 1, 0.98])
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
+            del fig
+
 
     print(f"[PDF] geschrieben: {out_pdf}")
 
+if __name__ == "__main__":
+    try:
+        log("START")
+        # ... dein Code ...
+        log("FERTIG ohne Fehler")
+    except Exception as e:
+        import traceback
+        err = traceback.format_exc()
+        log(f"EXCEPTION: {e}")
+        with open(LOGFILE, "a", encoding="utf-8") as f:
+            f.write("\n[EXCEPTION]\n")
+            f.write(err)
+        raise
 
 
+
+log("Exporting layout PDF/SVG ...")
 
 # Export aufrufen 
 export_with_layout(
@@ -2279,6 +2901,8 @@ export_with_layout(
     rows_per_page=3,          # 3 Zeilen -> alles auf eine Seite
     also_save_each_svg=True
 )
+
+log("Export finished")
 
 print("[ORDER]", chan_cols)  # Originalnamen der LFP-Spalten
 print("[GOOD_IDX]", good_idx)
@@ -2289,3 +2913,4 @@ print("[DEPTH flip?]", FLIP_DEPTH)
 
 print("[CHAN-FILTER] kept:", good_idx)
 print("[CHAN-FILTER] reasons:", reasons)
+
