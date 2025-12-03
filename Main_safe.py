@@ -986,7 +986,7 @@ def CSD_compare_side_by_side_ax(
         A = _np.abs(A[_np.isfinite(A)])
         return float(_np.nanpercentile(A, pct)) if A.size else _np.nan
 
-    def _mask_t0(A, align_pre, align_post, ms0=15.0):
+    def _mask_t0(A, align_pre, align_post, ms0=300.0):
         import numpy as np
         A = np.array(A, float, copy=True)
         n_t = A.shape[1]
