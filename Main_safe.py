@@ -545,6 +545,39 @@ for kU, kD in [
 
 
 
+def crop_up_intervals(UP, DOWN, dt, start_s=0.3, end_s=1.0):
+    """
+    Schneidet UP-Intervalle zu:
+    neuer Bereich = [UP + start_s  ...  UP + end_s], aber niemals über DOWN hinaus.
+    Gibt zwei Arrays zurück: cropped_UP, cropped_DOWN
+    """
+    UP = np.asarray(UP, int)
+    DOWN = np.asarray(DOWN, int)
+    m = min(len(UP), len(DOWN))
+
+    if m == 0:
+        return np.array([], int), np.array([], int)
+
+    UP = UP[:m]
+    DOWN = DOWN[:m]
+
+    cropped_UP = []
+    cropped_DOWN = []
+
+    start_offset = int(round(start_s / dt))
+    end_offset   = int(round(end_s / dt))
+
+    for u, d in zip(UP, DOWN):
+        new_u = u + start_offset
+        new_d = min(u + end_offset, d)
+
+        if new_d > new_u:   # sonst skip
+            cropped_UP.append(new_u)
+            cropped_DOWN.append(new_d)
+
+    return np.array(cropped_UP, int), np.array(cropped_DOWN, int)
+
+
 Spontaneous_UP        = Up.get("Spontaneous_UP",        np.array([], int))
 Spontaneous_DOWN      = Up.get("Spontaneous_DOWN",      np.array([], int))
 Pulse_triggered_UP    = Up.get("Pulse_triggered_UP",    np.array([], int))
@@ -554,62 +587,96 @@ Pulse_associated_DOWN = Up.get("Pulse_associated_DOWN", np.array([], int))
 Spon_Peaks            = Up.get("Spon_Peaks",            np.array([], float))
 Total_power           = Up.get("Total_power",           None)
 up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", None))
-print("[COUNTS] sponUP:", len(Spontaneous_UP), " trigUP:", len(Pulse_triggered_UP), " assocUP:", len(Pulse_associated_UP))
 
+print("[COUNTS] sponUP:", len(Spontaneous_UP), " trigUP:", len(Pulse_triggered_UP), " assocUP:", len(Pulse_associated_UP))
 log(f"States: spon={len(Spontaneous_UP)}, trig={len(Pulse_triggered_UP)}, assoc={len(Pulse_associated_UP)}")
 
+# --- NEU: gecroppte Intervalle (0.3–1.0 s ab UP-Start) ---
+Spon_UP_crop, Spon_DOWN_crop = crop_up_intervals(
+    Spontaneous_UP, Spontaneous_DOWN, dt, start_s=0.3, end_s=1.0
+)
+Trig_UP_crop, Trig_DOWN_crop = crop_up_intervals(
+    Pulse_triggered_UP, Pulse_triggered_DOWN, dt, start_s=0.3, end_s=1.0
+)
 
-def upstate_amplitude_compare_ax(spont_amp, trig_amp, ax=None, title="UP Amplituden: Spontan vs. Getriggert"):
-    """
-    Boxplot + Jitterpunkte + Mittelwert±SEM.
-    """
+def upstate_amplitude_compare_ax(
+    spont_amp, trig_amp,
+    ax=None,
+    title="UP Amplitude (max-min): Spontan vs. Getriggert"
+):
     import numpy as np
     import matplotlib.pyplot as plt
-    rng = np.random.default_rng(42)
+
+    spont_amp = np.asarray(spont_amp, float)
+    trig_amp  = np.asarray(trig_amp,  float)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6.5, 3.4))
     else:
         fig = ax.figure
 
-    data = []
-    labels = []
-    if spont_amp is not None and len(spont_amp):
-        data.append(np.asarray(spont_amp, float))
-        labels.append("Spontan")
-    if trig_amp is not None and len(trig_amp):
-        data.append(np.asarray(trig_amp, float))
-        labels.append("Getriggert")
+    data, labels = [], []
+    if spont_amp.size:
+        data.append(spont_amp); labels.append("Spontan")
+    if trig_amp.size:
+        data.append(trig_amp); labels.append("Getriggert")
 
     if not data:
-        ax.text(0.5, 0.5, "keine Amplituden gefunden", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.5, "no UP amplitudes", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
         return fig
 
-    # Boxplots
-    bp = ax.boxplot(data, labels=labels, whis=[5, 95], showfliers=False)
-
-    # Jitter-Punkte
-    for i, arr in enumerate(data, start=1):
-        x = i + (rng.random(arr.size) - 0.5) * 0.18
-        ax.plot(x, arr, "o", ms=3, alpha=0.5)
-
-    # Mittelwert ± SEM
-    for i, arr in enumerate(data, start=1):
-        m = float(np.nanmean(arr))
-        se = float(_sem(arr))
-        ax.errorbar(i+0.28, m, yerr=se, fmt="s", ms=5, capsize=4)
-
+    ax.boxplot(data, labels=labels, whis=[5, 95], showfliers=False)
     ax.set_ylabel(f"Amplitude ({UNIT_LABEL})")
     ax.set_title(title)
+    ax.grid(alpha=0.15, linestyle=":")
+    return fig
+
+def upstate_duration_compare_ax(
+    Trig_UP_crop, Trig_DOWN_crop,
+    Spon_UP_crop, Spon_DOWN_crop,
+    dt, ax=None
+):
+
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    else:
+        fig = ax.figure
+
+    Trig_UP   = np.asarray(Trig_UP_crop,   int)
+    Trig_DOWN = np.asarray(Trig_DOWN_crop, int)
+    Spon_UP   = np.asarray(Spon_UP_crop,   int)
+    Spon_DOWN = np.asarray(Spon_DOWN_crop, int)
+
+    m_trig = min(len(Trig_UP), len(Trig_DOWN))
+    m_spon = min(len(Spon_UP), len(Spon_DOWN))
+
+    trig_dur = (Trig_DOWN[:m_trig] - Trig_UP[:m_trig]) * dt if m_trig > 0 else np.array([], float)
+    spon_dur = (Spon_DOWN[:m_spon] - Spon_UP[:m_spon]) * dt if m_spon > 0 else np.array([], float)
+
+    data, labels = [], []
+    if spon_dur.size:
+        data.append(spon_dur); labels.append("Spontan")
+    if trig_dur.size:
+        data.append(trig_dur); labels.append("Getriggert")
+
+    if not data:
+        ax.text(0.5, 0.5, "no UP durations", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    ax.boxplot(data, labels=labels, whis=[5, 95], showfliers=False)
+    ax.set_ylabel("Dauer (s)")
+    ax.set_title("UP-Dauern (cropped 0.3–1.0 s)")
     ax.grid(alpha=0.15, linestyle=":")
     return fig
 
 
 
 # --- Amplituden pro UP-Typ (max - min) berechnen + CSV ablegen ---
-spont_amp = _upstate_amplitudes(main_channel, Spontaneous_UP,     Spontaneous_DOWN)
-trig_amp  = _upstate_amplitudes(main_channel, Pulse_triggered_UP, Pulse_triggered_DOWN)
+spont_amp = _upstate_amplitudes(main_channel, Spon_UP_crop, Spon_DOWN_crop)
+trig_amp  = _upstate_amplitudes(main_channel, Trig_UP_crop, Trig_DOWN_crop)
 
 amp_df = pd.DataFrame({
     "group": (["spontaneous"] * len(spont_amp)) + (["triggered"] * len(trig_amp)),
@@ -912,18 +979,7 @@ def spont_up_mean_ax(main_channel, time_s, dt, Spon_Peaks, ax=None):
     ax.set_xlabel("Time (s)"); ax.set_ylabel(f"LFP ({UNIT_LABEL})"); ax.set_title("Spontaneous UP – mean ± SEM")
     return fig
 
-def upstate_duration_compare_ax(PU, PD, SU, SD, dt, ax=None):
-    if ax is None: fig, ax = plt.subplots(figsize=(8,3))
-    else:         fig = ax.figure
-    trig=(PD-PU)*dt if len(PU) else np.array([]); spon=(SD-SU)*dt if len(SU) else np.array([])
-    labels,vals=[],[]
-    if len(spon): labels.append("Spont"); vals.append(spon)
-    if len(trig): labels.append("Trig");  vals.append(trig)
-    if not vals:
-        ax.text(0.5,0.5,"no UP durations", ha="center", va="center", transform=ax.transAxes); return fig
-    ax.boxplot(vals, labels=labels, whis=[5,95], showfliers=False)
-    ax.set_ylabel("Duration (s)"); ax.set_title("UP durations")
-    return fig
+
 
 def Total_power_plot_ax(Spect_dat, Total_power=None, ax=None, title="Gesamtleistung 0.1–150 Hz"):
     if ax is None:
@@ -1627,8 +1683,6 @@ def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *
     Alternative, falls du schon das downsampled Array hast:
     LFP_array: shape (n_chan, n_time)
     """
-    import numpy as np
-    import matplotlib.pyplot as plt
 
     t = np.asarray(time_s, dtype=float)
     step = max(1, t.size // max_points)
@@ -1681,8 +1735,8 @@ layout_rows = [
 
     # REIHE 2: links Durations, rechts Power
     [lambda ax: upstate_duration_compare_ax(
-        Pulse_triggered_UP, Pulse_triggered_DOWN,
-        Spontaneous_UP, Spontaneous_DOWN, dt, ax=ax
+        Trig_UP_crop, Trig_DOWN_crop,
+        Spon_UP_crop, Spon_DOWN_crop, dt, ax=ax
     ),
      lambda ax: Power_spectrum_compare_ax(
         freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax
@@ -1758,10 +1812,10 @@ def _write_summary_csv():
         UP_i   = np.array(Up_states.get("UP_start_i",   []), dtype=int)
         DOWN_i = np.array(Up_states.get("DOWN_start_i", []), dtype=int)
         if DOWN_i.size == 0:
-            sUP = np.array(Up_states.get("Spontaneous_UP",       []), dtype=int)
-            sDN = np.array(Up_states.get("Spontaneous_DOWN",     []), dtype=int)
-            tUP = np.array(Up_states.get("Pulse_triggered_UP",   []), dtype=int)
-            tDN = np.array(Up_states.get("Pulse_triggered_DOWN", []), dtype=int)
+            sUP = np.array(Up_states.get("Spontaneous_UP_crop",       []), dtype=int)
+            sDN = np.array(Up_states.get("Spontaneous_DOWN_crop",     []), dtype=int)
+            tUP = np.array(Up_states.get("Pulse_triggered_UP_crop",   []), dtype=int)
+            tDN = np.array(Up_states.get("Pulse_triggered_DOWN_crop", []), dtype=int)
             UP_i   = np.concatenate((tUP, sUP)) if (tUP.size or sUP.size) else np.array([], int)
             DOWN_i = np.concatenate((tDN, sDN)) if (tDN.size or sDN.size) else np.array([], int)
         m = min(len(UP_i), len(DOWN_i))

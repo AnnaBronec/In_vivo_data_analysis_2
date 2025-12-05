@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from neo.rawio import NeuralynxRawIO
 
-# ------------------ helpers ------------------
+
 
 def _dec(x):
     if isinstance(x, (bytes, bytearray)):
@@ -234,7 +234,10 @@ def main(session_dir, out_csv=None):
         t0 = _sig_t0(rr, si)
         time = t0 + np.arange(n, dtype=np.float64) / sr
 
-        chunk = _get_chunk(rr, si, 0, n, ch_idx)  # shape (n, n_ch)
+        # NEU: lokale Indizes für Neo (0..n_stream_ch-1)
+        ch_idx_local = list(range(len(ch_idx)))
+
+        chunk = _get_chunk(rr, si, 0, n, ch_idx_local)  # shape (n, n_ch)
 
         # Column names (robust gegen UNKNOWN: erst sinnvollen Namen versuchen, sonst CSC1..N)
         names = []
