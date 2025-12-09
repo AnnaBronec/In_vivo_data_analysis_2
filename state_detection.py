@@ -101,7 +101,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
     Spect_dB = np.clip(Spect_dat[0], -100, 100)
 
     # Frequenzmaske für z. B. 0.5–4 Hz
-    delta_mask = (freqs >= 0.1) & (freqs <= 150.0)
+    delta_mask = (freqs >= 0.1) & (freqs <= 150.0)   #FREUQUENZMASKE FRAG TIM
 
     # Nur Delta-Power extrahieren
     linear_power_delta = 10 ** (Spect_dB[delta_mask, :] / 10)
@@ -370,7 +370,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
         "DOWN_start_i": DOWN_start_i,
         "up_state_binary": up_state_binary,
         "Trig_Peaks": Trig_Peaks,
-        "Trig_UP_peak_alligned_array": Trig_UP_peak_aligned_array
+        "Trig_UP_peak_alligned_array": Trig_UP_peak_aligned_array,
 
 
     }
@@ -378,22 +378,103 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
     
 
 
-def Generate_CSD_mean(peaks_list, signal_array, dt):
-    all_csd = []
-    for i, peak in enumerate(peaks_list):
-        if not np.isnan(peak):
-            start = int(peak - int(0.5 / dt))
-            end = int(peak + int(0.5 / dt))
-            if start >= 1 and end <= signal_array.shape[1] - 1:
-                segment = signal_array[:, start:end]
-                CSD_out = CSD_calc(segment, dt)
-                all_csd.append(CSD_out)
+# def Generate_CSD_mean(peaks_list, signal_array, dt):
+#     all_csd = []
+#     for i, peak in enumerate(peaks_list):
+#         if not np.isnan(peak):
+#             start = int(peak - int(0.5 / dt))
+#             end = int(peak + int(0.5 / dt))
+#             if start >= 1 and end <= signal_array.shape[1] - 1:
+#                 segment = signal_array[:, start:end]
+#                 CSD_out = CSD_calc(segment, dt)
+#                 all_csd.append(CSD_out)
 
-    if len(all_csd) > 0:
-        return np.nanmean(np.stack(all_csd), axis=0)
-    else:
-        print("Kein CSD berechnet – Rückgabe: Dummy mit NaNs")
-        return np.full((signal_array.shape[0], int(1 / dt)), np.nan)
+#     if len(all_csd) > 0:
+#         return np.nanmean(np.stack(all_csd), axis=0)
+#     else:
+#         print("Kein CSD berechnet – Rückgabe: Dummy mit NaNs")
+#         return np.full((signal_array.shape[0], int(1 / dt)), np.nan)
+
+def Generate_CSD_mean_from_onsets(
+    onsets,
+    signal_array,
+    dt,
+    pre_s=0.3,
+    post_s=0.3,
+    clip_to_down=None,   # optional: DOWN-Indices, um das Fenster innerhalb des UP zu halten
+):
+    """
+    Erzeugt ein mittleres CSD rund um UP-Onsets.
+
+    onsets        : Array von Sample-Indizes (UP-Starts)
+    signal_array  : LFP (n_channels, n_time)
+    dt            : Abtastintervall [s]
+    pre_s,post_s  : Zeitfenster relativ zum Onset (z.B. -0.3..+0.5 s)
+    clip_to_down  : optional Array gleicher Länge wie onsets;
+                    wenn gesetzt, wird das Ende nicht hinter DOWN fallen.
+    """
+    import numpy as np
+
+    onsets = np.asarray(onsets, int)
+    if onsets.size == 0:
+        print("[CSD] keine Onsets übergeben")
+        return None
+
+    n_ch, n_t = signal_array.shape
+    pre  = int(round(pre_s  / dt))
+    post = int(round(post_s / dt))
+
+    csd_segments = []   # hier sammeln wir CSDs aller Events
+
+    for i, o in enumerate(onsets):
+        if np.isnan(o):
+            continue
+        o = int(o)
+
+        start = o - pre
+        end   = o + post
+
+        # optional: Fenster am DOWN begrenzen (nur innerhalb des UP)
+        if clip_to_down is not None and i < len(clip_to_down):
+            d = int(clip_to_down[i])
+            end = min(end, d)
+
+        # Randbedingungen: Platz für räumliche Ableitung lassen
+        if start < 1 or end > (n_t - 1):
+            # wäre aus dem Recording raus
+            continue
+
+        seg = signal_array[:, start:end]   # Shape (n_ch, n_seg_time)
+
+        try:
+            csd = CSD_calc(seg, dt)        # deine Funktion aus CSD.py
+        except Exception as e:
+            print(f"[CSD] CSD_calc Fehler bei Onset {o}: {e}")
+            continue
+
+        if csd is not None and np.isfinite(csd).any():
+            csd_segments.append(csd)
+
+    if not csd_segments:
+        print("[CSD] kein gültiges Event -> gebe None zurück")
+        return None
+
+    # --- NEU: alle CSDs auf gleiche Zeitlänge bringen ---
+    try:
+        min_T = min(c.shape[1] for c in csd_segments)
+    except Exception:
+        print("[CSD] ungültige CSD-Segmente -> None")
+        return None
+
+    if min_T <= 0:
+        print("[CSD] min_T <= 0 -> None")
+        return None
+
+    csd_stack = np.stack([c[:, :min_T] for c in csd_segments], axis=0)  # (n_events, n_ch_csd, min_T)
+    csd_mean = np.nanmean(csd_stack, axis=0)                            # (n_ch_csd, min_T)
+
+    print(f"[CSD] {len(csd_segments)} Events, mean CSD shape={csd_mean.shape}")
+    return csd_mean
 
 
 #

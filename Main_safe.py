@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# ========= Imports =========
 import os, math
 import numpy as np
 _np = np
@@ -12,6 +11,7 @@ import matplotlib.pyplot as plt
 
 from matplotlib.colors import SymLogNorm, TwoSlopeNorm
 import gc
+from scipy.ndimage import gaussian_filter
 
 from matplotlib.colors import TwoSlopeNorm, SymLogNorm
 from matplotlib.backends.backend_pdf import PdfPages
@@ -27,8 +27,8 @@ except ImportError:
 from preprocessing import filtering, get_main_channel, pre_post_condition
 from TimeFreq_plot import Run_spectrogram
 from state_detection import (
-    classify_states, Generate_CSD_mean, extract_upstate_windows,
-    compare_spectra, _up_onsets
+    classify_states, extract_upstate_windows,
+    compare_spectra, _up_onsets, Generate_CSD_mean_from_onsets,
 )
 from pathlib import Path
 from plotter import (
@@ -577,6 +577,177 @@ def crop_up_intervals(UP, DOWN, dt, start_s=0.3, end_s=1.0):
 
     return np.array(cropped_UP, int), np.array(cropped_DOWN, int)
 
+def refractory_overlay_ax(
+    main_channel,
+    time_s,
+    UP_indices,
+    DOWN_indices,
+    dt,
+    pre_s=0.5,       # wie weit vor UP-Ende anzeigen
+    post_s=2.0,      # wie weit nach UP-Ende anzeigen
+    ax=None,
+    title="UP-offset-alignierte LFP-Segmente + nächster UP-Onset"
+):
+    """
+    Visualisiert für eine Sequenz von UP/DOWN-Paaren:
+    - alle LFP-Segmente relativ zum Ende eines UP (DOWN-Index) übereinander
+    - 0 s = Ende des aktuellen UP
+    - vertikale Linie bei 0 s (UP-Ende)
+    - vertikale Linien für die Onsets des jeweils folgenden UP
+    - markiert zusätzlich den mittleren Zeitpunkt des nächsten UP-Onsets
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.0))
+    else:
+        fig = ax.figure
+
+    UP   = np.asarray(UP_indices,   int)
+    DOWN = np.asarray(DOWN_indices, int)
+
+    m = min(len(UP), len(DOWN))
+    if m < 2:
+        ax.text(0.5, 0.5, "zu wenige UP/DOWN-Paare\n(mind. 2 nötig)",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    # Wir betrachten Paare: (DOWN[i] -> UP[i+1])
+    pre_n  = int(round(pre_s  / dt))
+    post_n = int(round(post_s / dt))
+
+    segs = []
+    rel_next_onsets = []
+
+    for i in range(m - 1):
+        idx_off = DOWN[i]       # Ende des aktuellen UP
+        idx_next_on = UP[i+1]   # Beginn des nächsten UP
+
+        if idx_off < 0 or idx_off >= len(time_s):
+            continue
+        if idx_next_on < 0 or idx_next_on >= len(time_s):
+            continue
+
+        t_off = time_s[idx_off]
+        t_next = time_s[idx_next_on]
+        rel_next = t_next - t_off   # Refraktärzeit (s)
+
+        # Fenster um das UP-Ende
+        s = idx_off - pre_n
+        e = idx_off + post_n
+        if s < 0 or e > len(main_channel):
+            continue
+
+        seg = main_channel[s:e]
+        if len(seg) != (pre_n + post_n):
+            continue
+
+        segs.append(seg)
+        rel_next_onsets.append(rel_next)
+
+    if not segs:
+        ax.text(0.5, 0.5, "keine gültigen Segmente für Refraktär-Overlay",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    segs = np.vstack(segs)
+    rel_next_onsets = np.asarray(rel_next_onsets, float)
+    n = segs.shape[0]
+
+    t_rel = (np.arange(-pre_n, post_n) * dt)
+
+    # Einzeltraces
+    for i in range(n):
+        ax.plot(t_rel, segs[i], alpha=0.10, lw=0.8)
+
+    # Mitteltrace
+    mean_trace = np.nanmean(segs, axis=0)
+    ax.plot(t_rel, mean_trace, lw=2.0, label="Mean LFP")
+
+    # Vertikale Linie beim UP-Ende
+    ax.axvline(0.0, color="k", lw=1.0, ls="--", label="UP-Ende")
+
+    # Vertikale Linien für nächste UP-Onsets (leicht transparent)
+    valid_mask = np.isfinite(rel_next_onsets)
+    rel_valid = rel_next_onsets[valid_mask]
+
+    if rel_valid.size:
+        for r in rel_valid:
+            if (-pre_s <= r <= post_s):
+                ax.axvline(r, color="red", alpha=0.18, lw=1.0)
+
+        mean_ref = float(np.nanmean(rel_valid))
+        if -pre_s <= mean_ref <= post_s:
+            ax.axvline(mean_ref, color="red", lw=1.8, ls=":",
+                       label=f"Mean nächster UP ({mean_ref*1000:.0f} ms)")
+
+        # kleine Textbox mit n und Mean
+        ax.text(
+            0.02, 0.95,
+            f"n = {rel_valid.size}\nMean = {mean_ref*1000:.1f} ms",
+            transform=ax.transAxes,
+            ha="left", va="top",
+            fontsize=10,
+            bbox=dict(boxstyle="round", fc="white", alpha=0.7)
+        )
+    else:
+        ax.text(
+            0.02, 0.95,
+            f"n = 0\n(keine gültigen Refraktärzeiten)",
+            transform=ax.transAxes,
+            ha="left", va="top",
+            fontsize=10,
+            bbox=dict(boxstyle="round", fc="white", alpha=0.7)
+        )
+
+    ax.set_xlabel("Zeit relativ zum UP-Ende (s)")
+    ax.set_ylabel(f"LFP ({UNIT_LABEL})")
+    ax.set_title(title)
+
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+
+    return fig
+
+
+def compute_refractory_period(UP_indices, DOWN_indices, time_s):
+    """
+    Berechnet die Refraktärzeit:
+    Zeit vom Ende eines UP-Zustands (DOWN) bis zum Beginn des
+    nächsten UP-Zustands (UP), in Sekunden.
+
+    UP_indices, DOWN_indices: Arrays mit Indizes in time_s
+    time_s: Vektor der Zeitstempel (Sekunden)
+    """
+    UP   = np.asarray(UP_indices,   int)
+    DOWN = np.asarray(DOWN_indices, int)
+
+    m = min(len(UP), len(DOWN))
+    if m < 2:
+        return np.array([], float)
+
+    UP   = UP[:m]
+    DOWN = DOWN[:m]
+
+    # Sicherheit: nach Zeit sortieren
+    order = np.argsort(time_s[UP])
+    UP    = UP[order]
+    DOWN  = DOWN[order]
+
+    refrac = []
+    for i in range(m - 1):
+        t_off = time_s[DOWN[i]]      # Ende des aktuellen UP
+        t_on  = time_s[UP[i+1]]      # Beginn des nächsten UP
+        dt_ref = t_on - t_off
+        if dt_ref >= 0:
+            refrac.append(dt_ref)
+
+    return np.array(refrac, float)
+
+
 
 Spontaneous_UP        = Up.get("Spontaneous_UP",        np.array([], int))
 Spontaneous_DOWN      = Up.get("Spontaneous_DOWN",      np.array([], int))
@@ -590,6 +761,92 @@ up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", Non
 
 print("[COUNTS] sponUP:", len(Spontaneous_UP), " trigUP:", len(Pulse_triggered_UP), " assocUP:", len(Pulse_associated_UP))
 log(f"States: spon={len(Spontaneous_UP)}, trig={len(Pulse_triggered_UP)}, assoc={len(Pulse_associated_UP)}")
+
+
+# --- Refraktärzeiten (Ende eines UP bis Beginn des nächsten UP) ---
+refrac_spont = compute_refractory_period(
+    Spontaneous_UP, Spontaneous_DOWN, time_s
+)
+refrac_trig = compute_refractory_period(
+    Pulse_triggered_UP, Pulse_triggered_DOWN, time_s
+)
+
+print(f"[REFRAC] spont: n={len(refrac_spont)}, trig: n={len(refrac_trig)}")
+
+
+# --- CSV: Refraktärzeiten exportieren ---
+if len(refrac_spont) or len(refrac_trig):
+    ref_data = []
+    if len(refrac_spont):
+        ref_data.append(pd.DataFrame({
+            "group": "spontaneous",
+            "refractory_s": refrac_spont,
+            "refractory_ms": refrac_spont * 1000.0,
+        }))
+    if len(refrac_trig):
+        ref_data.append(pd.DataFrame({
+            "group": "triggered",
+            "refractory_s": refrac_trig,
+            "refractory_ms": refrac_trig * 1000.0,
+        }))
+    ref_df = pd.concat(ref_data, ignore_index=True)
+
+    ref_csv_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__refractory_periods.csv")
+    ref_df.to_csv(ref_csv_path, index=False)
+    print(f"[CSV] Refraktärzeiten geschrieben: {ref_csv_path}  (rows={len(ref_df)})")
+else:
+    print("[REFRAC] keine Refraktärzeiten (zu wenige UP/DOWN-Events)")
+
+def pulse_to_up_latencies(pulse_times, up_indices, time_s, max_win_s=1.0):
+    """
+    Berechnet die Latenz zwischen Puls und Beginn des UP-Zustands.
+    Für jeden UP-Index wird der *letzte Puls davor* gesucht (innerhalb von max_win_s),
+    und die Differenz (UP_time - pulse_time) in Sekunden zurückgegeben.
+    """
+    if pulse_times is None or len(pulse_times) == 0 or len(up_indices) == 0:
+        return np.array([], float)
+
+    pulse_times = np.asarray(pulse_times, float)
+    up_indices  = np.asarray(up_indices, int)
+
+    # Zeitpunkte der UP-Onsets
+    up_t = time_s[up_indices]
+    latencies = []
+
+    for t_up in up_t:
+        # alle Pulse, die vor diesem UP liegen
+        mask = pulse_times <= t_up
+        if not mask.any():
+            continue
+        t_p = pulse_times[mask][-1]    # letzter Puls vor UP
+
+        lat = t_up - t_p
+        # Optionales Fenster: nur Pulse, die "in der Nähe" liegen
+        if 0.0 <= lat <= max_win_s:
+            latencies.append(lat)
+
+    return np.array(latencies, float)
+
+
+# --- Pulse→UP-Latenzen (Trigger-Pulse zu Beginn des UP-Zustands) ---
+latencies_trig = pulse_to_up_latencies(
+    pulse_times_1,          # oder pulse_times_2, je nach Setup
+    Pulse_triggered_UP,
+    time_s,
+    max_win_s=1.0           # z.B. nur Pulse innerhalb von 1s berücksichtigen
+)
+
+if latencies_trig.size:
+    lat_df = pd.DataFrame({
+        "latency_s": latencies_trig,
+        "latency_ms": latencies_trig * 1000.0,
+    })
+    lat_csv_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__pulse_to_up_latency.csv")
+    lat_df.to_csv(lat_csv_path, index=False)
+    print(f"[CSV] Pulse→UP Latenzen geschrieben: {lat_csv_path}  (n={len(latencies_trig)})")
+else:
+    print("[INFO] keine Pulse→UP Latenzen gefunden (entweder keine Pulse oder keine Trigger-UPs)")
+
 
 # --- NEU: gecroppte Intervalle (0.3–1.0 s ab UP-Start) ---
 Spon_UP_crop, Spon_DOWN_crop = crop_up_intervals(
@@ -632,6 +889,52 @@ def upstate_amplitude_compare_ax(
     ax.grid(alpha=0.15, linestyle=":")
     return fig
 
+def pulse_to_up_latency_hist_ax(latencies, ax=None, bins=30):
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    latencies = np.asarray(latencies, float)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.0))
+    else:
+        fig = ax.figure
+
+    if latencies.size == 0:
+        ax.text(0.5, 0.5, "no Pulse→UP latencies", 
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    # in Millisekunden umrechnen
+    lat_ms  = latencies * 1000.0
+    mean_ms = float(np.nanmean(lat_ms))
+
+    # Histogramm
+    ax.hist(lat_ms, bins=bins, alpha=0.8, label="Einzel-Latenzen")
+
+    # vertikale Linie beim Mittelwert
+    ax.axvline(mean_ms, linestyle="--", linewidth=2,
+               label=f"Mean = {mean_ms:.1f} ms")
+
+    ax.set_xlabel("Pulse→UP Latenz (ms)")
+    ax.set_ylabel("Anzahl")
+    ax.set_title(f"Pulse→UP Latenzen (Mean = {mean_ms:.1f} ms)")
+
+    # Textbox oben rechts mit Mean + n
+    ax.text(
+        0.98, 0.95,
+        f"Mean = {mean_ms:.1f} ms\nn = {lat_ms.size}",
+        transform=ax.transAxes,
+        ha="right", va="top"
+    )
+
+    ax.legend()
+    return fig
+
+
+
+
 def upstate_duration_compare_ax(
     Trig_UP_crop, Trig_DOWN_crop,
     Spon_UP_crop, Spon_DOWN_crop,
@@ -673,6 +976,57 @@ def upstate_duration_compare_ax(
     return fig
 
 
+def refractory_compare_ax(refrac_spont, refrac_trig, ax=None, title="Refraktärzeit bis zum nächsten UP"):
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    else:
+        fig = ax.figure
+
+    refrac_spont = np.asarray(refrac_spont, float)
+    refrac_trig  = np.asarray(refrac_trig,  float)
+
+    data, labels = [], []
+    if refrac_spont.size:
+        data.append(refrac_spont)
+        labels.append("Spontan")
+    if refrac_trig.size:
+        data.append(refrac_trig)
+        labels.append("Getriggert")
+
+    if not data:
+        ax.text(0.5, 0.5, "keine Refraktärzeiten", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    ax.boxplot(
+        data,
+        labels=labels,
+        whis=[5, 95],
+        showfliers=False
+    )
+    ax.set_ylabel("Refraktärzeit bis nächster UP (s)")
+    ax.set_title(title)
+    ax.grid(alpha=0.15, linestyle=":")
+
+    # kleine n-Angabe
+    txt = []
+    if refrac_spont.size:
+        txt.append(f"Spontan: n={refrac_spont.size}")
+    if refrac_trig.size:
+        txt.append(f"Getriggert: n={refrac_trig.size}")
+    ax.text(
+        0.98, 0.95,
+        "\n".join(txt),
+        transform=ax.transAxes,
+        ha="right", va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round", fc="white", alpha=0.7)
+    )
+
+    return fig
 
 # --- Amplituden pro UP-Typ (max - min) berechnen + CSV ablegen ---
 spont_amp = _upstate_amplitudes(main_channel, Spon_UP_crop, Spon_DOWN_crop)
@@ -741,44 +1095,160 @@ Spon_Onsets = Spon_Onsets[(Spon_Onsets >= 0) & (Spon_Onsets < LFP_array_good.sha
 Trig_Onsets = Trig_Onsets[(Trig_Onsets >= 0) & (Trig_Onsets < LFP_array_good.shape[1])]
 
 CSD_spont = CSD_trig = None
+
+CSD_PRE_DESIRED  = 0.5   # 0.5 s vor Onset
+CSD_POST_DESIRED = 0.5   # 0.5 s nach Onset
+
 if NUM_CHANNELS_GOOD >= 7 and (Spon_Onsets.size >= 3 or Trig_Onsets.size >= 3):
     try:
         if Spon_Onsets.size >= 3:
-            CSD_spont = Generate_CSD_mean(Spon_Onsets, LFP_array_good, dt)
+            CSD_spont = Generate_CSD_mean_from_onsets(
+                Spon_Onsets,
+                LFP_array_good,
+                dt,
+                pre_s=CSD_PRE_DESIRED,
+                post_s=CSD_POST_DESIRED,
+                clip_to_down=Spontaneous_DOWN,   # optional
+            )
+
         if Trig_Onsets.size >= 3:
-            CSD_trig  = Generate_CSD_mean(Trig_Onsets,  LFP_array_good, dt)
+            CSD_trig = Generate_CSD_mean_from_onsets(
+                Trig_Onsets,
+                LFP_array_good,
+                dt,
+                pre_s=CSD_PRE_DESIRED,
+                post_s=CSD_POST_DESIRED,
+                clip_to_down=Pulse_triggered_DOWN,
+            )
+
+        align_pre_s  = CSD_PRE_DESIRED
+        align_post_s = CSD_POST_DESIRED
+
     except Exception as e:
-        print("[WARN] CSD skipped:", e)
+        print("[WARN] CSD generation failed:", e)
+        CSD_spont = CSD_trig = None
+        align_pre_s  = CSD_PRE_DESIRED
+        align_post_s = CSD_POST_DESIRED
 else:
-    print(f"[INFO] CSD skipped: channels={NUM_CHANNELS_GOOD}, spon_onsets={Spon_Onsets.size}, trig_onsets={Trig_Onsets.size}")
+    print(f"[INFO] CSD skipped: channels={NUM_CHANNELS_GOOD}, "
+          f"spon_onsets={Spon_Onsets.size}, trig_onsets={Trig_Onsets.size}")
+    align_pre_s  = CSD_PRE_DESIRED
+    align_post_s = CSD_POST_DESIRED
 
 
-USE_EQUAL_N_FOR_PLOT = True
-spon_all = np.asarray(Spon_Onsets, int)
-trig_all = np.asarray(Trig_Onsets,  int)
-m = int(min(spon_all.size, trig_all.size))
+# CSD_spont = CSD_trig = None
 
-if USE_EQUAL_N_FOR_PLOT and m >= 3:
-    spon_sel = np.sort(_even_subsample(spon_all, m))
-    trig_sel = np.sort(_even_subsample(trig_all, m))
-    try:
-        CSD_spont_eq = Generate_CSD_mean(spon_sel, LFP_array_good, dt)
-        CSD_trig_eq  = Generate_CSD_mean(trig_sel,  LFP_array_good, dt)
-        CSD_spont_plot = CSD_spont_eq if 'CSD_spont_eq' in locals() else CSD_spont
-        CSD_trig_plot  = CSD_trig_eq  if 'CSD_trig_eq'  in locals() else CSD_trig
-# …und diese in layout_rows an CSD_compare_side_by_side_ax übergeben.
+# # dein Wunschfenster
+# CSD_PRE_DESIRED  = 0.5   # 0.5 s vor Onset
+# CSD_POST_DESIRED = 0.5   # 0.5 s nach Onset
 
-        print(f"[Equal-N] using m={m} events (spont:{spon_all.size}→{m}, trig:{trig_all.size}→{m})")
-    except Exception as e:
-        print("[WARN] Equal-N CSD failed:", e)
-        CSD_spont_plot = CSD_spont_eq if 'CSD_spont_eq' in locals() else CSD_spont
-        CSD_trig_plot  = CSD_trig_eq  if 'CSD_trig_eq'  in locals() else CSD_trig
-# …und diese in layout_rows an CSD_compare_side_by_side_ax übergeben.
+# if NUM_CHANNELS_GOOD >= 7 and (Spon_Onsets.size >= 3 or Trig_Onsets.size >= 3):
+#     try:
+#         # 1) Fenster anhand der SPONT-Onsets bestimmen
+#         CSD_spont, pre_eff_s, post_eff_s = Generate_CSD_mean_from_onsets(
+#             Spon_Onsets,
+#             LFP_array_good,
+#             dt,
+#             pre_s_desired=CSD_PRE_DESIRED,
+#             post_s_desired=CSD_POST_DESIRED,
+#             down_indices=Spontaneous_DOWN
+#         )
 
-else:
-    CSD_spont_plot = CSD_spont_eq if 'CSD_spont_eq' in locals() else CSD_spont
-    CSD_trig_plot  = CSD_trig_eq  if 'CSD_trig_eq'  in locals() else CSD_trig
-    # …und diese in layout_rows an CSD_compare_side_by_side_ax übergeben.
+#         # 2) Das gleiche (gekürzte) Fenster für TRIG verwenden,
+#         #    damit Vergleich fair ist
+#         if Trig_Onsets.size >= 3:
+#             CSD_trig, _, _ = Generate_CSD_mean_from_onsets(
+#                 Trig_Onsets,
+#                 LFP_array_good,
+#                 dt,
+#                 pre_s_desired=pre_eff_s,    # schon gekürzt
+#                 post_s_desired=post_eff_s,
+#                 down_indices=Pulse_triggered_DOWN
+#             )
+
+#         # 3) Align-Variablen für Plot-Achsen
+#         align_pre_s  = pre_eff_s
+#         align_post_s = post_eff_s
+
+#     except Exception as e:
+#         print("[WARN] CSD generation failed:", e)
+#         CSD_spont = CSD_trig = None
+# else:
+#     print(f"[INFO] CSD skipped: channels={NUM_CHANNELS_GOOD}, spon_onsets={Spon_Onsets.size}, trig_onsets={Trig_Onsets.size}")
+
+# CSD_spont = CSD_trig = None
+
+# # Zeitfenster für CSD relativ zum UP-Onset
+# CSD_PRE_S  = 0.3   # 0.3 s vor Onset
+# CSD_POST_S = 1.5   # 1.5 s nach Onset
+
+# if NUM_CHANNELS_GOOD >= 7:
+#     try:
+#         if Spon_Onsets.size >= 3:
+#             CSD_spont = Generate_CSD_mean_from_onsets(
+#                 Spon_Onsets,
+#                 LFP_array_good,
+#                 dt,
+#                 pre_s=CSD_PRE_S,
+#                 post_s=CSD_POST_S,
+#                 clip_to_down=Spontaneous_DOWN,   # optional; sonst None
+#             )
+#         if Trig_Onsets.size >= 3:
+#             CSD_trig = Generate_CSD_mean_from_onsets(
+#                 Trig_Onsets,
+#                 LFP_array_good,
+#                 dt,
+#                 pre_s=CSD_PRE_S,
+#                 post_s=CSD_POST_S,
+#                 clip_to_down=Pulse_triggered_DOWN,  # optional
+#             )
+#     except Exception as e:
+#         print("[WARN] CSD skipped:", e)
+#         CSD_spont = CSD_trig = None
+# else:
+#     print(f"[INFO] CSD skipped: channels={NUM_CHANNELS_GOOD}, spon_onsets={Spon_Onsets.size}, trig_onsets={Trig_Onsets.size}")
+
+
+
+# CSD_spont = CSD_trig = None
+# if NUM_CHANNELS_GOOD >= 7 and (Spon_Onsets.size >= 3 or Trig_Onsets.size >= 3):
+#     try:
+#         if Spon_Onsets.size >= 3:
+#             CSD_spont = Generate_CSD_mean(Spon_Onsets, LFP_array_good, dt)
+#         if Trig_Onsets.size >= 3:
+#             CSD_trig  = Generate_CSD_mean(Trig_Onsets,  LFP_array_good, dt)
+#     except Exception as e:
+#         print("[WARN] CSD skipped:", e)
+# else:
+#     print(f"[INFO] CSD skipped: channels={NUM_CHANNELS_GOOD}, spon_onsets={Spon_Onsets.size}, trig_onsets={Trig_Onsets.size}")
+
+
+# USE_EQUAL_N_FOR_PLOT = True
+# spon_all = np.asarray(Spon_Onsets, int)
+# trig_all = np.asarray(Trig_Onsets,  int)
+# m = int(min(spon_all.size, trig_all.size))
+
+# if USE_EQUAL_N_FOR_PLOT and m >= 3:
+#     spon_sel = np.sort(_even_subsample(spon_all, m))
+#     trig_sel = np.sort(_even_subsample(trig_all, m))
+#     try:
+#         CSD_spont_eq = Generate_CSD_mean(spon_sel, LFP_array_good, dt)
+#         CSD_trig_eq  = Generate_CSD_mean(trig_sel,  LFP_array_good, dt)
+#         CSD_spont_plot = CSD_spont_eq if 'CSD_spont_eq' in locals() else CSD_spont
+#         CSD_trig_plot  = CSD_trig_eq  if 'CSD_trig_eq'  in locals() else CSD_trig
+# # …und diese in layout_rows an CSD_compare_side_by_side_ax übergeben.
+
+#         print(f"[Equal-N] using m={m} events (spont:{spon_all.size}→{m}, trig:{trig_all.size}→{m})")
+#     except Exception as e:
+#         print("[WARN] Equal-N CSD failed:", e)
+#         CSD_spont_plot = CSD_spont_eq if 'CSD_spont_eq' in locals() else CSD_spont
+#         CSD_trig_plot  = CSD_trig_eq  if 'CSD_trig_eq'  in locals() else CSD_trig
+# # …und diese in layout_rows an CSD_compare_side_by_side_ax übergeben.
+
+# else:
+#     CSD_spont_plot = CSD_spont_eq if 'CSD_spont_eq' in locals() else CSD_spont
+#     CSD_trig_plot  = CSD_trig_eq  if 'CSD_trig_eq'  in locals() else CSD_trig
+#     # …und diese in layout_rows an CSD_compare_side_by_side_ax übergeben.
 
 
 
@@ -791,23 +1261,23 @@ _nan_stats("CSD_spont", CSD_spont)
 _nan_stats("CSD_trig",  CSD_trig)
 print(f"[DIAG] RMS CSD: spont={_rms(CSD_spont):.4g}, trig={_rms(CSD_trig):.4g}")
 
-# 2) Gleiche Event-Anzahl erzwingen (fairer Vergleich)
-Spon_Peaks_eq = Up.get("Spon_Peaks", np.array([], float))
-Trig_Peaks_eq = Up.get("Trig_Peaks", np.array([], float))
-m = min(len(Spon_Peaks_eq), len(Trig_Peaks_eq))
-if m >= 3:
-    Spon_Peaks_eq = np.asarray(Spon_Peaks_eq, int)[:m]
-    Trig_Peaks_eq  = np.asarray(Trig_Peaks_eq,  int)[:m]
-    try:
-        CSD_spont_eq = Generate_CSD_mean(Spon_Peaks_eq, LFP_array_good, dt)
-        CSD_trig_eq  = Generate_CSD_mean(Trig_Peaks_eq,  LFP_array_good, dt)
-        print(f"[DIAG] RMS CSD (equal N={m}): spont={_rms(CSD_spont_eq):.4g}, trig={_rms(CSD_trig_eq):.4g}")
-        _nan_stats("CSD_spont_eq", CSD_spont_eq)
-        _nan_stats("CSD_trig_eq",  CSD_trig_eq)
-    except Exception as e:
-        print("[DIAG][WARN] Equal-N CSD failed:", e)
-else:
-    print(f"[DIAG] Equal-N Skip: not enough events (spon={len(Spon_Peaks_eq)}, trig={len(Trig_Peaks_eq)})")
+# # 2) Gleiche Event-Anzahl erzwingen (fairer Vergleich)
+# Spon_Peaks_eq = Up.get("Spon_Peaks", np.array([], float))
+# Trig_Peaks_eq = Up.get("Trig_Peaks", np.array([], float))
+# m = min(len(Spon_Peaks_eq), len(Trig_Peaks_eq))
+# if m >= 3:
+#     Spon_Peaks_eq = np.asarray(Spon_Peaks_eq, int)[:m]
+#     Trig_Peaks_eq  = np.asarray(Trig_Peaks_eq,  int)[:m]
+#     try:
+#         CSD_spont_eq = Generate_CSD_mean(Spon_Peaks_eq, LFP_array_good, dt)
+#         CSD_trig_eq  = Generate_CSD_mean(Trig_Peaks_eq,  LFP_array_good, dt)
+#         print(f"[DIAG] RMS CSD (equal N={m}): spont={_rms(CSD_spont_eq):.4g}, trig={_rms(CSD_trig_eq):.4g}")
+#         _nan_stats("CSD_spont_eq", CSD_spont_eq)
+#         _nan_stats("CSD_trig_eq",  CSD_trig_eq)
+#     except Exception as e:
+#         print("[DIAG][WARN] Equal-N CSD failed:", e)
+# else:
+#     print(f"[DIAG] Equal-N Skip: not enough events (spon={len(Spon_Peaks_eq)}, trig={len(Trig_Peaks_eq)})")
 
 # 3) Prüfen, ob Cropping Spontan-Events stark reduziert
 print(f"[DIAG] Cropped time_s: {time_s[0]:.3f}..{time_s[-1]:.3f} s, pulses p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
@@ -842,23 +1312,23 @@ _nan_stats("CSD_spont", CSD_spont)
 _nan_stats("CSD_trig",  CSD_trig)
 print(f"[DIAG] RMS CSD: spont={_rms(CSD_spont):.4g}, trig={_rms(CSD_trig):.4g}")
 
-# 2) Gleiche Event-Anzahl erzwingen (fairer Vergleich)
-Spon_Peaks_eq = Up.get("Spon_Peaks", np.array([], float))
-Trig_Peaks_eq = Up.get("Trig_Peaks", np.array([], float))
-m = min(len(Spon_Peaks_eq), len(Trig_Peaks_eq))
-if m >= 3:  # brauchbare Mindestzahl
-    Spon_Peaks_eq = np.asarray(Spon_Peaks_eq, int)[:m]
-    Trig_Peaks_eq = np.asarray(Trig_Peaks_eq, int)[:m]
-    try:
-        CSD_spont_eq = Generate_CSD_mean(Spon_Peaks_eq, LFP_array_good, dt)
-        CSD_trig_eq  = Generate_CSD_mean(Trig_Peaks_eq,  LFP_array_good, dt)
-        print(f"[DIAG] RMS CSD (equal N={m}): spont={_rms(CSD_spont_eq):.4g}, trig={_rms(CSD_trig_eq):.4g}")
-        _nan_stats("CSD_spont_eq", CSD_spont_eq)
-        _nan_stats("CSD_trig_eq",  CSD_trig_eq)
-    except Exception as e:
-        print("[DIAG][WARN] Equal-N CSD failed:", e)
-else:
-    print(f"[DIAG] Equal-N Skip: not enough events (spon={len(Spon_Peaks_eq)}, trig={len(Trig_Peaks_eq)})")
+# # 2) Gleiche Event-Anzahl erzwingen (fairer Vergleich)
+# Spon_Peaks_eq = Up.get("Spon_Peaks", np.array([], float))
+# Trig_Peaks_eq = Up.get("Trig_Peaks", np.array([], float))
+# m = min(len(Spon_Peaks_eq), len(Trig_Peaks_eq))
+# if m >= 3:  # brauchbare Mindestzahl
+#     Spon_Peaks_eq = np.asarray(Spon_Peaks_eq, int)[:m]
+#     Trig_Peaks_eq = np.asarray(Trig_Peaks_eq, int)[:m]
+#     try:
+#         CSD_spont_eq = Generate_CSD_mean(Spon_Peaks_eq, LFP_array_good, dt)
+#         CSD_trig_eq  = Generate_CSD_mean(Trig_Peaks_eq,  LFP_array_good, dt)
+#         print(f"[DIAG] RMS CSD (equal N={m}): spont={_rms(CSD_spont_eq):.4g}, trig={_rms(CSD_trig_eq):.4g}")
+#         _nan_stats("CSD_spont_eq", CSD_spont_eq)
+#         _nan_stats("CSD_trig_eq",  CSD_trig_eq)
+#     except Exception as e:
+#         print("[DIAG][WARN] Equal-N CSD failed:", e)
+# else:
+#     print(f"[DIAG] Equal-N Skip: not enough events (spon={len(Spon_Peaks_eq)}, trig={len(Trig_Peaks_eq)})")
 
 # 3) Prüfen, ob Cropping Spontan-Events stark reduziert
 print(f"[DIAG] Cropped time_s: {time_s[0]:.3f}..{time_s[-1]:.3f} s, pulses p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
@@ -965,19 +1435,58 @@ if len(pulse_times_2):
     print("[DEBUG] p2 first/last:", float(pulse_times_2[0]), float(pulse_times_2[-1]), "count:", len(pulse_times_2))
 
 def spont_up_mean_ax(main_channel, time_s, dt, Spon_Peaks, ax=None):
-    if ax is None: fig, ax = plt.subplots(figsize=(8,3))
-    else:         fig = ax.figure
-    half = int(0.5/dt); traces=[]
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8,3))
+    else:
+        fig = ax.figure
+
+    half = int(0.5/dt)
+    traces = []
     for pk in Spon_Peaks:
-        if np.isnan(pk): continue
-        pk=int(pk); s=pk-half; e=pk+half
-        if s>=0 and e<=len(main_channel): traces.append(main_channel[s:e])
+        if np.isnan(pk):
+            continue
+        pk = int(pk)
+        s = pk - half
+        e = pk + half
+        if s >= 0 and e <= len(main_channel):
+            traces.append(main_channel[s:e])
+
     if not traces:
-        ax.text(0.5,0.5,"no spontaneous peaks", ha="center", va="center", transform=ax.transAxes); return fig
-    tr=np.vstack(traces); m=np.nanmean(tr,0); se=np.nanstd(tr,0)/np.sqrt(tr.shape[0]); t=(np.arange(-half,half)*dt)
-    ax.plot(t,m,lw=2); ax.fill_between(t,m-se,m+se,alpha=0.3); ax.axvline(0,ls="--",lw=1)
-    ax.set_xlabel("Time (s)"); ax.set_ylabel(f"LFP ({UNIT_LABEL})"); ax.set_title("Spontaneous UP – mean ± SEM")
+        ax.text(0.5, 0.5, "no spontaneous peaks",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    tr = np.vstack(traces)
+    n  = tr.shape[0]
+
+    m  = np.nanmean(tr, 0)
+    se = np.nanstd(tr, 0) / np.sqrt(n)
+    t  = (np.arange(-half, half) * dt)
+
+    ax.plot(t, m, lw=2)
+    ax.fill_between(t, m-se, m+se, alpha=0.3)
+    ax.axvline(0, ls="--", lw=1)
+
+    # ⬅️ Hier wird n in den Plot geschrieben
+    ax.text(
+        0.98, 0.90,
+        f"n = {n}",
+        transform=ax.transAxes,
+        ha="right", va="top",
+        fontsize=11,
+        bbox=dict(boxstyle="round", fc="white", alpha=0.7)
+    )
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(f"LFP ({UNIT_LABEL})")
+    ax.set_title("Spontaneous UP – mean ± SEM")
+
     return fig
+
 
 
 
@@ -1004,139 +1513,170 @@ def Total_power_plot_ax(Spect_dat, Total_power=None, ax=None, title="Gesamtleist
         ax.text(0.5, 0.5, f"Power-Plot fehlgeschlagen:\n{e}", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
     return fig
-
 def CSD_compare_side_by_side_ax(
     CSD_spont, CSD_trig, dt,
     *, z_mm=None,
     align_pre=0.5, align_post=0.5,
-    cmap="turbo", sat_pct=98, interp="bilinear",
-    contours=False, ax=None, title="CSD (Spon vs. Trig)",
-    norm_mode="symlog",          # "symlog" | "linear"
-    linthresh_frac=0.03,         # Anteil von vmax für linearen Bereich
-    flip_y=True,                 # Kanal 0 oben?
-    # --- NEU: Anti-Patchiness/Export-Kontrolle ---
-    prefer_imshow=True,          # auch bei z_mm imshow benutzen (weiche Übergänge)
-    rasterize_csd=True,          # CSD-Artists für PDF/SVG rasterisieren
-    pcolor_shading="nearest",    # "nearest" reduziert Seams ggü. "auto"
+    cmap="Spectral_r",
+    sat_pct=95,          # etwas konservativer
+    interp="bilinear",
+    contours=False,
+    ax=None,
+    title="CSD (Spon vs. Trig)",
+    norm_mode="linear",  # default: linear für "paper look"
+    linthresh_frac=0.03,
+    flip_y=True,
+    prefer_imshow=True,
+    rasterize_csd=True,
+    pcolor_shading="nearest",
+    vmax_abs=None,
     **_unused
 ):
-    import matplotlib.pyplot as plt
-    import numpy as _np
     from matplotlib.colors import TwoSlopeNorm, SymLogNorm
+
+    # --- Robustheitschecks ---
+    ok = lambda A: (isinstance(A, _np.ndarray) and A.ndim == 2 and A.size > 0)
+    if not (ok(CSD_spont) and ok(CSD_trig)):
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 3))
+        else:
+            fig = ax.figure
+        ax.axis("off")
+        ax.text(0.5, 0.5, "no CSD", ha="center", va="center", transform=ax.transAxes)
+        return fig
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 3))
+    else:
+        fig = ax.figure
+
+    # --- 1) In float umwandeln & 2D glätten (time × depth) ---
+    CSD_sp = _np.asarray(CSD_spont, float)
+    CSD_tr = _np.asarray(CSD_trig,  float)
+
+    # sigma=(depth, time) – hier moderat, nicht zu stark
+    CSD_sp_sm = gaussian_filter(CSD_sp, sigma=(2.0, 3.0))
+    CSD_tr_sm = gaussian_filter(CSD_tr, sigma=(2.0, 3.0))
+
+    # --- 2) Optional: Tiefe invertieren (superficial oben) ---
+    if flip_y:
+        CSD_sp_plot = CSD_sp_sm[::-1, :]
+        CSD_tr_plot = CSD_tr_sm[::-1, :]
+        if z_mm is not None:
+            z_plot = _np.asarray(z_mm)[::-1]
+        else:
+            z_plot = None
+    else:
+        CSD_sp_plot = CSD_sp_sm
+        CSD_tr_plot = CSD_tr_sm
+        z_plot = _np.asarray(z_mm) if z_mm is not None else None
+
+    # --- 3) Gemeinsame Skala (linear, zero-centered) ---
+    stack = _np.concatenate([
+        _np.abs(CSD_sp_plot).ravel(),
+        _np.abs(CSD_tr_plot).ravel()
+    ])
+    stack = stack[_np.isfinite(stack)]
+    if stack.size == 0:
+        vmax = 1.0
+    else:
+        vmax = float(_np.nanpercentile(stack, sat_pct))
+        if not _np.isfinite(vmax) or vmax <= 0:
+            vmax = 1.0
+
+        if vmax_abs is not None:
+            vmax = float(vmax_abs)
+
+    if norm_mode == "linear":
+        norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+    else:
+        # fallback auf symlog, falls du das explizit willst
+        lt = max(float(linthresh_frac) * vmax, 1e-12)
+        norm = SymLogNorm(linthresh=lt, vmin=-vmax, vmax=vmax)
+
+    # --- 4) Zeitachse: centers & edges ---
+    n_t = CSD_sp_plot.shape[1]
+    t_centers = _np.linspace(-float(align_pre), float(align_post), n_t)
 
     def _edges_from_centers(c):
         c = _np.asarray(c, float)
         if c.size == 1:
             d = 0.5
             return _np.array([c[0]-d, c[0]+d], float)
-        mid = 0.5*(c[:-1]+c[1:])
-        first = c[0] - (mid[0]-c[0])
-        last  = c[-1] + (c[-1]-mid[-1])
+        mid = 0.5 * (c[:-1] + c[1:])
+        first = c[0] - (mid[0] - c[0])
+        last  = c[-1] + (c[-1] - mid[-1])
         return _np.concatenate([[first], mid, [last]])
-    
-    
 
+    t_edges = _edges_from_centers(t_centers)
 
-    def _robust_vmax(A, pct):
-        A = _np.asarray(A, float)
-        A = _np.abs(A[_np.isfinite(A)])
-        return float(_np.nanpercentile(A, pct)) if A.size else _np.nan
-
-    def _mask_t0(A, align_pre, align_post, ms0=300.0):
-        import numpy as np
-        A = np.array(A, float, copy=True)
-        n_t = A.shape[1]
-        t = np.linspace(-align_pre, align_post, n_t)
-        m = (t >= 0) & (t <= ms0/1000.0)
-        A[:, m] = np.nan
-        return A
-
-    CSD_sp_for_scale = _mask_t0(CSD_spont, align_pre, align_post, ms0=15)
-    CSD_tr_for_scale = _mask_t0(CSD_trig,  align_pre, align_post, ms0=15)
-    v_sp = _robust_vmax(CSD_sp_for_scale, sat_pct)
-    v_tr = _robust_vmax(CSD_tr_for_scale,  sat_pct)
-
-    ok = lambda A: (isinstance(A, _np.ndarray) and A.ndim == 2 and A.size > 0)
-    if not (ok(CSD_spont) and ok(CSD_trig)):
-        if ax is None: fig, ax = plt.subplots(figsize=(8,3))
-        else:          fig = ax.figure
-        ax.axis("off"); ax.text(0.5,0.5,"no CSD", ha="center", va="center", transform=ax.transAxes)
-        return fig
-
-    if ax is None: fig, ax = plt.subplots(figsize=(8,3))
-    else:          fig = ax.figure
-
-    # === Gemeinsame Skala ===
-    v_sp = _robust_vmax(CSD_spont, sat_pct)
-    v_tr = _robust_vmax(CSD_trig,  sat_pct)
-    vals = [v for v in (v_sp, v_tr) if _np.isfinite(v) and v > 0]
-    if len(vals) == 2: vmax_joint = float(_np.sqrt(vals[0]*vals[1]))
-    elif len(vals) == 1: vmax_joint = float(vals[0])
-    else: vmax_joint = 1.0
-    vmin_joint = -vmax_joint
-
-    # === Normierung ===
-    if norm_mode == "linear":
-        norm = TwoSlopeNorm(vmin=vmin_joint, vcenter=0.0, vmax=vmax_joint)
-    else:
-        lt = max(float(linthresh_frac) * vmax_joint, 1e-12)
-        norm = SymLogNorm(linthresh=lt, vmin=vmin_joint, vmax=vmax_joint)
-
-    # === Zeit-Achse ===
-    n_t = CSD_spont.shape[1]
-    t_centers = _np.linspace(-float(align_pre), float(align_post), n_t)
-    t_edges   = _edges_from_centers(t_centers)
-
+    # --- 5) Subplots + Colorbar-Achse anlegen ---
     ax_left  = ax.inset_axes([0.00, 0.0, 0.45, 1.0])
     ax_right = ax.inset_axes([0.50, 0.0, 0.45, 1.0])
     cax      = ax.inset_axes([0.955, 0.1, 0.02, 0.8])
     ax.set_axis_off()
 
-    # === Darstellung ===
-    use_imshow = (z_mm is None) or prefer_imshow
     artists = []
 
+    # --- 6) Imshow vs pcolormesh ---
+    use_imshow = (z_plot is None) or prefer_imshow
+
     if use_imshow:
-        # y-Extent aus z_mm (falls vorhanden) ableiten
-        if z_mm is not None:
-            z_edges = _edges_from_centers(_np.asarray(z_mm, float))
+        if z_plot is not None:
+            z_edges = _edges_from_centers(z_plot)
             y0, y1 = float(z_edges[0]), float(z_edges[-1])
         else:
-            y0, y1 = 0.0, float((CSD_spont.shape[0]-1))
+            y0, y1 = 0.0, float(CSD_sp_plot.shape[0] - 1)
 
         extent = [-float(align_pre), float(align_post), y0, y1]
-        imL = ax_left.imshow(CSD_spont, aspect="auto",
-                             origin="upper" if flip_y else "lower",
-                             extent=extent, cmap=cmap, norm=norm,
-                             interpolation=interp)
-        imR = ax_right.imshow(CSD_trig,  aspect="auto",
-                              origin="upper" if flip_y else "lower",
-                              extent=extent, cmap=cmap, norm=norm,
-                              interpolation=interp)
+
+        imL = ax_left.imshow(
+            CSD_sp_plot,
+            aspect="auto",
+            origin="upper",
+            extent=extent,
+            cmap=cmap,
+            norm=norm,
+            interpolation=interp,
+        )
+        imR = ax_right.imshow(
+            CSD_tr_plot,
+            aspect="auto",
+            origin="upper",
+            extent=extent,
+            cmap=cmap,
+            norm=norm,
+            interpolation=interp,
+        )
+
         for a in (ax_left, ax_right):
             a.set_xlabel("Zeit (s)")
-            if flip_y:
-                a.invert_yaxis()
-        ax_left.set_ylabel("Tiefe (mm)" if z_mm is not None else "Tiefe (arb.)")
+        ax_left.set_ylabel("Tiefe (mm)" if z_plot is not None else "Tiefe (arb.)")
+
         artists.extend([imL, imR])
 
     else:
-        # pcolormesh mit „seam“-freundlichen Settings
-        z_mm = _np.asarray(z_mm, float)
-        if z_mm.size != CSD_spont.shape[0]:
-            raise ValueError(f"z_mm hat {z_mm.size} Werte, CSD hat {CSD_spont.shape[0]} Zeilen.")
-        z_edges = _edges_from_centers(z_mm)
+        if z_plot is None:
+            z_plot = _np.arange(CSD_sp_plot.shape[0], dtype=float)
+        z_edges = _edges_from_centers(z_plot)
 
-        imL = ax_left.pcolormesh(t_edges, z_edges, CSD_spont,
-                                 shading=pcolor_shading, cmap=cmap, norm=norm)
-        imR = ax_right.pcolormesh(t_edges, z_edges, CSD_trig,
-                                  shading=pcolor_shading, cmap=cmap, norm=norm)
+        imL = ax_left.pcolormesh(
+            t_edges, z_edges, CSD_sp_plot,
+            shading=pcolor_shading,
+            cmap=cmap,
+            norm=norm,
+        )
+        imR = ax_right.pcolormesh(
+            t_edges, z_edges, CSD_tr_plot,
+            shading=pcolor_shading,
+            cmap=cmap,
+            norm=norm,
+        )
 
-        # Anti-aliasing/Kanten entschärfen
         for im in (imL, imR):
             try:
                 im.set_antialiased(False)
-                im.set_edgecolor('face')
+                im.set_edgecolor("face")
                 im.set_linewidth(0.0)
             except Exception:
                 pass
@@ -1145,12 +1685,11 @@ def CSD_compare_side_by_side_ax(
             a.set_xlim(t_edges[0], t_edges[-1])
             a.set_ylim(z_edges[0], z_edges[-1])
             a.set_xlabel("Zeit (s)")
-            if flip_y:
-                a.invert_yaxis()
         ax_left.set_ylabel("Tiefe (mm)")
+
         artists.extend([imL, imR])
 
-    # Optional: Rasterisieren für saubere PDF/SVG
+    # --- 7) Optional rasterisieren für hübsche PDFs ---
     if rasterize_csd:
         for im in artists:
             try:
@@ -1158,13 +1697,277 @@ def CSD_compare_side_by_side_ax(
             except Exception:
                 pass
 
-    # Titel/Colorbar
+    # --- 8) Titles & Colorbar ---
     ax_left.set_title("Spontaneous", fontsize=10)
     ax_right.set_title("Triggered", fontsize=10)
     cb = fig.colorbar(artists[-1], cax=cax)
     cb.set_label("CSD (a.u.)", rotation=90)
+
     ax_left.set_title(title, fontsize=11, pad=22)
     return fig
+
+
+
+from scipy.ndimage import gaussian_filter  # falls oben noch nicht importiert
+
+def CSD_single_panel_ax(
+    CSD,
+    dt,
+    *,
+    z_mm=None,
+    align_pre=0.5,
+    align_post=0.5,
+    ax=None,
+    title="CSD",
+    cmap="Spectral_r",      # klassisches Blau-Rot
+    sat_pct=95,
+    smooth_sigma=(2.0, 3.0),   # (depth, time) Glättung
+    flip_y=True
+):
+    """
+    Paper-freundliche Darstellung eines einzelnen CSD:
+    - glatte Darstellung
+    - lineare, zero-centered Skala
+    - klassisches Blau-Rot-Layout
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(4, 4))
+    else:
+        fig = ax.figure
+
+    if CSD is None or not isinstance(CSD, np.ndarray) or CSD.ndim != 2 or CSD.size == 0:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "no CSD", ha="center", va="center", transform=ax.transAxes)
+        return fig
+
+    # 1) float + optional smoothing
+    A = np.asarray(CSD, float)
+    if smooth_sigma is not None:
+        A = gaussian_filter(A, sigma=smooth_sigma)
+
+    # 2) ggf. Tiefe invertieren (superficial oben)
+    if flip_y:
+        A = A[::-1, :]
+        if z_mm is not None:
+            z_plot = np.asarray(z_mm)[::-1]
+        else:
+            z_plot = None
+    else:
+        z_plot = np.asarray(z_mm) if z_mm is not None else None
+
+    # 3) robuste Skala
+    vals = np.abs(A[np.isfinite(A)])
+    if vals.size == 0:
+        vmax = 1.0
+    else:
+        vmax = float(np.nanpercentile(vals, sat_pct))
+        if vmax <= 0 or not np.isfinite(vmax):
+            vmax = 1.0
+    vmin = -vmax
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+
+    # 4) Zeitachse
+    n_t = A.shape[1]
+    t = np.linspace(-float(align_pre), float(align_post), n_t)
+
+    # 5) extent für imshow
+    if z_plot is not None:
+        z0, z1 = float(z_plot[0]), float(z_plot[-1])
+    else:
+        z0, z1 = 0.0, float(A.shape[0] - 1)
+
+    im = ax.imshow(
+        A,
+        aspect="auto",
+        origin="upper",
+        extent=[t[0], t[-1], z0, z1],
+        cmap=cmap,
+        norm=norm,
+        interpolation="bilinear",   # weich, „paper“-Look
+    )
+
+    ax.set_xlabel("Zeit (s)")
+    ax.set_ylabel("Tiefe (mm)" if z_plot is not None else "Tiefe (arb.)")
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, label="CSD (a.u.)")
+
+    # optional: dünne vertikale Linie bei 0 s
+    ax.axvline(0, color="k", lw=0.5, alpha=0.7)
+
+    return fig
+
+
+
+# def CSD_compare_side_by_side_ax(
+#     CSD_spont, CSD_trig, dt,
+#     *, z_mm=None,
+#     align_pre=0.5, align_post=0.5,
+#     cmap="turbo", sat_pct=98, interp="bilinear",
+#     contours=False, ax=None, title="CSD (Spon vs. Trig)",
+#     norm_mode="symlog",          # "symlog" | "linear"
+#     linthresh_frac=0.03,         # Anteil von vmax für linearen Bereich
+#     flip_y=True,                 # Kanal 0 oben?
+#     # --- NEU: Anti-Patchiness/Export-Kontrolle ---
+#     prefer_imshow=True,          # auch bei z_mm imshow benutzen (weiche Übergänge)
+#     rasterize_csd=True,          # CSD-Artists für PDF/SVG rasterisieren
+#     pcolor_shading="nearest",    # "nearest" reduziert Seams ggü. "auto"
+#     **_unused
+# ):
+    
+#     from matplotlib.colors import TwoSlopeNorm, SymLogNorm
+
+#     def _edges_from_centers(c):
+#         c = _np.asarray(c, float)
+#         if c.size == 1:
+#             d = 0.5
+#             return _np.array([c[0]-d, c[0]+d], float)
+#         mid = 0.5*(c[:-1]+c[1:])
+#         first = c[0] - (mid[0]-c[0])
+#         last  = c[-1] + (c[-1]-mid[-1])
+#         return _np.concatenate([[first], mid, [last]])
+    
+    
+
+
+#     def _robust_vmax(A, pct):
+#         A = _np.asarray(A, float)
+#         A = _np.abs(A[_np.isfinite(A)])
+#         return float(_np.nanpercentile(A, pct)) if A.size else _np.nan
+
+#     def _mask_t0(A, align_pre, align_post, ms0=300.0):
+#         import numpy as np
+#         A = np.array(A, float, copy=True)
+#         n_t = A.shape[1]
+#         t = np.linspace(-align_pre, align_post, n_t)
+#         m = (t >= 0) & (t <= ms0/1000.0)
+#         A[:, m] = np.nan
+#         return A
+
+#     CSD_sp_for_scale = _mask_t0(CSD_spont, align_pre, align_post, ms0=15)
+#     CSD_tr_for_scale = _mask_t0(CSD_trig,  align_pre, align_post, ms0=15)
+#     v_sp = _robust_vmax(CSD_sp_for_scale, sat_pct)
+#     v_tr = _robust_vmax(CSD_tr_for_scale,  sat_pct)
+
+#     ok = lambda A: (isinstance(A, _np.ndarray) and A.ndim == 2 and A.size > 0)
+#     if not (ok(CSD_spont) and ok(CSD_trig)):
+#         if ax is None: fig, ax = plt.subplots(figsize=(8,3))
+#         else:          fig = ax.figure
+#         ax.axis("off"); ax.text(0.5,0.5,"no CSD", ha="center", va="center", transform=ax.transAxes)
+#         return fig
+
+#     if ax is None: fig, ax = plt.subplots(figsize=(8,3))
+#     else:          fig = ax.figure
+
+#     # === Gemeinsame Skala ===
+#     v_sp = _robust_vmax(CSD_spont, sat_pct)
+#     v_tr = _robust_vmax(CSD_trig,  sat_pct)
+#     vals = [v for v in (v_sp, v_tr) if _np.isfinite(v) and v > 0]
+#     if len(vals) == 2: vmax_joint = float(_np.sqrt(vals[0]*vals[1]))
+#     elif len(vals) == 1: vmax_joint = float(vals[0])
+#     else: vmax_joint = 1.0
+#     vmin_joint = -vmax_joint
+
+#     # === Normierung ===
+#     if norm_mode == "linear":
+#         norm = TwoSlopeNorm(vmin=vmin_joint, vcenter=0.0, vmax=vmax_joint)
+#     else:
+#         lt = max(float(linthresh_frac) * vmax_joint, 1e-12)
+#         norm = SymLogNorm(linthresh=lt, vmin=vmin_joint, vmax=vmax_joint)
+
+#     # === Zeit-Achse ===
+#     n_t = CSD_spont.shape[1]
+#     t_centers = _np.linspace(-float(align_pre), float(align_post), n_t)
+#     t_edges   = _edges_from_centers(t_centers)
+
+#     ax_left  = ax.inset_axes([0.00, 0.0, 0.45, 1.0])
+#     ax_right = ax.inset_axes([0.50, 0.0, 0.45, 1.0])
+#     cax      = ax.inset_axes([0.955, 0.1, 0.02, 0.8])
+#     ax.set_axis_off()
+
+#     # === Darstellung ===
+
+#     from scipy.ndimage import gaussian_filter
+
+#     # 2D-Smoothing: (depth_sigma, time_sigma)
+#     CSD_sp_sm  = gaussian_filter(CSD_spont, sigma=(1.2, 1.2))
+#     CSD_tr_sm  = gaussian_filter(CSD_trig,  sigma=(1.2, 1.2))
+
+#     use_imshow = (z_mm is None) or prefer_imshow
+#     artists = []
+
+#     if use_imshow:
+#         # y-Extent aus z_mm (falls vorhanden) ableiten
+#         if z_mm is not None:
+#             z_edges = _edges_from_centers(_np.asarray(z_mm, float))
+#             y0, y1 = float(z_edges[0]), float(z_edges[-1])
+#         else:
+#             y0, y1 = 0.0, float((CSD_spont.shape[0]-1))
+
+#         extent = [-float(align_pre), float(align_post), y0, y1]
+#         imL = ax_left.imshow(CSD_sp_sm, aspect="auto",
+#                              origin="upper" if flip_y else "lower",
+#                              extent=extent, cmap=cmap, norm=norm,
+#                              interpolation=interp)
+#         imR = ax_right.imshow(CSD_tr_sm,  aspect="auto",
+#                               origin="upper" if flip_y else "lower",
+#                               extent=extent, cmap=cmap, norm=norm,
+#                               interpolation=interp)
+#         for a in (ax_left, ax_right):
+#             a.set_xlabel("Zeit (s)")
+#             if flip_y:
+#                 a.invert_yaxis()
+#         ax_left.set_ylabel("Tiefe (mm)" if z_mm is not None else "Tiefe (arb.)")
+#         artists.extend([imL, imR])
+
+#     else:
+#         # pcolormesh mit „seam“-freundlichen Settings
+#         z_mm = _np.asarray(z_mm, float)
+#         if z_mm.size != CSD_spont.shape[0]:
+#             raise ValueError(f"z_mm hat {z_mm.size} Werte, CSD hat {CSD_spont.shape[0]} Zeilen.")
+#         z_edges = _edges_from_centers(z_mm)
+
+#         imL = ax_left.pcolormesh(t_edges, z_edges, CSD_spont,
+#                                  shading=pcolor_shading, cmap=cmap, norm=norm)
+#         imR = ax_right.pcolormesh(t_edges, z_edges, CSD_trig,
+#                                   shading=pcolor_shading, cmap=cmap, norm=norm)
+
+#         # Anti-aliasing/Kanten entschärfen
+#         for im in (imL, imR):
+#             try:
+#                 im.set_antialiased(False)
+#                 im.set_edgecolor('face')
+#                 im.set_linewidth(0.0)
+#             except Exception:
+#                 pass
+
+#         for a in (ax_left, ax_right):
+#             a.set_xlim(t_edges[0], t_edges[-1])
+#             a.set_ylim(z_edges[0], z_edges[-1])
+#             a.set_xlabel("Zeit (s)")
+#             if flip_y:
+#                 a.invert_yaxis()
+#         ax_left.set_ylabel("Tiefe (mm)")
+#         artists.extend([imL, imR])
+
+#     # Optional: Rasterisieren für saubere PDF/SVG
+#     if rasterize_csd:
+#         for im in artists:
+#             try:
+#                 im.set_rasterized(True)
+#             except Exception:
+#                 pass
+
+#     # Titel/Colorbar
+#     ax_left.set_title("Spontaneous", fontsize=10)
+#     ax_right.set_title("Triggered", fontsize=10)
+#     cb = fig.colorbar(artists[-1], cax=cax)
+#     cb.set_label("CSD (a.u.)", rotation=90)
+#     ax_left.set_title(title, fontsize=11, pad=22)
+#     return fig
 
 
 # def CSD_compare_side_by_side_ax(
@@ -1482,10 +2285,15 @@ def export_onepage_custom(
         try:
             CSD_compare_side_by_side_ax(
                 CSD_spont, CSD_trig, dt,
-                dz_um=dz_um, align_pre=align_pre, align_post=align_post,
-                cmap=cmap, sat_pct=sat_pct, interp=interp, contours=contours,
-                ax=ax_bottom,
-                title="CSD (Spont vs. Trig; gemeinsame Zeitachse, 0 mm oben)"
+                z_mm=z_mm,
+                align_pre=align_pre_s,
+                align_post=align_post_s,
+                cmap="Spectral",
+                sat_pct=98,
+                norm_mode="linear",
+                linthresh_frac=0.02,
+                ax=ax,
+                title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
             )
         except Exception as e:
             ax_bottom.text(0.5, 0.5, f"Plot error (CSD):\n{e}", ha="center", va="center", transform=ax_bottom.transAxes)
@@ -1718,6 +2526,191 @@ def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *
     del fig
     print(f"[ALL-CH] SVG geschrieben: {out_svg}")
 
+def up_onset_mean_ax(main_channel, dt, onsets, ax=None, title="UPs – onset-aligned mean"):
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6,3))
+    else:
+        fig = ax.figure
+
+    onsets = np.asarray(onsets, int)
+    if onsets.size == 0:
+        ax.text(0.5, 0.5, "no onsets", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    half_win_s = 0.6
+    half = int(round(half_win_s / dt))
+
+    traces = []
+    for o in onsets:
+        s = o - half
+        e = o + half
+        if s < 0 or e > len(main_channel):
+            continue
+        seg = main_channel[s:e]
+        if len(seg) == 2 * half:
+            traces.append(seg)
+
+    if not traces:
+        ax.text(0.5, 0.5, "no valid segments",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    traces = np.vstack(traces)
+    n = traces.shape[0]
+
+    t = (np.arange(-half, half) * dt)
+    m  = np.nanmean(traces, axis=0)
+    se = np.nanstd(traces, axis=0) / np.sqrt(n)
+
+    ax.plot(t, traces.T, alpha=0.07, lw=0.8)
+    ax.plot(t, m, lw=2)
+    ax.fill_between(t, m-se, m+se, alpha=0.25)
+
+    ax.axvline(0, color="red", lw=1)
+    ax.axhline(0, color="k", alpha=0.3, lw=0.8)
+
+    ax.set_xlabel("Zeit relativ zum UP-Onset (s)")
+    ax.set_ylabel(f"LFP ({UNIT_LABEL})")
+    ax.set_title(title)
+
+    # ⬅️ Textbox mit n
+    ax.text(
+        0.98, 0.90,
+        f"n = {n}",
+        transform=ax.transAxes,
+        ha="right", va="top",
+        fontsize=11,
+        bbox=dict(boxstyle="round", fc="white", alpha=0.7)
+    )
+
+    return fig
+
+def pulse_triggered_up_overlay_ax(
+    main_channel,
+    time_s,
+    pulse_times,
+    Pulse_triggered_UP,
+    dt,
+    pre_s=0.2,         # wie weit vor dem Pulse anzeigen
+    post_s=1.0,        # wie weit nach dem Pulse anzeigen
+    max_win_s=1.0,     # max. erlaubte Pulse→UP-Latenz (Filter)
+    ax=None,
+    title="Pulse-alignierte Trigger-UPs (LFP overlay)"
+):
+    """
+    Zeichnet für alle getriggerten UPs den Main-Channel LFP relativ zum Pulse:
+    - 0 s = Pulse
+    - alle Segmente übereinander
+    - Mean-Trace
+    - vertikale Linie bei 0 s (Pulse)
+    - vertikale Linie beim mittleren UP-Onset relativ zum Pulse
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.0))
+    else:
+        fig = ax.figure
+
+    if pulse_times is None or len(pulse_times) == 0 or len(Pulse_triggered_UP) == 0:
+        ax.text(0.5, 0.5, "no pulses or triggered UPs",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    pulse_times = np.asarray(pulse_times, float)
+    up_idx_arr  = np.asarray(Pulse_triggered_UP, int)
+
+    pre_n  = int(round(pre_s  / dt))
+    post_n = int(round(post_s / dt))
+
+    segs = []
+    up_rel_times = []
+
+    for up_idx in up_idx_arr:
+        if up_idx < 0 or up_idx >= len(time_s):
+            continue
+
+        t_up = time_s[up_idx]
+
+        # letzter Pulse vor diesem UP
+        mask = pulse_times <= t_up
+        if not mask.any():
+            continue
+        t_p = pulse_times[mask][-1]
+
+        lat = t_up - t_p
+        if lat < 0 or lat > max_win_s:
+            # UP ist zu weit vom Pulse weg -> als nicht "triggered" ignorieren
+            continue
+
+        # Index des Pulses im Zeitvektor
+        ip = np.searchsorted(time_s, t_p)
+        s = ip - pre_n
+        e = ip + post_n
+        if s < 0 or e > len(main_channel):
+            continue
+
+        seg = main_channel[s:e]
+        if len(seg) != (pre_n + post_n):
+            continue
+
+        segs.append(seg)
+        up_rel_times.append(lat)
+
+    if not segs:
+        ax.text(0.5, 0.5, "no valid pulse-aligned segments",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    segs = np.vstack(segs)                # (n_events, n_time)
+    n    = segs.shape[0]
+    t_rel = (np.arange(-pre_n, post_n) * dt)
+
+    # alle Einzeltraces
+    for i in range(n):
+        ax.plot(t_rel, segs[i], alpha=0.12, lw=0.8)
+
+    # Mittelwert-Trace
+    mean_trace = np.nanmean(segs, axis=0)
+    ax.plot(t_rel, mean_trace, lw=2.0, label="Mean LFP")
+
+    # vertikale Linie beim Pulse (0 s)
+    ax.axvline(0.0, color="k", lw=1.0, ls="--", label="Pulse")
+
+    # mittlere UP-Latenz
+    up_rel_times = np.asarray(up_rel_times, float)
+    if up_rel_times.size:
+        mean_lat = float(np.nanmean(up_rel_times))
+        ax.axvline(mean_lat, color="red", lw=1.5, ls=":",
+                   label=f"Mean UP onset ({mean_lat*1000:.0f} ms)")
+
+    ax.set_xlabel("Zeit relativ zum Pulse (s)")
+    ax.set_ylabel(f"LFP ({UNIT_LABEL})")
+    ax.set_title(title)
+
+    # n-Textbox
+    ax.text(
+        0.02, 0.95,
+        f"n = {n}",
+        transform=ax.transAxes,
+        ha="left", va="top",
+        fontsize=10,
+        bbox=dict(boxstyle="round", fc="white", alpha=0.7)
+    )
+
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+
+    return fig
+
 
 
 #  Layout definieren (Zeilen)
@@ -1749,16 +2742,96 @@ layout_rows = [
 
     # REIHE 4: CSD (volle Breite)
     [lambda ax: CSD_compare_side_by_side_ax(
-    CSD_spont, CSD_trig, dt,
-    z_mm=z_mm,
-    align_pre=align_pre_s, align_post=align_post_s,
-    cmap="Spectral", sat_pct=98,
-    norm_mode="symlog",           # gemeinsame Skala, kleine Werte sichtbar
-    linthresh_frac=0.02,
-    exclude_for_scaling_ms=(0.0, 15.0),  # Stim-Artefakt beim Schätzen ignorieren
-    ax=ax,
-    title="CSD (Spont vs. Trig; gemeinsame Skala)"
+        CSD_spont, CSD_trig, dt,
+        z_mm=z_mm,
+        align_pre=align_pre_s, align_post=align_post_s,
+        # Paper-look:
+        cmap="Spectral_r",          # <--- klassisches Diverging-Map
+        sat_pct=95,             # <--- etwas weniger aggressiv
+        norm_mode="linear",
+        #vmax_abs=15,     # <--- einfache lineare Skala
+        linthresh_frac=0.03,    # hier egal bei linear, kann bleiben
+        ax=ax,
+        title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
     )],
+
+
+
+      # REIHE 4 (NEU): Mittel-LFP um Onsets – Spont vs. Trig
+    [lambda ax: up_onset_mean_ax(
+        main_channel, dt, Spon_Onsets,
+        ax=ax, title="Spont-UPs – onset-aligned mean"
+    ),
+     lambda ax: up_onset_mean_ax(
+        main_channel, dt, Trig_Onsets,
+        ax=ax, title="Trig-UPs – onset-aligned mean"
+    )],
+
+        # REIHE 4: CSD – zwei Panels nebeneinander (Spont / Trig)
+    [lambda ax: CSD_single_panel_ax(
+            CSD_spont, dt,
+            z_mm=z_mm,
+            align_pre=align_pre_s,
+            align_post=align_post_s,
+            ax=ax,
+            title="CSD Spontaneous"
+        ),
+    lambda ax: CSD_single_panel_ax(
+            CSD_trig, dt,
+            z_mm=z_mm,
+            align_pre=align_pre_s,
+            align_post=align_post_s,
+            ax=ax,
+            title="CSD Triggered"
+    
+        )],
+    # REIHE X: Pulse→UP Latenzen (Histogramm)
+    [lambda ax: pulse_to_up_latency_hist_ax(latencies_trig, ax=ax)],
+
+    [lambda ax: pulse_triggered_up_overlay_ax(
+    main_channel,
+    time_s,
+    pulse_times_1,          # ggf. pulse_times_2
+    Pulse_triggered_UP,
+    dt,
+    pre_s=0.2,
+    post_s=1.0,
+    max_win_s=1.0,
+    ax=ax,
+    title="Pulse-alignierte Trigger-UPs (LFP overlay)"
+    )],
+
+    [lambda ax: refractory_compare_ax(
+        refrac_spont, refrac_trig, ax=ax,
+        title="Refraktärzeit nach UP bis nächster UP"
+    )],
+    
+
+        # REIHE: Refraktär-Overlay – offset-aligniert (Spontan / Getriggert)
+    [lambda ax: refractory_overlay_ax(
+        main_channel,
+        time_s,
+        Spontaneous_UP,
+        Spontaneous_DOWN,
+        dt,
+        pre_s=0.5,
+        post_s=2.0,
+        ax=ax,
+        title="Refraktär-Overlay – Spontane UPs"
+    ),
+     lambda ax: refractory_overlay_ax(
+        main_channel,
+        time_s,
+        Pulse_triggered_UP,
+        Pulse_triggered_DOWN,
+        dt,
+        pre_s=0.5,
+        post_s=2.0,
+        ax=ax,
+        title="Refraktär-Overlay – Getriggerte UPs"
+    )],
+
+
 ]
 
 
