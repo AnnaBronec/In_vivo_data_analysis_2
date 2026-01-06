@@ -53,10 +53,22 @@ def load_LFP_new(BASE_PATH: str, LFP_FILENAME: str) -> Tuple[pd.DataFrame, List[
 
     df = pd.read_csv(csv_path)
 
+        # --- DROP-IN: akzeptiere 'timesamples' oder 'timestamps' als Zeitspalte ---
+    # Dein CSV hat 'timesamples' (wir nehmen das als Sekunden-Zeitachse)
+    if "time" not in df.columns:
+        if "timesamples" in df.columns:
+            df = df.rename(columns={"timesamples": "time"})
+        elif "timestamps" in df.columns:
+            df = df.rename(columns={"timestamps": "time"})
+
+
     # --- Fall A: neues Layout (time + Kanäle) ---
     if "time" in df.columns:
         # Kanalspalten: alles außer 'time' und ggf. 'stim'
-        ch_names = [c for c in df.columns if c not in ("time", "stim")]
+                # --- DROP-IN: Meta-Spalten NICHT als Kanäle behandeln ---
+        NON_CH = {"time", "stim", "timestamps", "timesamples"}
+        ch_names = [c for c in df.columns if c not in NON_CH]
+
         # Sicherstellen: numeric
         for c in ch_names:
             df[c] = pd.to_numeric(df[c], errors="coerce")

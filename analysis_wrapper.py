@@ -10,7 +10,6 @@ Drop-in wrapper for batch_pipeline.py
     * forces garbage collection
 """
 
-# analysis_wrapper.py (ganz oben)
 import os
 # BLAS/MKL/OpenBLAS/Accelerate/NumExpr strikt auf 1 Thread
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -20,6 +19,7 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("BLIS_NUM_THREADS", "1")
 
+from sklearn.decomposition import PCA
 
 
 from pathlib import Path

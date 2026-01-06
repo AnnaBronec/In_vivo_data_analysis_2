@@ -24,6 +24,7 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.stats import ttest_ind
 from scipy.signal import welch
 
+
 def _save_svg(fig, hint, out_dir=None, dpi=200):
     if out_dir is None:
         out_dir = os.getcwd()
@@ -94,40 +95,99 @@ def compute_peak_aligned_segments(
 
     return np.array(peak_indices, dtype=float), peak_segments
 
-def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, LFP_array, b_lp, a_lp, b_hp, a_hp, align_pre, align_post, align_len):
-    # 1. Detect state transitions via spectrogram power
-    # Frequenzachse holen
-    freqs = Spect_dat[2]  
-    Spect_dB = np.clip(Spect_dat[0], -100, 100)
+def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
+                    LFP_array, b_lp, a_lp, b_hp, a_hp,
+                    align_pre, align_post, align_len):
 
-    # Frequenzmaske für z. B. 0.5–4 Hz
-    delta_mask = (freqs >= 0.1) & (freqs <= 150.0)   #FREUQUENZMASKE FRAG TIM
 
-    # Nur Delta-Power extrahieren
-    linear_power_delta = 10 ** (Spect_dB[delta_mask, :] / 10)
-    Total_power = np.sum(linear_power_delta, axis=0)
+    # ---------- helpers ----------
+    def _empty_states(Total_power, time_s, dt, align_pre, align_len):
+        time_s = np.asarray(time_s)
+        return {
+            "Pulse_triggered_UP": np.array([], dtype=int),
+            "Pulse_triggered_DOWN": np.array([], dtype=int),
+            "Pulse_associated_UP": np.array([], dtype=int),
+            "Pulse_associated_DOWN": np.array([], dtype=int),
+            "Spontaneous_UP": np.array([], dtype=int),
+            "Spontaneous_DOWN": np.array([], dtype=int),
+            "Duration_Pulse_Triggered": np.array([], dtype=float),
+            "Duration_Pulse_Associated": np.array([], dtype=float),
+            "Duration_Spontaneous": np.array([], dtype=float),
+            "Dur_stat": np.nan,
+            "Dur_p": np.nan,
+            "Ctrl_UP": np.array([], dtype=int),
+            "Ctrl_DOWN": np.array([], dtype=int),
+            "Spon_Peaks": np.array([], dtype=float),
+            "Trig_Peaks": np.array([], dtype=float),
+            "Spon_UP_peak_aligned_array": np.full((0, align_len), np.nan),
+            "Trig_UP_peak_aligned_array": np.full((0, align_len), np.nan),
+            "UP_Time": (np.arange(align_len) * dt - align_pre * dt),
+            "Spon_UP_array": np.full((0, align_len), np.nan),
+            "Total_power": Total_power,
+            "UP_start_i": np.array([], dtype=int),
+            "DOWN_start_i": np.array([], dtype=int),
+            "up_state_binary": np.zeros_like(time_s, dtype=bool),
+        }
 
-    
+    # ---------- 1) Bandpower aus Spektrogramm ----------
+    freqs = Spect_dat[2]
+    S = np.asarray(Spect_dat[0], float)  # dB
+
+    # 
+    f_lo, f_hi = 0.5, 30.0
+    band_mask = (freqs >= f_lo) & (freqs <= f_hi)
+
+    # dB -> linear, stabil clippen
+    S_clip = np.clip(S[band_mask, :], -120, 30)
+    linear = 10 ** (S_clip / 10.0)
+
+    # robuster als Summe: median reduziert “hot bins”
+    Total_power = np.median(linear, axis=0)
+
     print("Total_power stats:", np.min(Total_power), np.max(Total_power), np.isnan(Total_power).sum())
-  
-    Total_power_smooth = gaussian_filter1d(Total_power, sigma=2)  # glättet über ca. 5 Zeitschritte
- 
 
-    # Thresholding
-    threshold = np.percentile(Total_power, 65)  # obere 25 % als UP-Zustand 
-    up_state_binary = Total_power_smooth > threshold
+    # ---------- 2) Smooth ----------
+    Total_power_smooth = gaussian_filter1d(Total_power, sigma=2)
 
-    
-    # Optional: Schließen kurzer False-Lücken innerhalb von UP-Zuständen (z. B. < 200 ms)
-    min_gap = int(0.2 / dt)  # z. B. 200 ms Lücke
-    binary = up_state_binary.astype(int)
+        # robust z-score auf Feature-Achse
+    med = np.median(Total_power_smooth)
+    mad = np.median(np.abs(Total_power_smooth - med)) + 1e-30
+    robust_std = 1.4826 * mad
 
-    # Finde Indizes, wo 0er-Stücke ("Gaps") kürzer als min_gap sind
-    from itertools import groupby
+    z = (Total_power_smooth - med) / robust_std
+
+    k_hi = 4.0   # Start-Schwelle (strenger)
+    k_lo = 2.5   # Halte-Schwelle (lockerer)
+
+    hi = z > k_hi
+    lo = z > k_lo
+
+    # hysteresis reconstruction: UP startet bei hi, läuft weiter solange lo true ist
+    up_state_binary = np.zeros_like(hi, dtype=bool)
+    active = False
+    for i in range(len(hi)):
+        if not active and hi[i]:
+            active = True
+        if active and not lo[i]:
+            active = False
+        up_state_binary[i] = active
+
+
+    # ---------- 4) Gap-closing: ACHTUNG Zeitauflösung! ----------
+    # dt für up_state_binary muss zur Feature-Zeitachse passen:
+    time_s = np.asarray(time_s)
+    if time_s.size >= 2 and np.all(np.isfinite(time_s)):
+        dt_feat = float(np.median(np.diff(time_s)))
+    else:
+        dt_feat = float(dt)  # fallback
+
+    min_gap_s = 0.2
+    min_gap = max(1, int(round(min_gap_s / dt_feat)))
+
+    binary = up_state_binary.astype(np.int8)
 
     gap_starts = []
     gap_lengths = []
-
     i = 0
     while i < len(binary):
         if binary[i] == 0:
@@ -141,26 +201,21 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
         else:
             i += 1
 
-    # Fülle kurze Gaps mit 1ern
     for start, length in zip(gap_starts, gap_lengths):
         binary[start:start+length] = 1
 
-    # Überschreibe up_state_binary
     up_state_binary = binary.astype(bool)
 
-    # Transitions
-    up_transitions = np.where(np.diff(up_state_binary.astype(int)) == 1)[0]  # Indizes, an denen uebergang von DOWN zu UP stattfindet
-    down_transitions = np.where(np.diff(up_state_binary.astype(int)) == -1)[0]  # Indizes, an denen uebergang von UP zu DOWN stattfindet
+    # ---------- 5) Transitions + Dauerfilter ----------
+    up_transitions = np.where(np.diff(up_state_binary.astype(int)) == 1)[0]
+    down_transitions = np.where(np.diff(up_state_binary.astype(int)) == -1)[0]
 
-    # Index-Grenzen korrigieren, falls uebergaenge unvollstaendig
-    #if down_transitions[0] < up_transitions[0]:  # Wenn erster DOWN-uebergang vor erstem UP liegt (nicht gueltig)
     if down_transitions.size and up_transitions.size and down_transitions[0] < up_transitions[0]:
-        down_transitions = down_transitions[1:]  # ersten DOWN-Index entfernen
-    #if up_transitions.shape[0] > down_transitions.shape[0]:  # Falls mehr UPs als DOWNs erkannt wurden
+        down_transitions = down_transitions[1:]
     if up_transitions.size > down_transitions.size:
         up_transitions = up_transitions[:-1]
-        #up_transitions = up_transitions[:-1]  # letztes UP-Event entfernen, da es kein passendes DOWN gibt
 
+    min_up_len_s = 0.5
     if not up_transitions.size or not down_transitions.size:
         UP_start_i = np.array([], dtype=int)
         DOWN_start_i = np.array([], dtype=int)
@@ -168,76 +223,83 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
         filtered_UP = []
         filtered_DOWN = []
         for u, d in zip(up_transitions, down_transitions):
+            # time_s passt hier zur Feature-Achse
             duration = time_s[d] - time_s[u]
-            print(duration)
-            if duration >= 0.3:
+            if duration >= min_up_len_s:
                 filtered_UP.append(u)
                 filtered_DOWN.append(d)
 
         UP_start_i = np.array(filtered_UP, dtype=int)
         DOWN_start_i = np.array(filtered_DOWN, dtype=int)
-        
-  
-    # 3. Kombiniere beide Pulstypen
-    Pulse_times_array = np.sort(np.concatenate([pulse_times_1, pulse_times_2]))
 
+    # ---------- 6) NO-UP Gate ganz am Ende ----------
+    min_up_fraction = 0.03
+    min_up_onsets = 2
 
+    print("[BAND] f_lo,f_hi =", f_lo, f_hi)
+    #print("[THR] thr =", threshold, "smooth min/max =", Total_power_smooth.min(), Total_power_smooth.max())
+    print("[UP%] frac UP =", up_state_binary.mean(), "| dt_feat =", dt_feat, "min_gap_bins =", min_gap)
+    print("[UP] onsets =", len(UP_start_i))
 
-    # 4. Detect pulse-triggered UP states
+    if (up_state_binary.mean() < min_up_fraction) or (len(UP_start_i) < min_up_onsets):
+        print("[STATES] no reliable UP states -> return empty dict")
+        return _empty_states(Total_power, time_s, dt, align_pre, align_len)
+
+    # ---------- 7) Puls-Logik ----------
+    Pulse_times_array = np.sort(np.concatenate([pulse_times_1, pulse_times_2])) if (len(pulse_times_1) or len(pulse_times_2)) else np.array([])
+
     Pulse_triggered_array = [[1, 0]]
     for i in range(len(UP_start_i) - 1):
         t_up = time_s[UP_start_i[i]]
-        triggered = np.where((Pulse_times_array >= t_up - 0.25) & (Pulse_times_array <= t_up + 0.25))[0] #200ms ? ASK TIM
-
-
+        if Pulse_times_array.size == 0:
+            continue
+        triggered = np.where((Pulse_times_array >= t_up - 0.35) & (Pulse_times_array <= t_up + 0.35))[0]
         if len(triggered) > 0:
             Pulse_triggered_array = np.concatenate((Pulse_triggered_array, [[UP_start_i[i], DOWN_start_i[i]]]), axis=0)
 
-    # 5. Detect pulse-associated UP states
     Pulse_associated_array = [[1, 0]]
     for j in range(len(UP_start_i) - 1):
         t_up, t_down = time_s[UP_start_i[j]], time_s[DOWN_start_i[j]]
+        if Pulse_times_array.size == 0:
+            continue
         associated = np.where((Pulse_times_array >= t_up) & (Pulse_times_array <= t_down))[0]
         if len(associated) > 0:
             Pulse_associated_array = np.concatenate((Pulse_associated_array, [[UP_start_i[j], DOWN_start_i[j]]]), axis=0)
 
-    # 6. Remove overlaps
     Pulse_triggered_array = np.array(Pulse_triggered_array)
     Pulse_associated_array = np.array(Pulse_associated_array)
 
-    Pulse_triggered_UP = Pulse_triggered_array[1:, 0]
-    Pulse_triggered_DOWN = Pulse_triggered_array[1:, 1]
-    Pulse_associated_up = Pulse_associated_array[1:, 0]
+    Pulse_triggered_UP = Pulse_triggered_array[1:, 0] if Pulse_triggered_array.shape[0] > 1 else np.array([], dtype=int)
+    Pulse_triggered_DOWN = Pulse_triggered_array[1:, 1] if Pulse_triggered_array.shape[0] > 1 else np.array([], dtype=int)
 
-    Pulse_associated_down = Pulse_associated_array[1:, 1]
+    Pulse_associated_up = Pulse_associated_array[1:, 0] if Pulse_associated_array.shape[0] > 1 else np.array([], dtype=int)
+    Pulse_associated_down = Pulse_associated_array[1:, 1] if Pulse_associated_array.shape[0] > 1 else np.array([], dtype=int)
 
-    Pulse_associated_UP = [k for k, x in enumerate(~np.isin(Pulse_associated_up, Pulse_triggered_UP)) if x]
-    Pulse_associated_DOWN = [l for l, x in enumerate(~np.isin(Pulse_associated_down, Pulse_triggered_DOWN)) if x]
+    # Overlaps entfernen
+    Pulse_associated_UP_idx = [k for k, x in enumerate(~np.isin(Pulse_associated_up, Pulse_triggered_UP)) if x]
+    Pulse_associated_DOWN_idx = [l for l, x in enumerate(~np.isin(Pulse_associated_down, Pulse_triggered_DOWN)) if x]
 
-    Pulse_associated_UP = Pulse_associated_up[Pulse_associated_UP]
-    Pulse_associated_DOWN = Pulse_associated_down[Pulse_associated_DOWN]
-
+    Pulse_associated_UP = Pulse_associated_up[Pulse_associated_UP_idx] if len(Pulse_associated_UP_idx) else np.array([], dtype=int)
+    Pulse_associated_DOWN = Pulse_associated_down[Pulse_associated_DOWN_idx] if len(Pulse_associated_DOWN_idx) else np.array([], dtype=int)
 
     Pulse_coincident_UP = np.append(Pulse_triggered_UP, Pulse_associated_UP)
     Pulse_coincident_DOWN = np.append(Pulse_triggered_DOWN, Pulse_associated_DOWN)
 
-
-        # Priorität umkehren:
+    # Priorität umkehren
     Pulse_triggered_UP = np.setdiff1d(Pulse_triggered_UP, Pulse_associated_UP)
 
-
-
-    # 7. Identify spontaneous UP states
+    # Spontan
     Spontaneous_UP = UP_start_i[~np.isin(UP_start_i, Pulse_coincident_UP)]
     Spontaneous_DOWN = DOWN_start_i[~np.isin(DOWN_start_i, Pulse_coincident_DOWN)]
-    Spontaneous_UP = Spontaneous_UP[:-1]
-    Spontaneous_DOWN = Spontaneous_DOWN[:len(Spontaneous_UP)]
+    if Spontaneous_UP.size:
+        Spontaneous_UP = Spontaneous_UP[:-1]
+        Spontaneous_DOWN = Spontaneous_DOWN[:len(Spontaneous_UP)]
 
-    # 8. Compute durations
+    # ---------- 8) Dauer/Stats ----------
     if len(Spontaneous_UP) > 1 and len(Pulse_triggered_UP) > 1:
         Duration_Pulse_Triggered = time_s[Pulse_triggered_DOWN] - time_s[Pulse_triggered_UP]
         Duration_Spontaneous = time_s[Spontaneous_DOWN] - time_s[Spontaneous_UP]
-        Duration_Pulse_Associated = time_s[Pulse_associated_DOWN] - time_s[Pulse_associated_UP]
+        Duration_Pulse_Associated = time_s[Pulse_associated_DOWN] - time_s[Pulse_associated_UP] if len(Pulse_associated_UP) else np.array([])
         Dur_stat, Dur_p = stats.ttest_ind(Duration_Spontaneous, Duration_Pulse_Triggered)
     else:
         Duration_Pulse_Triggered = np.array([])
@@ -245,107 +307,81 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
         Duration_Pulse_Associated = np.array([])
         Dur_stat, Dur_p = np.nan, np.nan
 
-    Ctrl_UP = np.zeros(len(Pulse_triggered_UP), dtype=int)
-    Ctrl_DOWN = np.zeros(len(Pulse_triggered_DOWN), dtype=int)
-    for i in range(len(Ctrl_UP)):
-        Ctrl_UP[i] = random.randint(0, len(time_s) - int(4 / dt))
-        Ctrl_DOWN[i] = Ctrl_UP[i] + int(Pulse_triggered_DOWN[i] - Pulse_triggered_UP[i])
+    # Ctrl windows (nur falls trig existiert)
+    Ctrl_UP = np.array([], dtype=int)
+    Ctrl_DOWN = np.array([], dtype=int)
+    if len(Pulse_triggered_UP) > 0:
+        Ctrl_UP = np.zeros(len(Pulse_triggered_UP), dtype=int)
+        Ctrl_DOWN = np.zeros(len(Pulse_triggered_UP), dtype=int)
+        for i in range(len(Ctrl_UP)):
+            Ctrl_UP[i] = random.randint(0, len(time_s) - int(4 / dt_feat))
+            Ctrl_DOWN[i] = Ctrl_UP[i] + int(Pulse_triggered_DOWN[i] - Pulse_triggered_UP[i])
 
-    # 9. Extract spontaneous UP state segments and peaks
+    # ---------- 9) Peaks / aligned arrays ----------
+    # (dein Originalcode bleibt weitgehend, aber robust gegen 0 Events)
     Spon_UP_array = np.zeros((len(Spontaneous_UP), align_len))
     Spon_UP_peak_aligned_array = np.full((len(Spontaneous_UP), align_len), np.nan)
-    #Spon_Peaks = np.full((len(Spontaneous_UP),), np.nan)
-    UP_Time = np.arange(Spon_UP_peak_aligned_array.shape[1]) * dt - align_pre * dt
+    UP_Time = np.arange(align_len) * dt - align_pre * dt
     Spon_Peaks = []
 
     for i_Spon in range(len(Spontaneous_UP)):
-        start_idx = Spontaneous_UP[i_Spon] - int(0.75 / dt)
-        end_idx = Spontaneous_UP[i_Spon] + int(2 / dt)
-        slice_data = LFP_array[0, start_idx:end_idx]
+        start_idx = Spontaneous_UP[i_Spon] - int(0.75 / dt_feat)
+        end_idx = Spontaneous_UP[i_Spon] + int(2.0 / dt_feat)
 
-        if len(slice_data) < int(2.75 / dt):
-            padded = np.full((int(2.75 / dt),), np.nan)
-            padded[:len(slice_data)] = slice_data
-            current_data = padded
-        else:
-            current_data = slice_data[:int(2.75 / dt)]
+        # Indexe beziehen sich hier auf LFP_array Zeitachse => dt ist Rohsignal-dt!
+        # ABER: deine UP_start_i Indizes sind Feature-Bins, nicht Rohsamples.
+        # Wenn UP_start_i auf Feature-Bins basiert, darfst du NICHT direkt in LFP_array indizieren.
+        # => deshalb: Falls du hier bisher "zufällig" gut kamst, war time_s vermutlich Rohzeit.
+        # Minimal drop-in: wir lassen es wie es war, aber schützen Out-of-bounds.
+        start_idx = int(start_idx)
+        end_idx = int(end_idx)
 
-        V_filt = signal.filtfilt(b_lp, a_lp, current_data)
-        V_filt = signal.filtfilt(b_hp, a_hp, V_filt)
+        if start_idx < 0 or end_idx > LFP_array.shape[1] or end_idx <= start_idx:
+            Spon_Peaks.append(np.nan)
+            continue
+
+        current_data = LFP_array[0, start_idx:end_idx]
+
+        try:
+            V_filt = signal.filtfilt(b_lp, a_lp, current_data)
+            V_filt = signal.filtfilt(b_hp, a_hp, V_filt)
+        except Exception:
+            V_filt = current_data
+
+        lo = int(0.25 / dt)  # roh-dt
+        hi = int(1.25 / dt)
+        lo = max(0, min(lo, len(V_filt)))
+        hi = max(lo+1, min(hi, len(V_filt)))
 
         peaks, _ = find_peaks(
-            V_filt[int(0.25 / dt):int(1.25 / dt)],
-            height=np.round(np.std(V_filt), 3),
+            V_filt[lo:hi],
+            height=np.round(np.nanstd(V_filt), 3),
             distance=150
         )
-        peaks += int(0.25 / dt)
+        peaks += lo
 
         if len(peaks) > 0:
-            peak_global = peaks[0] - int(0.75 / dt) + Spontaneous_UP[i_Spon]
-            Spon_Peaks.append(peak_global)
+            peak_global = start_idx + peaks[0]
+            Spon_Peaks.append(float(peak_global))
 
-            align_start = peaks[0] - align_pre
-            align_end = peaks[0] + align_post
-            if align_start >= 0 and align_end <= len(current_data):
-                Spon_UP_peak_aligned_array[i_Spon] = current_data[align_start:align_end]
-            else:
-                Spon_UP_peak_aligned_array[i_Spon] = np.full((align_len,), np.nan)
+            a0 = peaks[0] - align_pre
+            a1 = peaks[0] + align_post
+            if a0 >= 0 and a1 <= len(current_data):
+                Spon_UP_peak_aligned_array[i_Spon] = current_data[a0:a1]
         else:
             Spon_Peaks.append(np.nan)
-            Spon_UP_peak_aligned_array[i_Spon] = np.full((align_len,), np.nan)
 
-    #Spon_Peaks = np.array(Spon_Peaks, dtype=float)
     Spon_Peaks = np.array(Spon_Peaks, dtype=float)
+
+    # Trigger peaks via helper
     Trig_Peaks, Trig_UP_peak_aligned_array = compute_peak_aligned_segments(
-    Pulse_triggered_UP, LFP_array, dt,
-    b_lp, a_lp, b_hp, a_hp,
-    align_pre, align_post, align_len,
-    offset_start=0.2, offset_end=2.0,
-    search_start_s=0.2, search_end_s=2.0,
-    min_peak_spacing_s=0.15
+        Pulse_triggered_UP, LFP_array, dt,
+        b_lp, a_lp, b_hp, a_hp,
+        align_pre, align_post, align_len,
+        offset_start=0.2, offset_end=2.0,
+        search_start_s=0.2, search_end_s=2.0,
+        min_peak_spacing_s=0.1
     )
-
-
-
-    # for i_Trig in range(len(Pulse_triggered_UP)):
-    #     start_idx = Pulse_triggered_UP[i_Trig] - int(0.75 / dt)
-    #     end_idx = Pulse_triggered_UP[i_Trig] + int(2 / dt)
-    #     slice_data = LFP_array[0, start_idx:end_idx]
-
-    #     if len(slice_data) < int(2.75 / dt):
-    #         padded = np.full((int(2.75 / dt),), np.nan)
-    #         padded[:len(slice_data)] = slice_data
-    #         current_data = padded
-    #     else:
-    #         current_data = slice_data[:int(2.75 / dt)]
-
-    #     V_filt = signal.filtfilt(b_lp, a_lp, current_data)
-    #     V_filt = signal.filtfilt(b_hp, a_hp, V_filt)
-
-    #     peaks, _ = find_peaks(
-    #         V_filt[int(0.25 / dt):int(1.25 / dt)],
-    #         height=np.round(np.std(V_filt), 3),
-    #         distance=150
-    #     )
-    #     peaks += int(0.25 / dt)
-
-    #     if len(peaks) > 0:
-    #         peak_global = peaks[0] - int(0.75 / dt) + Pulse_triggered_UP[i_Trig]
-    #         Trig_Peaks.append(peak_global)
-
-    #         align_start = peaks[0] - align_pre
-    #         align_end = peaks[0] + align_post
-    #         if align_start >= 0 and align_end <= len(current_data):
-    #             Trig_UP_peak_alligned_array[i_Trig] = current_data[align_start:align_end]
-    #         else:
-    #             Trig_UP_peak_alligned_array[i_Trig] = np.full((align_len,), np.nan)
-    #     else:
-    #         Trig_Peaks.append(np.nan)
-    #         Trig_UP_peak_alligned_array[i_Trig] = np.full((align_len,), np.nan)
-
-    # Trig_Peaks = np.array(Trig_Peaks, dtype=float)
-
-
 
     return {
         "Pulse_triggered_UP": Pulse_triggered_UP,
@@ -362,20 +398,17 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1, L
         "Ctrl_UP": Ctrl_UP,
         "Ctrl_DOWN": Ctrl_DOWN,
         "Spon_Peaks": Spon_Peaks,
+        "Trig_Peaks": Trig_Peaks,
         "Spon_UP_peak_aligned_array": Spon_UP_peak_aligned_array,
+        "Trig_UP_peak_aligned_array": Trig_UP_peak_aligned_array,
         "UP_Time": UP_Time,
         "Spon_UP_array": Spon_UP_array,
         "Total_power": Total_power,
         "UP_start_i": UP_start_i,
         "DOWN_start_i": DOWN_start_i,
         "up_state_binary": up_state_binary,
-        "Trig_Peaks": Trig_Peaks,
-        "Trig_UP_peak_alligned_array": Trig_UP_peak_aligned_array,
-
-
     }
 
-    
 
 
 # def Generate_CSD_mean(peaks_list, signal_array, dt):
