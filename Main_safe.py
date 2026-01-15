@@ -3,8 +3,8 @@
 
 import os, math
 import numpy as np
+import numpy as _np 
 import re
-_np = np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  
@@ -39,6 +39,8 @@ from plotter import (
     plot_upstate_duration_comparison,
     plot_upstate_amplitude_blocks_colored,
     CSD_compare_side_by_side_ax,
+    _blank_ax,
+    compute_refrac_from_spont_to_spon_and_trig,
 )
 
 import os, glob
@@ -56,7 +58,8 @@ from processing import (
     downsample_array_simple, 
     _counts_to_uV, _volts_to_uV, 
     convert_df_to_uV, _decimate_xy, 
-    _ensure_main_channel, _ensure_seconds, 
+    _ensure_main_channel,
+    _ensure_seconds, 
     _safe_crop_to_pulses,
     _empty_updict,
     _clip_pairs,
@@ -74,6 +77,8 @@ from processing import (
     upstate_duration_compare_ax,
     refractory_compare_ax,
     CSD_single_panel_ax,
+    _as_valid_idx,
+    _build_rollups,
     )
         
 #Konstanten
@@ -372,7 +377,7 @@ if HTML_IN_uV:
         main_channel_uV = main_channel.copy()
 
 
-# --- XDAT-Erkennung (heuristisch) ---
+# XDAT-Erkennung (heuristisch) 
 def _is_xdat_format():
     """
     Liefert True, wenn die Kanalnamen stark nach XDAT/Intan aussehen,
@@ -401,7 +406,7 @@ def _is_xdat_format():
     return (len(cols) >= 8 and hits / max(1, len(cols)) >= 0.6)
 
 
-# ==== Feste Kanalwahl für .xdat
+# Feste Kanalwahl für .xdat
 if _is_xdat_format():
     fixed_idx = [i for i in range(1, 15) if i < LFP_array.shape[0]]  # pri_1..
     good_idx = fixed_idx[:]  # überschreibe Fallback
@@ -487,6 +492,30 @@ if len(time_s) >= 2 and LFP_array.shape[1] >= 2:
 else:
     raise RuntimeError("Spectrogram skipped: empty/too short segment after cropping.")
 
+
+
+S = np.asarray(Spect_dat[0])
+t_feat = np.asarray(Spect_dat[1])
+print("[CHECK] len(time_s) =", len(time_s))
+print("[CHECK] S.shape =", S.shape, "-> timebins =", S.shape[1])
+print("[CHECK] len(t_feat) =", len(t_feat))
+
+
+t_feat = np.asarray(Spect_dat[1], float)
+print("[CHECK] len(t_feat) =", len(t_feat))
+print("[CHECK] time_s[0], time_s[-1] =", float(time_s[0]), float(time_s[-1]))
+print("[CHECK] t_feat[0], t_feat[-1] =", float(t_feat[0]), float(t_feat[-1]))
+print("[CHECK] median dt time_s =", float(np.median(np.diff(time_s))))
+print("[CHECK] median dt t_feat  =", float(np.median(np.diff(t_feat))))
+
+# Vergleich der ersten paar Werte
+print("[CHECK] first 5 time_s:", time_s[:5])
+print("[CHECK] first 5 t_feat :", t_feat[:5])
+
+# max absolute difference (wenn Längen kompatibel)
+m = min(len(time_s), len(t_feat))
+print("[CHECK] max|time_s - t_feat| over first m:",
+      float(np.nanmax(np.abs(time_s[:m] - t_feat[:m]))))
 
 
 
@@ -603,24 +632,10 @@ Pulse_triggered_UP    = Up.get("Pulse_triggered_UP",    np.array([], int))
 Pulse_triggered_DOWN  = Up.get("Pulse_triggered_DOWN",  np.array([], int))
 Pulse_associated_UP   = Up.get("Pulse_associated_UP",   np.array([], int))
 Pulse_associated_DOWN = Up.get("Pulse_associated_DOWN", np.array([], int))
-#Spon_Peaks            = Up.get("Spon_Peaks",            np.array([], float))
-# Peaks robust NEU ableiten: nimm einfach die Onsets als Peak-Proxy
-# Spon_Peaks = np.asarray(Spontaneous_UP, dtype=int)
-# Trig_Peaks = np.asarray(Pulse_triggered_UP, dtype=int)
-
 
 Spon_Peaks_raw = Up.get("Spon_Peaks", None)
 Trig_Peaks_raw = Up.get("Trig_Peaks", None)
 
-def _as_valid_idx(arr, n):
-    if arr is None:
-        return None
-    a = np.asarray(arr)
-    if np.issubdtype(a.dtype, np.floating):
-        return None
-    a = a.astype(int, copy=False)
-    a = a[(a >= 0) & (a < n)]
-    return a
 
 Spon_Peaks = _as_valid_idx(Spon_Peaks_raw, LFP_array_good.shape[1])
 Trig_Peaks = _as_valid_idx(Trig_Peaks_raw, LFP_array_good.shape[1])
@@ -631,17 +646,9 @@ if Trig_Peaks is None or Trig_Peaks.size == 0:
     Trig_Peaks = np.asarray(Pulse_triggered_UP, int)
 
 
-Total_power           = Up.get("Total_power", None)
-up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", None))
+# Total_power           = Up.get("Total_power", None)
+# up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", None))
 
-
-# Spon_Peaks = Up.get("Spon_Peaks", None)
-# Trig_Peaks = Up.get("Trig_Peaks", None)
-# if Spon_Peaks is None: Spon_Peaks = np.asarray(Spontaneous_UP, int)
-# if Trig_Peaks is None: Trig_Peaks = np.asarray(Pulse_triggered_UP, int)
-
-Total_power           = Up.get("Total_power",           None)
-up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", None))
 
 print("[COUNTS] sponUP:", len(Spontaneous_UP), " trigUP:", len(Pulse_triggered_UP), " assocUP:", len(Pulse_associated_UP))
 log(f"States: spon={len(Spontaneous_UP)}, trig={len(Pulse_triggered_UP)}, assoc={len(Pulse_associated_UP)}")
@@ -658,7 +665,7 @@ refrac_trig = compute_refractory_period(
 print(f"[REFRAC] spont: n={len(refrac_spont)}, trig: n={len(refrac_trig)}")
 
 
-# --- NEU: Refraktärzeiten "Ende ANY-UP → nächster SPONT/TRIG-UP" ---
+# Refraktärzeiten "Ende ANY-UP → nächster SPONT/TRIG-UP"
 refrac_any_to_spont, refrac_any_to_trig = compute_refractory_any_to_type(
     Spontaneous_UP, Spontaneous_DOWN,
     Pulse_triggered_UP, Pulse_triggered_DOWN,
@@ -669,7 +676,7 @@ refrac_any_to_spont, refrac_any_to_trig = compute_refractory_any_to_type(
 print(f"[REFRAC-any] any→spont: n={len(refrac_any_to_spont)}, any→trig: n={len(refrac_any_to_trig)}")
 
 
-# --- CSV: Refraktärzeiten exportieren ---
+# CSV: Refraktärzeiten exportieren 
 if len(refrac_spont) or len(refrac_trig):
     ref_data = []
     if len(refrac_spont):
@@ -778,7 +785,7 @@ except Exception as e:
 
 n_time = LFP_array_good.shape[1]
 
-# --- Onsets aus UP/DOWN-Listen (zeitlich stabiler als Peaks) ---
+# Onsets aus UP/DOWN-Listen (zeitlich stabiler als Peaks) 
 Spon_Onsets = _up_onsets(Spontaneous_UP,       Spontaneous_DOWN)
 Trig_Onsets = _up_onsets(Pulse_triggered_UP,   Pulse_triggered_DOWN)
 
@@ -827,12 +834,6 @@ else:
     align_pre_s  = CSD_PRE_DESIRED
     align_post_s = CSD_POST_DESIRED
 
-
-
-# 0) Event-Zahlen + Index-Gültigkeit
-# _check_peak_indices("Spon_Peaks", Up.get("Spon_Peaks", []), LFP_array_good.shape[1])
-# _check_peak_indices("Trig_Peaks", Up.get("Trig_Peaks", []), LFP_array_good.shape[1])
-
 _check_peak_indices("Spon_Peaks", Spon_Peaks, LFP_array_good.shape[1])
 _check_peak_indices("Trig_Peaks", Trig_Peaks, LFP_array_good.shape[1])
 
@@ -860,16 +861,6 @@ if freqs is not None and pulse_mean is not None:
         os.path.join(SAVE_DIR, "spectrum_trig.csv"), index=False)
 
 
-
-
-# # 0) Event-Zahlen + Index-Gültigkeit
-# # _check_peak_indices("Spon_Peaks", Up.get("Spon_Peaks", []), LFP_array_good.shape[1])
-# # _check_peak_indices("Trig_Peaks", Up.get("Trig_Peaks", []), LFP_array_good.shape[1])
-
-# _check_peak_indices("Spon_Peaks", Spon_Peaks, LFP_array_good.shape[1])
-# _check_peak_indices("Trig_Peaks", Trig_Peaks, LFP_array_good.shape[1])
-
-
 # 1) CSD-Grundstats
 _nan_stats("CSD_spont", CSD_spont)
 _nan_stats("CSD_trig",  CSD_trig)
@@ -889,75 +880,6 @@ if len(pulse_times_1):
     print("[DEBUG] p1 first/last:", float(pulse_times_1[0]), float(pulse_times_1[-1]), "count:", len(pulse_times_1))
 if len(pulse_times_2):
     print("[DEBUG] p2 first/last:", float(pulse_times_2[0]), float(pulse_times_2[-1]), "count:", len(pulse_times_2))
-
-
-
-
-def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
-
-    
-    FIELDNAMES = [
-        "Parent","Experiment","Dauer [s]","Samplingrate [Hz]","Kanäle",
-        "Pulse count 1","Pulse count 2",
-        "Upstates total","triggered","spon","associated",
-        "Downstates total","UP/DOWN ratio",
-        "Mean UP Dauer [s]","Mean UP Dauer Triggered [s]","Mean UP Dauer Spontaneous [s]",
-        "Datum Analyse",
-    ]
-    print("[ROLLUP][DEBUG] summary_path =", summary_path)
-    exp_dir       = os.path.dirname(summary_path)
-    parent_dir    = os.path.dirname(exp_dir)
-    for_david_dir = os.path.dirname(parent_dir)
-    print("[ROLLUP][DEBUG] exp_dir =", exp_dir)
-    print("[ROLLUP][DEBUG] parent_dir =", parent_dir)
-    print("[ROLLUP][DEBUG] for_david_dir =", for_david_dir)
-
-    files_parent = sorted(glob.glob(os.path.join(parent_dir, "*", "upstate_summary.csv")))
-    print("[ROLLUP][DEBUG] files_parent =", files_parent)
-    def _read_any(path):
-        try:
-            # liest Komma/Semikolon/Tabs automatisch
-            df = pd.read_csv(path, sep=None, engine="python", dtype=str)
-            for k in FIELDNAMES:
-                if k not in df.columns:
-                    df[k] = ""
-            return df[FIELDNAMES]
-        except Exception:
-            return pd.DataFrame(columns=FIELDNAMES)
-
-    def _write_semicolon(path, df):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        df.to_csv(path, sep=";", index=False, encoding="utf-8")
-
-    exp_dir       = os.path.dirname(summary_path)
-    parent_dir    = os.path.dirname(exp_dir)        
-    for_david_dir = os.path.dirname(parent_dir)     
-
-    #Rollup pro Parent-Ordner 
-    files_parent = sorted(glob.glob(os.path.join(parent_dir, "*", "upstate_summary.csv")))
-    dfs = [_read_any(p) for p in files_parent]
-    if dfs:
-        r = (pd.concat(dfs, ignore_index=True)
-               .drop_duplicates(subset=["Parent","Experiment"], keep="last"))
-        out_parent = os.path.join(parent_dir, out_name)
-        _write_semicolon(out_parent, r)
-        print(f"[SUMMARY][ROLLUP Parent] {out_parent}  (Quellen: {len(files_parent)})")
-    else:
-        print("[SUMMARY][ROLLUP Parent] keine Quellen gefunden")
-
-    # Rollup (alle Parents zusammen) 
-    files_all = sorted(glob.glob(os.path.join(for_david_dir, "*", "*", "upstate_summary.csv")))
-    dfs_all = [_read_any(p) for p in files_all]
-    if dfs_all:
-        r_all = (pd.concat(dfs_all, ignore_index=True)
-                   .drop_duplicates(subset=["Parent","Experiment"], keep="last"))
-        out_fd = os.path.join(for_david_dir, out_name)
-        _write_semicolon(out_fd, r_all)
-        print(f"[SUMMARY][ROLLUP For David] {out_fd}  (Quellen: {len(files_all)})")
-    else:
-        print("[SUMMARY][ROLLUP For David] keine Quellen gefunden")
-
-
 
 
 
@@ -1018,7 +940,7 @@ def plot_up_classification_ax(
     y0, y1 = ax.get_ylim()
 
     # 5) Pulsezeiten als vlines (ohne die y-Limits zu verändern)
-    # 5) Pulsezeiten als vlines (ohne die y-Limits zu verändern)
+
     def _vlines(ts, style, label, color="red"):
         if ts is None or len(ts) == 0:
             return
@@ -1065,10 +987,10 @@ def plot_up_classification_ax(
     return fig
 
 
-def _blank_ax(ax, msg=None):
-    ax.axis("off")
-    if msg:
-        ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes, alpha=0.4)
+# def _blank_ax(ax, msg=None):
+#     ax.axis("off")
+#     if msg:
+#         ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes, alpha=0.4)
 
 def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=0.05, ax=None):
     if ax is None:
@@ -1090,6 +1012,7 @@ def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=
                 if i==len(idx) or idx[i] != idx[i-1]+1:
                     ax.axvspan(freqs[start], freqs[idx[i-1]], alpha=0.12)
                     if i < len(idx): start = idx[i]
+    plt.xlim(0,150)
     ax.set_xlabel("Hz"); ax.set_ylabel(PSD_UNIT_LABEL) 
     ax.set_title("Power (Spontan vs. Getriggert)"); ax.legend()
     return fig
@@ -1147,8 +1070,6 @@ except Exception as e:
 
 
 def up_onset_mean_ax(main_channel, dt, onsets, ax=None, title="UPs – onset-aligned mean"):
-    import numpy as np
-    import matplotlib.pyplot as plt
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6,3))
@@ -1328,84 +1249,6 @@ def pulse_triggered_up_overlay_ax(
 
     return fig
 
-
-
-
-def compute_refrac_from_spont_to_spon_and_trig(
-    Spontaneous_UP, Spontaneous_DOWN,
-    Pulse_triggered_UP,
-    Pulse_associated_UP,
-    time_s
-):
-    """
-    Refraktärzeiten nur von SPONT-UP-Off → nächster UP,
-    aber nur dann:
-      - wenn der *erste* UP nach dem Off spontan oder trig ist
-      - wenn der *erste* UP nach dem Off 'associated' ist, wird
-        dieser SPONT-Off komplett ignoriert.
-    """
-
-    Spontaneous_UP      = np.asarray(Spontaneous_UP,      int)
-    Spontaneous_DOWN    = np.asarray(Spontaneous_DOWN,    int)
-    Pulse_triggered_UP  = np.asarray(Pulse_triggered_UP,  int)
-    Pulse_associated_UP = np.asarray(Pulse_associated_UP, int)
-
-    m_spon = min(len(Spontaneous_UP), len(Spontaneous_DOWN))
-    if m_spon == 0:
-        return np.array([], float), np.array([], float)
-
-    # Nur gepaarte SPONT-UP/DOWN
-    Spontaneous_UP   = Spontaneous_UP[:m_spon]
-    Spontaneous_DOWN = Spontaneous_DOWN[:m_spon]
-
-    # Onset-Zeiten aller relevanten UPs
-    times_spon  = time_s[Spontaneous_UP]      if len(Spontaneous_UP)      else np.array([], float)
-    times_trig  = time_s[Pulse_triggered_UP]  if len(Pulse_triggered_UP)  else np.array([], float)
-    times_assoc = time_s[Pulse_associated_UP] if len(Pulse_associated_UP) else np.array([], float)
-
-    # Nichts da → nichts zu tun
-    if times_spon.size == 0 and times_trig.size == 0 and times_assoc.size == 0:
-        return np.array([], float), np.array([], float)
-
-    # Kombinierte Liste: 0 = spont, 1 = trig, 2 = assoc
-    all_times  = np.concatenate([times_spon,          times_trig,          times_assoc])
-    all_labels = np.concatenate([
-        np.zeros_like(times_spon,  dtype=int),        # 0 = spont
-        np.ones_like(times_trig,   dtype=int),        # 1 = trig
-        np.full_like(times_assoc,  2,         dtype=int)  # 2 = assoc
-    ])
-
-    order      = np.argsort(all_times)
-    all_times  = all_times[order]
-    all_labels = all_labels[order]
-
-    refrac_spon2spon = []
-    refrac_spon2trig = []
-
-    for down_idx in Spontaneous_DOWN:
-        t_off = time_s[down_idx]
-
-        # erster UP nach dem Off
-        j = np.searchsorted(all_times, t_off + 1e-9)
-        if j >= all_times.size:
-            continue
-
-        lab = all_labels[j]
-
-        # wenn das erste Event ein associated UP ist → diesen SPONT-Off ignorieren
-        if lab == 2:
-            continue
-
-        dt_ref = all_times[j] - t_off
-        if dt_ref < 0:
-            continue
-
-        if lab == 0:
-            refrac_spon2spon.append(dt_ref)
-        elif lab == 1:
-            refrac_spon2trig.append(dt_ref)
-
-    return np.asarray(refrac_spon2spon, float), np.asarray(refrac_spon2trig, float)
 
 
 def refractory_from_spont_to_type_overlay_ax(
@@ -2929,7 +2772,6 @@ def _write_summary_csv():
 
     # Helfer: numpy/NaN -> plain
     def _py(v):
-        import numpy as _np 
         try:
             if isinstance(v, (_np.floating, _np.float32, _np.float64)):
                 f = float(v);  return "" if (f != f) else f  # NaN -> ""

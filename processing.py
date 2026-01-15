@@ -824,3 +824,79 @@ def CSD_single_panel_ax(
     ax.axvline(0, color="k", lw=0.5, alpha=0.7)
 
     return fig
+
+
+def _as_valid_idx(arr, n):
+    if arr is None:
+        return None
+    a = np.asarray(arr)
+    if np.issubdtype(a.dtype, np.floating):
+        return None
+    a = a.astype(int, copy=False)
+    a = a[(a >= 0) & (a < n)]
+    return a
+
+def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
+
+    
+    FIELDNAMES = [
+        "Parent","Experiment","Dauer [s]","Samplingrate [Hz]","Kanäle",
+        "Pulse count 1","Pulse count 2",
+        "Upstates total","triggered","spon","associated",
+        "Downstates total","UP/DOWN ratio",
+        "Mean UP Dauer [s]","Mean UP Dauer Triggered [s]","Mean UP Dauer Spontaneous [s]",
+        "Datum Analyse",
+    ]
+    print("[ROLLUP][DEBUG] summary_path =", summary_path)
+    exp_dir       = os.path.dirname(summary_path)
+    parent_dir    = os.path.dirname(exp_dir)
+    for_david_dir = os.path.dirname(parent_dir)
+    print("[ROLLUP][DEBUG] exp_dir =", exp_dir)
+    print("[ROLLUP][DEBUG] parent_dir =", parent_dir)
+    print("[ROLLUP][DEBUG] for_david_dir =", for_david_dir)
+
+    files_parent = sorted(glob.glob(os.path.join(parent_dir, "*", "upstate_summary.csv")))
+    print("[ROLLUP][DEBUG] files_parent =", files_parent)
+    def _read_any(path):
+        try:
+            # liest Komma/Semikolon/Tabs automatisch
+            df = pd.read_csv(path, sep=None, engine="python", dtype=str)
+            for k in FIELDNAMES:
+                if k not in df.columns:
+                    df[k] = ""
+            return df[FIELDNAMES]
+        except Exception:
+            return pd.DataFrame(columns=FIELDNAMES)
+
+    def _write_semicolon(path, df):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df.to_csv(path, sep=";", index=False, encoding="utf-8")
+
+    exp_dir       = os.path.dirname(summary_path)
+    parent_dir    = os.path.dirname(exp_dir)        
+    for_david_dir = os.path.dirname(parent_dir)     
+
+    #Rollup pro Parent-Ordner 
+    files_parent = sorted(glob.glob(os.path.join(parent_dir, "*", "upstate_summary.csv")))
+    dfs = [_read_any(p) for p in files_parent]
+    if dfs:
+        r = (pd.concat(dfs, ignore_index=True)
+               .drop_duplicates(subset=["Parent","Experiment"], keep="last"))
+        out_parent = os.path.join(parent_dir, out_name)
+        _write_semicolon(out_parent, r)
+        print(f"[SUMMARY][ROLLUP Parent] {out_parent}  (Quellen: {len(files_parent)})")
+    else:
+        print("[SUMMARY][ROLLUP Parent] keine Quellen gefunden")
+
+    # Rollup (alle Parents zusammen) 
+    files_all = sorted(glob.glob(os.path.join(for_david_dir, "*", "*", "upstate_summary.csv")))
+    dfs_all = [_read_any(p) for p in files_all]
+    if dfs_all:
+        r_all = (pd.concat(dfs_all, ignore_index=True)
+                   .drop_duplicates(subset=["Parent","Experiment"], keep="last"))
+        out_fd = os.path.join(for_david_dir, out_name)
+        _write_semicolon(out_fd, r_all)
+        print(f"[SUMMARY][ROLLUP For David] {out_fd}  (Quellen: {len(files_all)})")
+    else:
+        print("[SUMMARY][ROLLUP For David] keine Quellen gefunden")
+

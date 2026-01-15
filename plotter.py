@@ -372,3 +372,84 @@ def CSD_compare_side_by_side_ax(
     ax_left.set_title(title, fontsize=11, pad=22)
     return fig
 
+def _blank_ax(ax, msg=None):
+    ax.axis("off")
+    if msg:
+        ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes, alpha=0.4)
+
+
+def compute_refrac_from_spont_to_spon_and_trig(
+    Spontaneous_UP, Spontaneous_DOWN,
+    Pulse_triggered_UP,
+    Pulse_associated_UP,
+    time_s
+):
+    """
+    Refraktärzeiten nur von SPONT-UP-Off → nächster UP,
+    aber nur dann:
+      - wenn der *erste* UP nach dem Off spontan oder trig ist
+      - wenn der *erste* UP nach dem Off 'associated' ist, wird
+        dieser SPONT-Off komplett ignoriert.
+    """
+
+    Spontaneous_UP      = np.asarray(Spontaneous_UP,      int)
+    Spontaneous_DOWN    = np.asarray(Spontaneous_DOWN,    int)
+    Pulse_triggered_UP  = np.asarray(Pulse_triggered_UP,  int)
+    Pulse_associated_UP = np.asarray(Pulse_associated_UP, int)
+
+    m_spon = min(len(Spontaneous_UP), len(Spontaneous_DOWN))
+    if m_spon == 0:
+        return np.array([], float), np.array([], float)
+
+    # Nur gepaarte SPONT-UP/DOWN
+    Spontaneous_UP   = Spontaneous_UP[:m_spon]
+    Spontaneous_DOWN = Spontaneous_DOWN[:m_spon]
+
+    # Onset-Zeiten aller relevanten UPs
+    times_spon  = time_s[Spontaneous_UP]      if len(Spontaneous_UP)      else np.array([], float)
+    times_trig  = time_s[Pulse_triggered_UP]  if len(Pulse_triggered_UP)  else np.array([], float)
+    times_assoc = time_s[Pulse_associated_UP] if len(Pulse_associated_UP) else np.array([], float)
+
+    # Nichts da → nichts zu tun
+    if times_spon.size == 0 and times_trig.size == 0 and times_assoc.size == 0:
+        return np.array([], float), np.array([], float)
+
+    # Kombinierte Liste: 0 = spont, 1 = trig, 2 = assoc
+    all_times  = np.concatenate([times_spon,          times_trig,          times_assoc])
+    all_labels = np.concatenate([
+        np.zeros_like(times_spon,  dtype=int),        # 0 = spont
+        np.ones_like(times_trig,   dtype=int),        # 1 = trig
+        np.full_like(times_assoc,  2,         dtype=int)  # 2 = assoc
+    ])
+
+    order      = np.argsort(all_times)
+    all_times  = all_times[order]
+    all_labels = all_labels[order]
+
+    refrac_spon2spon = []
+    refrac_spon2trig = []
+
+    for down_idx in Spontaneous_DOWN:
+        t_off = time_s[down_idx]
+
+        # erster UP nach dem Off
+        j = np.searchsorted(all_times, t_off + 1e-9)
+        if j >= all_times.size:
+            continue
+
+        lab = all_labels[j]
+
+        # wenn das erste Event ein associated UP ist → diesen SPONT-Off ignorieren
+        if lab == 2:
+            continue
+
+        dt_ref = all_times[j] - t_off
+        if dt_ref < 0:
+            continue
+
+        if lab == 0:
+            refrac_spon2spon.append(dt_ref)
+        elif lab == 1:
+            refrac_spon2trig.append(dt_ref)
+
+    return np.asarray(refrac_spon2spon, float), np.asarray(refrac_spon2trig, float)

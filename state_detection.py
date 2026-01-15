@@ -133,11 +133,20 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
             "UP_start_i": np.array([], dtype=int),
             "DOWN_start_i": np.array([], dtype=int),
             "up_state_binary": np.zeros_like(time_s, dtype=bool),
+             "t_feat": t_feat,
+            "dt_feat": dt_feat,
+            "Spontaneous_UP_raw": Spont_UP_raw,
+            "Spontaneous_DOWN_raw": Spont_DN_raw,
+            "Pulse_triggered_UP_raw": Trig_UP_raw,
+            "Pulse_triggered_DOWN_raw": Trig_DN_raw,
+            "Pulse_associated_UP_raw": Assoc_UP_raw,
+            "Pulse_associated_DOWN_raw": Assoc_DN_raw,
         }
 
     # ---------- 1) Bandpower aus Spektrogramm ----------
     freqs = Spect_dat[2]
     S = np.asarray(Spect_dat[0], float)  # dB
+    t_feat = np.asarray(Spect_dat[1], float) 
 
     # 
     f_lo, f_hi = 0.5, 4.0
@@ -407,8 +416,19 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     print("freqs min/max/df:", freqs.min(), freqs.max(), np.median(np.diff(freqs)))
     print("band bins:", band_mask.sum(), "f_lo/f_hi:", f_lo, f_hi)
     print("effective band:", freqs[band_mask].min(), freqs[band_mask].max())
+    # Feature -> Raw
+    UP_start_raw   = np.asarray(np.round(t_feat[UP_start_i]   / dt), int) if UP_start_i.size else np.array([], int)
+    DOWN_start_raw = np.asarray(np.round(t_feat[DOWN_start_i] / dt), int) if DOWN_start_i.size else np.array([], int)
 
+    # und ebenso für die Kategorien:
+    Spont_UP_raw = np.asarray(np.round(t_feat[Spontaneous_UP] / dt), int) if Spontaneous_UP.size else np.array([], int)
+    Spont_DN_raw = np.asarray(np.round(t_feat[Spontaneous_DOWN] / dt), int) if Spontaneous_DOWN.size else np.array([], int)
+    Trig_UP_raw  = np.asarray(np.round(t_feat[Pulse_triggered_UP] / dt), int) if Pulse_triggered_UP.size else np.array([], int)
+    Trig_DN_raw  = np.asarray(np.round(t_feat[Pulse_triggered_DOWN] / dt), int) if Pulse_triggered_DOWN.size else np.array([], int)
+    Assoc_UP_raw = np.asarray(np.round(t_feat[Pulse_associated_UP] / dt), int) if Pulse_associated_UP.size else np.array([], int)
+    Assoc_DN_raw = np.asarray(np.round(t_feat[Pulse_associated_DOWN] / dt), int) if Pulse_associated_DOWN.size else np.array([], int)
 
+  
     return {
         "Pulse_triggered_UP": Pulse_triggered_UP,
         "Pulse_triggered_DOWN": Pulse_triggered_DOWN,
@@ -433,6 +453,14 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         "UP_start_i": UP_start_i,
         "DOWN_start_i": DOWN_start_i,
         "up_state_binary": up_state_binary,
+        "t_feat": t_feat,
+        "dt_feat": dt_feat,
+        "Spontaneous_UP_raw": Spont_UP_raw,
+        "Spontaneous_DOWN_raw": Spont_DN_raw,
+        "Pulse_triggered_UP_raw": Trig_UP_raw,
+        "Pulse_triggered_DOWN_raw": Trig_DN_raw,
+        "Pulse_associated_UP_raw": Assoc_UP_raw,
+        "Pulse_associated_DOWN_raw": Assoc_DN_raw,
     }
 
 

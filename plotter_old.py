@@ -284,4 +284,9 @@ def plot_upstate_amplitude_blocks_colored(main_channel, UP_start_i, DOWN_start_i
 
     return dict(zip(block_labels, block_means))
 
+def _blank_ax(ax, msg=None):
+    ax.axis("off")
+    if msg:
+        ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes, alpha=0.4)
+
 
