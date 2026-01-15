@@ -140,7 +140,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     S = np.asarray(Spect_dat[0], float)  # dB
 
     # 
-    f_lo, f_hi = 8, 16
+    f_lo, f_hi = 0.5, 4.0
     band_mask = (freqs >= f_lo) & (freqs <= f_hi)
     if band_mask.sum() > 0:
         print("[BAND-EFF]", freqs[band_mask].min(), freqs[band_mask].max(), "bins", band_mask.sum())
@@ -153,7 +153,9 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     linear = 10 ** (S_clip / 10.0)
 
     # robuster als Summe: median reduziert “hot bins”
-    Total_power = np.mean(linear, axis=0)
+    S_band = S[band_mask, :]          # S ist in dB
+    Total_power = np.mean(S_band, axis=0)  # jetzt direkt dB-Mittelwert
+
 
     print("Total_power stats:", np.min(Total_power), np.max(Total_power), np.isnan(Total_power).sum())
 
@@ -328,7 +330,6 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
             Ctrl_DOWN[i] = Ctrl_UP[i] + int(Pulse_triggered_DOWN[i] - Pulse_triggered_UP[i])
 
     #  9) Peaks / aligned arrays
-    # (dein Originalcode bleibt weitgehend, aber robust gegen 0 Events)
     Spon_UP_array = np.zeros((len(Spontaneous_UP), align_len))
     Spon_UP_peak_aligned_array = np.full((len(Spontaneous_UP), align_len), np.nan)
     UP_Time = np.arange(align_len) * dt - align_pre * dt
