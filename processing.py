@@ -216,7 +216,7 @@ def _ensure_main_channel(LFP_array, preferred_idx=10):
     num_ch = int(LFP_array.shape[0])
     if isinstance(preferred_idx, int) and 0 <= preferred_idx < num_ch:
         return LFP_array[preferred_idx, :], preferred_idx
-    return LFP_array[0, :], 0
+    return LFP_array[0, :], 10
 
 
 def _ensure_seconds(ts, time_ref, fs_xdat=DEFAULT_FS_XDAT):
@@ -224,7 +224,7 @@ def _ensure_seconds(ts, time_ref, fs_xdat=DEFAULT_FS_XDAT):
     Bringt ts (Pulszeiten) in die gleiche Einheit wie time_ref (Sekunden).
     Erkennt 'zu große' Werte heuristisch und teilt dann durch fs_xdat.
     """
-    import numpy as np
+
     if ts is None: 
         return None
     ts = np.asarray(ts, float)
@@ -238,7 +238,7 @@ def _ensure_seconds(ts, time_ref, fs_xdat=DEFAULT_FS_XDAT):
 
 
 def _safe_crop_to_pulses(time_s, LFP_array, p1, p2, pad=0.5):
-    import numpy as np
+
     t = np.asarray(time_s, float)
     if t.size == 0:
         print("[CROP] skip: empty time_s")

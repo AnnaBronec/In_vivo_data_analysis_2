@@ -23,7 +23,7 @@ from preprocessing import downsampling, filtering, get_main_channel, pre_post_co
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import ttest_ind
 from scipy.signal import welch
-
+from scipy.ndimage import gaussian_filter
 
 
 def _save_svg(fig, hint, out_dir=None, dpi=200):
@@ -37,7 +37,7 @@ def _save_svg(fig, hint, out_dir=None, dpi=200):
 
 
 def compute_peak_aligned_segments(
-    up_indices, LFP_array, dt,
+    up_indices, time_s, LFP_array, dt,
     b_lp, a_lp, b_hp, a_hp,
     align_pre, align_post, align_len,
     *,
@@ -54,8 +54,13 @@ def compute_peak_aligned_segments(
     peak_indices = []
 
     for i, up in enumerate(up_indices):
-        start_idx = up + int(offset_start / dt)
-        end_idx   = up + int(offset_end   / dt)
+        # Feature-index -> Zeit (s)
+        t_up = time_s[int(up)]
+
+        # Zeit -> Rohsamples
+        start_idx = int((t_up + offset_start) / dt)
+        end_idx   = int((t_up + offset_end) / dt)
+
         if start_idx < 0 or end_idx <= start_idx or end_idx > LFP_array.shape[1]:
             continue
 
@@ -101,7 +106,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                     align_pre, align_post, align_len):
 
 
-    # ---------- helpers ----------
+    # helpers 
     def _empty_states(Total_power, time_s, dt, align_pre, align_len):
         time_s = np.asarray(time_s)
         return {
@@ -135,19 +140,24 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     S = np.asarray(Spect_dat[0], float)  # dB
 
     # 
-    f_lo, f_hi = 0.5, 30.0
+    f_lo, f_hi = 8, 16
     band_mask = (freqs >= f_lo) & (freqs <= f_hi)
+    if band_mask.sum() > 0:
+        print("[BAND-EFF]", freqs[band_mask].min(), freqs[band_mask].max(), "bins", band_mask.sum())
+    else:
+        print("[BAND-EFF] EMPTY!")
+
 
     # dB -> linear, stabil clippen
     S_clip = np.clip(S[band_mask, :], -120, 30)
     linear = 10 ** (S_clip / 10.0)
 
     # robuster als Summe: median reduziert “hot bins”
-    Total_power = np.median(linear, axis=0)
+    Total_power = np.mean(linear, axis=0)
 
     print("Total_power stats:", np.min(Total_power), np.max(Total_power), np.isnan(Total_power).sum())
 
-    # ---------- 2) Smooth ----------
+    # 2) Smooth 
     Total_power_smooth = gaussian_filter1d(Total_power, sigma=2)
 
         # robust z-score auf Feature-Achse
@@ -157,7 +167,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     z = (Total_power_smooth - med) / robust_std
 
-    k_hi = 4.0   # Start-Schwelle (strenger)
+    k_hi = 3.0   # Start-Schwelle (strenger)
     k_lo = 2.5   # Halte-Schwelle (lockerer)
 
     hi = z > k_hi
@@ -174,7 +184,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         up_state_binary[i] = active
 
 
-    # ---------- 4) Gap-closing: ACHTUNG Zeitauflösung! ----------
+    # 4) Gap-closing: ACHTUNG Zeitauflösung! 
     # dt für up_state_binary muss zur Feature-Zeitachse passen:
     time_s = np.asarray(time_s)
     if time_s.size >= 2 and np.all(np.isfinite(time_s)):
@@ -182,7 +192,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     else:
         dt_feat = float(dt)  # fallback
 
-    min_gap_s = 0.2
+    min_gap_s = 0.5
     min_gap = max(1, int(round(min_gap_s / dt_feat)))
 
     binary = up_state_binary.astype(np.int8)
@@ -207,7 +217,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     up_state_binary = binary.astype(bool)
 
-    # ---------- 5) Transitions + Dauerfilter ----------
+    # 5) Transitions + Dauerfilter 
     up_transitions = np.where(np.diff(up_state_binary.astype(int)) == 1)[0]
     down_transitions = np.where(np.diff(up_state_binary.astype(int)) == -1)[0]
 
@@ -216,7 +226,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     if up_transitions.size > down_transitions.size:
         up_transitions = up_transitions[:-1]
 
-    min_up_len_s = 0.5
+    min_up_len_s = 0.7
     if not up_transitions.size or not down_transitions.size:
         UP_start_i = np.array([], dtype=int)
         DOWN_start_i = np.array([], dtype=int)
@@ -224,7 +234,6 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         filtered_UP = []
         filtered_DOWN = []
         for u, d in zip(up_transitions, down_transitions):
-            # time_s passt hier zur Feature-Achse
             duration = time_s[d] - time_s[u]
             if duration >= min_up_len_s:
                 filtered_UP.append(u)
@@ -233,7 +242,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         UP_start_i = np.array(filtered_UP, dtype=int)
         DOWN_start_i = np.array(filtered_DOWN, dtype=int)
 
-    # ---------- 6) NO-UP Gate ganz am Ende ----------
+    # 6) NO-UP Gate
     min_up_fraction = 0.03
     min_up_onsets = 2
 
@@ -246,7 +255,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         print("[STATES] no reliable UP states -> return empty dict")
         return _empty_states(Total_power, time_s, dt, align_pre, align_len)
 
-    # ---------- 7) Puls-Logik ----------
+    # 7) Puls-Logik 
     Pulse_times_array = np.sort(np.concatenate([pulse_times_1, pulse_times_2])) if (len(pulse_times_1) or len(pulse_times_2)) else np.array([])
 
     Pulse_triggered_array = [[1, 0]]
@@ -296,7 +305,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         Spontaneous_UP = Spontaneous_UP[:-1]
         Spontaneous_DOWN = Spontaneous_DOWN[:len(Spontaneous_UP)]
 
-    # ---------- 8) Dauer/Stats ----------
+    # 8) Dauer/Stats
     if len(Spontaneous_UP) > 1 and len(Pulse_triggered_UP) > 1:
         Duration_Pulse_Triggered = time_s[Pulse_triggered_DOWN] - time_s[Pulse_triggered_UP]
         Duration_Spontaneous = time_s[Spontaneous_DOWN] - time_s[Spontaneous_UP]
@@ -318,7 +327,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
             Ctrl_UP[i] = random.randint(0, len(time_s) - int(4 / dt_feat))
             Ctrl_DOWN[i] = Ctrl_UP[i] + int(Pulse_triggered_DOWN[i] - Pulse_triggered_UP[i])
 
-    # ---------- 9) Peaks / aligned arrays ----------
+    #  9) Peaks / aligned arrays
     # (dein Originalcode bleibt weitgehend, aber robust gegen 0 Events)
     Spon_UP_array = np.zeros((len(Spontaneous_UP), align_len))
     Spon_UP_peak_aligned_array = np.full((len(Spontaneous_UP), align_len), np.nan)
@@ -326,14 +335,14 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     Spon_Peaks = []
 
     for i_Spon in range(len(Spontaneous_UP)):
-        start_idx = Spontaneous_UP[i_Spon] - int(0.75 / dt_feat)
-        end_idx = Spontaneous_UP[i_Spon] + int(2.0 / dt_feat)
+        # Feature-Index → Zeit (s)
+        t_up = time_s[Spontaneous_UP[i_Spon]]
 
-        # Indexe beziehen sich hier auf LFP_array Zeitachse => dt ist Rohsignal-dt!
-        # ABER: deine UP_start_i Indizes sind Feature-Bins, nicht Rohsamples.
-        # Wenn UP_start_i auf Feature-Bins basiert, darfst du NICHT direkt in LFP_array indizieren.
-        # => deshalb: Falls du hier bisher "zufällig" gut kamst, war time_s vermutlich Rohzeit.
-        # Minimal drop-in: wir lassen es wie es war, aber schützen Out-of-bounds.
+        # Zeit → Rohsample-Index
+        start_idx = int((t_up - 0.75) / dt)
+        end_idx   = int((t_up + 2.0) / dt)
+
+
         start_idx = int(start_idx)
         end_idx = int(end_idx)
 
@@ -356,13 +365,24 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
         peaks, _ = find_peaks(
             V_filt[lo:hi],
-            height=np.round(np.nanstd(V_filt), 3),
-            distance=150
+            distance = max(1, int(0.1 / dt)),              # 100 ms
+            height   = 2.0 * np.nanstd(V_filt)               # etwas strenger
+            # oder statt height:
+            # prominence = 2.0 * np.nanstd(V_filt)
         )
         peaks += lo
 
         if len(peaks) > 0:
             peak_global = start_idx + peaks[0]
+            if i_Spon < 5:
+                print("[PEAKCHK]",
+                    "t_up", float(t_up),
+                    "start_idx", int(start_idx),
+                    "peak_rel", int(peaks[0]),
+                    "peak_global", int(peak_global),
+                    "n_time", int(LFP_array.shape[1]),
+                    "in_bounds", 0 <= peak_global < LFP_array.shape[1])
+
             Spon_Peaks.append(float(peak_global))
 
             a0 = peaks[0] - align_pre
@@ -376,13 +396,17 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     # Trigger peaks via helper
     Trig_Peaks, Trig_UP_peak_aligned_array = compute_peak_aligned_segments(
-        Pulse_triggered_UP, LFP_array, dt,
+        Pulse_triggered_UP, time_s, LFP_array, dt,
         b_lp, a_lp, b_hp, a_hp,
         align_pre, align_post, align_len,
         offset_start=0.2, offset_end=2.0,
         search_start_s=0.2, search_end_s=2.0,
         min_peak_spacing_s=0.1
     )
+    print("freqs min/max/df:", freqs.min(), freqs.max(), np.median(np.diff(freqs)))
+    print("band bins:", band_mask.sum(), "f_lo/f_hi:", f_lo, f_hi)
+    print("effective band:", freqs[band_mask].min(), freqs[band_mask].max())
+
 
     return {
         "Pulse_triggered_UP": Pulse_triggered_UP,
@@ -410,24 +434,6 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         "up_state_binary": up_state_binary,
     }
 
-
-
-# def Generate_CSD_mean(peaks_list, signal_array, dt):
-#     all_csd = []
-#     for i, peak in enumerate(peaks_list):
-#         if not np.isnan(peak):
-#             start = int(peak - int(0.5 / dt))
-#             end = int(peak + int(0.5 / dt))
-#             if start >= 1 and end <= signal_array.shape[1] - 1:
-#                 segment = signal_array[:, start:end]
-#                 CSD_out = CSD_calc(segment, dt)
-#                 all_csd.append(CSD_out)
-
-#     if len(all_csd) > 0:
-#         return np.nanmean(np.stack(all_csd), axis=0)
-#     else:
-#         print("Kein CSD berechnet – Rückgabe: Dummy mit NaNs")
-#         return np.full((signal_array.shape[0], int(1 / dt)), np.nan)
 
 def Generate_CSD_mean_from_onsets(
     onsets,
@@ -493,7 +499,7 @@ def Generate_CSD_mean_from_onsets(
         print("[CSD] kein gültiges Event -> gebe None zurück")
         return None
 
-    # --- NEU: alle CSDs auf gleiche Zeitlänge bringen ---
+    # alle CSDs auf gleiche Zeitlänge bringen ---
     try:
         min_T = min(c.shape[1] for c in csd_segments)
     except Exception:
@@ -510,43 +516,6 @@ def Generate_CSD_mean_from_onsets(
     print(f"[CSD] {len(csd_segments)} Events, mean CSD shape={csd_mean.shape}")
     return csd_mean
 
-
-#
-#def plot_CSD_comparison(CSD_spont, CSD_trig, dt, cmap="bwr",
-#                        save=False, hint="CSD_spont_vs_trig",
-#                        out_dir=None, show=True, close=False):
-#    fig, axes = plt.subplots(1, 2, figsize=(12, 6), sharey=True)#
-#
-#    im1 = axes[0].imshow(CSD_spont, aspect="auto", cmap=cmap, origin="lower",
-#                         extent=[0, CSD_spont.shape[1]*dt, 0, CSD_spont.shape[0]])
-#    axes[0].set_title("Spontaneous UP — CSD")
-#    axes[0].set_xlabel("Time (s)")
-#    axes[0].set_ylabel("Channel depth")
-#
-##    im2 = axes[1].imshow(CSD_trig, aspect="auto", cmap=cmap, origin="lower",
-          #               extent=[0, CSD_trig.shape[1]*dt, 0, CSD_trig.shape[0]])
-#    axes[1].set_title("Pulse-triggered UP — CSD")
-##    axes[1].set_xlabel("Time (s)")##
-#
-#    # gemeinsame Colorbar rechts außen
-#    fig.colorbar(im1, ax=axes, shrink=0.9, label="CSD (a.u.)",
-#                 location="right", anchor=(0, 0.5))
-##    fig.tight_layout(rect=[0, 0, 0.93, 1])##
-#
- #   if save:
-#        _save_svg(fig, hint, out_dir=out_dir)#
-
-#    if show:
-#        plt.draw()
-#        plt.pause(0.001)   # winziger Event-Loop-Tick, Fenster wird sicher angezeigt
-
- #   if close:
-   #     plt.close(fig)
-#
- #   return fig
-
-
-from scipy.ndimage import gaussian_filter
 
 def plot_CSD_comparison(CSD_spont, CSD_trig, dt, dz_um=50.0,
                               sigma_ch=0.8, sigma_t=0.4,  # Glättung: Kanäle, Zeit
@@ -586,24 +555,6 @@ def plot_CSD_comparison(CSD_spont, CSD_trig, dt, dz_um=50.0,
     cbar = fig.colorbar(im, ax=axes, shrink=0.9, label="CSD (a.u.)")
     return fig
 
-
-# def Spectrum(V_win):
-# 	LFP_win = V_win - np.mean(V_win)
-# 	# Windowing if you want
-# 	w = np.hanning(len(V_win))
-# 	LFP_win = w * LFP_win
-# 	# Calculate power spectrum for window
-# 	Fs = srate
-# 	N = len(LFP_win)
-# 	xdft = np.fft.fft(LFP_win)
-# 	xdft = xdft[0:int((N / 2) + 1)]
-# 	psdx = (1 / (Fs * N)) * np.abs(xdft) ** 2
-# 	freq = np.arange(0, (Fs / 2) + Fs / N, Fs / N)
-# 	Pow = psdx
-# 	Pow = np.zeros((501, 1))
-# 	for j in range(0, 200):
-# 		Pow[j] = psdx[j]
-# 	return Pow, freq
 
 
 def extract_upstate_windows(UP_indices, LFP_array, dt, window_s):

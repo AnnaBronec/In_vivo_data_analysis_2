@@ -15,7 +15,7 @@ dt = 5e-3
 srate=1/dt
 num_frex = 20
 range_cycles = [1  ,8]
-min_freq = 0.01
+min_freq = 0.5
 max_freq = 10
 frex = np.linspace(min_freq,max_freq,num = num_frex)
 t_wav  = np.arange(-2,(2-(1/srate)),(1/srate))

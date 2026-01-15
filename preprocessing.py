@@ -47,8 +47,6 @@ def downsampling(downsample_factor: int, df, num_channels):
     return (time_s, dt, LFP_array, pulse_times_1, pulse_times_2)
 
 
-import numpy as np
-
 def downsampling_old(
     downsample_factor: int,
     df,
@@ -58,8 +56,7 @@ def downsampling_old(
     snap_pulses: bool = True
 ):
     """
-    Downsampling per Zeilenselektion (df.iloc[::factor]) – wie in deiner alten Version.
-    Erwartet DataFrame mit:
+    Downsampling per Zeilenselektion (df.iloc[::factor])
       - 'timesamples' (Sekunden, monoton)
       - 'pri_0'..'pri_{N-1}'
       - optional: 'din_1', 'din_2' (altes Format)
@@ -137,7 +134,7 @@ def get_main_channel(downsample_factor: int, df, num_channels):
     # Downsampling: jede n-te Zeile behalten
     df_down = df.iloc[::downsample_factor].reset_index(drop=True)
     time_s = df_down['timesamples'].to_numpy() 
-    main_channel = df_down["pri_10"].to_numpy()
+    main_channel = df_down["_10"].to_numpy()
     main_channel.shape == time_s.shape
     main_channel = main_channel-np.mean(main_channel)
 

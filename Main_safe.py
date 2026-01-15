@@ -9,13 +9,12 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
-
+from scipy import stats
 from matplotlib.colors import SymLogNorm, TwoSlopeNorm
 import gc
 from scipy.ndimage import gaussian_filter
 from sklearn.decomposition import PCA
-
-
+from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import TwoSlopeNorm, SymLogNorm
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Patch
@@ -42,6 +41,7 @@ from plotter import (
     CSD_compare_side_by_side_ax,
 )
 
+import os, glob
 import sys, os
 from datetime import datetime
 
@@ -109,14 +109,12 @@ if (not is_merged_run) and (not has_explicit_filename) and parts_dir.exists() an
         load_parts_to_array_streaming(BASE_PATH, ds_factor=DOWNSAMPLE_FACTOR)
     lfp_meta = {"source": "parts-streaming"}
 
-    # wichtig: KEIN riesiges DataFrame bauen
     LFP_df = None
 
     log(f"MODE: streaming={ (not is_merged_run) and (not has_explicit_filename) } parts_dir={parts_dir}")
    
 
 else:
-    from loader_old import load_LFP_new
     LFP_df, chan_cols, lfp_meta = load_LFP_new(BASE_PATH, LFP_FILENAME)
     time_s = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
     LFP_array = LFP_df[chan_cols].to_numpy(dtype=np.float32).T
@@ -134,24 +132,22 @@ if LFP_df is not None:
     time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
 
     chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
-    ...
+    
     LFP_df_ds = pd.DataFrame({"timesamples": time_full})
     for i, col in enumerate(chan_cols):
         LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
     NUM_CHANNELS = len(chan_cols)
 else:
-    # streaming-Weg: wir haben schon Array-Form
     time_full = time_s
     NUM_CHANNELS = LFP_array.shape[0]
-    chan_cols = chan_cols  # die kamen aus load_parts_to_array_streaming
-    # und wir können LFP_df_ds ganz weglassen, weil _ds_fun ja schon auf Array arbeitet
+    chan_cols = chan_cols  
 
 CALIB_MODE = "counts"   # "counts" | "volts" | "uV"
 ADC_BITS   = 16         # bit
 ADC_VPP    = 10.0       # Peak-to-Peak des ADC in Volt 
 PREAMP_GAIN = 1000.0    # Gesamt-Gain vor dem ADC. Falls kanal-spezifisch, unten 'PER_CH_GAIN' nutzen.
 
-# optional: kanal-spezifische Gains (Original-Spaltennamen nutzen, vor 'pri_*' Umbenennung)
+
 PER_CH_GAIN = {
     # "CSC1_values": 2000.0,
     # "CSC2_values": 1000.0,
@@ -246,12 +242,12 @@ if not FROM_STREAM:
 
     # 3) Sortierte Reihenfolge (flach -> tief). Wenn du tief->flach willst: am Ende [::-1].
     order_idx = sorted(range(len(chan_cols_raw)), key=lambda i: _key_num(chan_cols_raw[i]))
-    # optional: flippen, falls benötigt
-    FLIP_DEPTH = False   # <- bei Bedarf True
+    FLIP_DEPTH = False   # <- bei Bedarf flippen
     if FLIP_DEPTH:
         order_idx = order_idx[::-1]
 
-    
+    chan_cols = [chan_cols_raw[i] for i in order_idx]
+
     LFP_df_ds = pd.DataFrame({"timesamples": time_full})
     for i, col in enumerate(chan_cols):
         LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
@@ -341,10 +337,6 @@ pulse_times_1 = _ensure_seconds(pulse_times_1, time_s, DEFAULT_FS_XDAT)
 pulse_times_2 = _ensure_seconds(pulse_times_2, time_s, DEFAULT_FS_XDAT)
 
 
-
-
-
-
 # vor dem Crop:
 if ((pulse_times_1 is None or len(pulse_times_1)==0) and
     (pulse_times_2 is None or len(pulse_times_2)==0)):
@@ -357,21 +349,12 @@ else:
 
 
 
-
-
-
-
-# Anwenden (benutze NUR die normalisierten pulse_times_1/2 – NICHT *_full):
-time_s, LFP_array, pulse_times_1, pulse_times_2 = _safe_crop_to_pulses(
-    time_s, LFP_array, pulse_times_1, pulse_times_2, pad=0.5
-)
-
 log(f"Crop done: time={time_s[0]:.3f}->{time_s[-1]:.3f}, shape={LFP_array.shape}, p1={len(pulse_times_1) if pulse_times_1 is not None else 0}, p2={len(pulse_times_2) if pulse_times_2 is not None else 0}")
 
-# --- main_channel robust auswählen (nach evtl. Cropping) ---
-main_channel, ch_idx_used = _ensure_main_channel(LFP_array, preferred_idx=10)
+# --- main_channel robust auswählen 
+main_channel, ch_idx_used = _ensure_main_channel(LFP_array, preferred_idx=9)
 
-# --- Für HTML: Main-Channel in µV (ohne die Analyse anzurühren) ---
+# --- Für HTML: Main-Channel in µV 
 main_channel_uV = None
 if HTML_IN_uV:
     # welches Gain für diesen physikalischen Kanal?
@@ -389,8 +372,6 @@ if HTML_IN_uV:
         main_channel_uV = main_channel.copy()
 
 
-
-
 # --- XDAT-Erkennung (heuristisch) ---
 def _is_xdat_format():
     """
@@ -398,7 +379,6 @@ def _is_xdat_format():
     z.B. 'ch00', 'ch1', 'ch17' etc. oder wenn der Dateipfad 'xdat' enthält.
     Nutzt die *originalen* Spaltennamen vor dem pri_* Mapping.
     """
-    import re
     # 1) Dateipfad-/Dateiname-Heuristik
     try:
         path_str = str(BASE_PATH).lower() + " " + str(LFP_FILENAME).lower()
@@ -421,9 +401,9 @@ def _is_xdat_format():
     return (len(cols) >= 8 and hits / max(1, len(cols)) >= 0.6)
 
 
-# ==== Feste Kanalwahl für .xdat: nur pri_1 .. pri_17 ====
+# ==== Feste Kanalwahl für .xdat
 if _is_xdat_format():
-    fixed_idx = [i for i in range(1, 15) if i < LFP_array.shape[0]]  # pri_1..pri_17
+    fixed_idx = [i for i in range(1, 15) if i < LFP_array.shape[0]]  # pri_1..
     good_idx = fixed_idx[:]  # überschreibe Fallback
     print(f"[XDAT] GOOD_IDX override -> {good_idx} (n={len(good_idx)})")
 else:
@@ -509,24 +489,12 @@ else:
 
 
 
-try:
-    _save_all_channels_svg_from_array(
-        time_s, LFP_array, [f"pri_{i}" for i in range(NUM_CHANNELS)],
-        os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_DS.svg"),
-        max_points=40000
-    )
-except Exception as e:
-    print("[ALL-CH][DS] skip:", e)
 
 
 # --- Init vor Spektren/States, damit Namen garantiert existieren ---
 freqs = spont_mean = pulse_mean = p_vals = None
 
-try:
-    res = compare_spectra(pulse_windows, spont_windows, dt, ignore_start_s=0.3)
-    freqs, spont_mean, pulse_mean, p_vals = res
-except Exception as e:
-    print("[WARN] spectra compare skipped:", e)
+
 
 pulse_times_1 = _clip_events_to_bounds(pulse_times_1, time_s, align_pre_s, align_post_s)
 pulse_times_2 = _clip_events_to_bounds(pulse_times_2, time_s, align_pre_s, align_post_s)
@@ -535,13 +503,66 @@ pulse_times_2 = _clip_events_to_bounds(pulse_times_2, time_s, align_pre_s, align
 log(f"Calling classify_states: len(time_s)={len(time_s)}, main_len={len(main_channel)}, dt={dt}, p1={len(pulse_times_1) if pulse_times_1 is not None else 0}, p2={len(pulse_times_2) if pulse_times_2 is not None else 0}")
 
 
-# --- classify_states robust aufrufen ---
 try:
     Up = classify_states(
         Spect_dat, time_s, pulse_times_1, pulse_times_2, dt,
         main_channel, LFP_array, b_lp, a_lp, b_hp, a_hp,
         align_pre, align_post, align_len
     )
+
+    # --- ab hier: Peaks sauber machen (nach classify_states) ---
+    Spontaneous_UP      = np.asarray(Up.get("Spontaneous_UP", []), dtype=int)
+    Pulse_triggered_UP  = np.asarray(Up.get("Pulse_triggered_UP", []), dtype=int)
+
+    Spon_Peaks_raw = Up.get("Spon_Peaks", None)
+    Trig_Peaks_raw = Up.get("Trig_Peaks", None)
+
+    n_sig = int(len(main_channel))  # oder: LFP_array.shape[1] / len(time_s)
+
+    def _as_valid_idx(arr, n):
+        if arr is None:
+            return None
+        a = np.asarray(arr)
+        # wenn float -> sehr wahrscheinlich Sekundenwerte, dann NICHT als Index benutzen
+        if np.issubdtype(a.dtype, np.floating):
+            return None
+        a = a.astype(int, copy=False)
+        a = a[(a >= 0) & (a < n)]
+        return a
+
+    Spon_Peaks = _as_valid_idx(Spon_Peaks_raw, n_sig)
+    Trig_Peaks = _as_valid_idx(Trig_Peaks_raw, n_sig)
+
+    # Fallback: nimm Onsets
+    if Spon_Peaks is None or Spon_Peaks.size == 0:
+        Spon_Peaks = Spontaneous_UP.copy()
+    if Trig_Peaks is None or Trig_Peaks.size == 0:
+        Trig_Peaks = Pulse_triggered_UP.copy()
+
+    # Wichtig: zurück ins Up dict schreiben, damit ALLES downstream konsistent ist
+    Up["Spon_Peaks"] = Spon_Peaks
+    Up["Trig_Peaks"] = Trig_Peaks
+
+#except Exception as e:
+
+
+
+
+
+
+    print("[DEBUG] Up keys:", sorted(list(Up.keys()))[:50])
+    print("[DEBUG] aligned arrays:",
+        type(Up.get("Trig_UP_peak_aligned_array")),
+        getattr(Up.get("Trig_UP_peak_aligned_array"), "shape", None),
+        type(Up.get("Spon_UP_peak_aligned_array")),
+        getattr(Up.get("Spon_UP_peak_aligned_array"), "shape", None))
+    print("[DBG] peaks dtype:", Up["Spon_Peaks"].dtype, Up["Trig_Peaks"].dtype)
+    print("[DBG] peaks min/max:", 
+        (Up["Spon_Peaks"].min() if Up["Spon_Peaks"].size else None),
+        (Up["Spon_Peaks"].max() if Up["Spon_Peaks"].size else None))
+    print("[DBG] n_sig:", n_sig, "align_len:", align_len)
+
+
 
 except IndexError as e:
     log(f"classify_states FAILED: {e}")
@@ -582,7 +603,43 @@ Pulse_triggered_UP    = Up.get("Pulse_triggered_UP",    np.array([], int))
 Pulse_triggered_DOWN  = Up.get("Pulse_triggered_DOWN",  np.array([], int))
 Pulse_associated_UP   = Up.get("Pulse_associated_UP",   np.array([], int))
 Pulse_associated_DOWN = Up.get("Pulse_associated_DOWN", np.array([], int))
-Spon_Peaks            = Up.get("Spon_Peaks",            np.array([], float))
+#Spon_Peaks            = Up.get("Spon_Peaks",            np.array([], float))
+# Peaks robust NEU ableiten: nimm einfach die Onsets als Peak-Proxy
+# Spon_Peaks = np.asarray(Spontaneous_UP, dtype=int)
+# Trig_Peaks = np.asarray(Pulse_triggered_UP, dtype=int)
+
+
+Spon_Peaks_raw = Up.get("Spon_Peaks", None)
+Trig_Peaks_raw = Up.get("Trig_Peaks", None)
+
+def _as_valid_idx(arr, n):
+    if arr is None:
+        return None
+    a = np.asarray(arr)
+    if np.issubdtype(a.dtype, np.floating):
+        return None
+    a = a.astype(int, copy=False)
+    a = a[(a >= 0) & (a < n)]
+    return a
+
+Spon_Peaks = _as_valid_idx(Spon_Peaks_raw, LFP_array_good.shape[1])
+Trig_Peaks = _as_valid_idx(Trig_Peaks_raw, LFP_array_good.shape[1])
+
+if Spon_Peaks is None or Spon_Peaks.size == 0:
+    Spon_Peaks = np.asarray(Spontaneous_UP, int)
+if Trig_Peaks is None or Trig_Peaks.size == 0:
+    Trig_Peaks = np.asarray(Pulse_triggered_UP, int)
+
+
+Total_power           = Up.get("Total_power", None)
+up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", None))
+
+
+# Spon_Peaks = Up.get("Spon_Peaks", None)
+# Trig_Peaks = Up.get("Trig_Peaks", None)
+# if Spon_Peaks is None: Spon_Peaks = np.asarray(Spontaneous_UP, int)
+# if Trig_Peaks is None: Trig_Peaks = np.asarray(Pulse_triggered_UP, int)
+
 Total_power           = Up.get("Total_power",           None)
 up_state_binary       = Up.get("up_state_binary ", Up.get("up_state_binary", None))
 
@@ -590,7 +647,7 @@ print("[COUNTS] sponUP:", len(Spontaneous_UP), " trigUP:", len(Pulse_triggered_U
 log(f"States: spon={len(Spontaneous_UP)}, trig={len(Pulse_triggered_UP)}, assoc={len(Pulse_associated_UP)}")
 
 
-# --- Refraktärzeiten (Ende eines UP bis Beginn des nächsten UP) ---
+# Refraktärzeiten (Ende eines UP bis Beginn des nächsten UP) 
 refrac_spont = compute_refractory_period(
     Spontaneous_UP, Spontaneous_DOWN, time_s
 )
@@ -706,9 +763,6 @@ export_interactive_lfp_html(
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})")
 )
 
-
-
-
 # Extras für Plots
 pulse_windows = extract_upstate_windows(Pulse_triggered_UP, main_channel[None, :], dt, window_s=1.0)
 spont_windows = extract_upstate_windows(Spontaneous_UP, main_channel[None, :], dt, window_s=1.0)
@@ -719,6 +773,7 @@ try:
     )
 except Exception as e:
     print("[WARN] spectra compare skipped:", e)
+
 
 
 n_time = LFP_array_good.shape[1]
@@ -775,8 +830,12 @@ else:
 
 
 # 0) Event-Zahlen + Index-Gültigkeit
-_check_peak_indices("Spon_Peaks", Up.get("Spon_Peaks", []), LFP_array_good.shape[1])
-_check_peak_indices("Trig_Peaks", Up.get("Trig_Peaks", []), LFP_array_good.shape[1])
+# _check_peak_indices("Spon_Peaks", Up.get("Spon_Peaks", []), LFP_array_good.shape[1])
+# _check_peak_indices("Trig_Peaks", Up.get("Trig_Peaks", []), LFP_array_good.shape[1])
+
+_check_peak_indices("Spon_Peaks", Spon_Peaks, LFP_array_good.shape[1])
+_check_peak_indices("Trig_Peaks", Trig_Peaks, LFP_array_good.shape[1])
+
 
 # 1) CSD-Grundstats
 _nan_stats("CSD_spont", CSD_spont)
@@ -791,11 +850,6 @@ print(f"[DIAG] Counts: sponUP={len(Spontaneous_UP)}, trigUP={len(Pulse_triggered
 # 4) Gleiche Zeitfenster/Alignment sicher? (pre/post)
 print(f"[DIAG] align_pre={align_pre_s:.3f}s, align_post={align_post_s:.3f}s, dt={dt:.6f}s")
 
-# ====== ENDE DIAGNOSE ======
-
-
-
-
 
 # nach compare_spectra
 if freqs is not None and spont_mean is not None:
@@ -808,9 +862,13 @@ if freqs is not None and pulse_mean is not None:
 
 
 
-# 0) Event-Zahlen + Index-Gültigkeit
-_check_peak_indices("Spon_Peaks", Up.get("Spon_Peaks", []), LFP_array_good.shape[1])
-_check_peak_indices("Trig_Peaks", Up.get("Trig_Peaks", []), LFP_array_good.shape[1])
+# # 0) Event-Zahlen + Index-Gültigkeit
+# # _check_peak_indices("Spon_Peaks", Up.get("Spon_Peaks", []), LFP_array_good.shape[1])
+# # _check_peak_indices("Trig_Peaks", Up.get("Trig_Peaks", []), LFP_array_good.shape[1])
+
+# _check_peak_indices("Spon_Peaks", Spon_Peaks, LFP_array_good.shape[1])
+# _check_peak_indices("Trig_Peaks", Trig_Peaks, LFP_array_good.shape[1])
+
 
 # 1) CSD-Grundstats
 _nan_stats("CSD_spont", CSD_spont)
@@ -836,8 +894,7 @@ if len(pulse_times_2):
 
 
 def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
-    import os, glob
-    import pandas as pd
+
     
     FIELDNAMES = [
         "Parent","Experiment","Dauer [s]","Samplingrate [Hz]","Kanäle",
@@ -902,127 +959,6 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
 
 
 
-# Helper
-def _render_plotfunc_to_image(plot_func):
-    before = set(plt.get_fignums())
-    ret = plot_func()
-    after  = set(plt.get_fignums())
-    new_ids = sorted(after - before)
-    figs = []
-    if isinstance(ret, plt.Figure): figs = [ret]
-    elif new_ids:                    figs = [plt.figure(n) for n in new_ids]
-    elif plt.get_fignums():          figs = [plt.gcf()]
-    if not figs:
-        return [None]
-    images = []
-    for f in figs:
-        try:
-            f.canvas.draw()
-            w, h = f.canvas.get_width_height()
-            buf = np.frombuffer(f.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
-            images.append(buf.copy())
-        except Exception:
-            images.append(None)
-        finally:
-            plt.close(f)
-            del f
-    return images
-
-#Custom 1-Page Layout (1 groß, 2 klein, 1 groß) 
-def export_onepage_custom(
-    base_tag, save_dir,
-    *,  # alles weitere nur per Keyword
-    main_channel, time_s,
-    Spontaneous_UP, Spontaneous_DOWN,
-    Pulse_triggered_UP, Pulse_triggered_DOWN,
-    Pulse_associated_UP, Pulse_associated_DOWN,
-    pulse_times_1, pulse_times_2,
-    dt, freqs, spont_mean, pulse_mean, p_vals,
-    CSD_spont, CSD_trig, align_pre, align_post,
-    dz_um=100.0, cmap="turbo", sat_pct=90, interp="bilinear", contours=True
-):
-    out_pdf = os.path.join(save_dir, f"{base_tag}_ALL_PLOTS_STACKED.pdf")
-    with PdfPages(out_pdf) as pdf:
-        # große Seite
-        fig = plt.figure(figsize=(11.2, 12.0))
-        gs  = fig.add_gridspec(nrows=3, ncols=2,
-                               height_ratios=[1.2, 0.9, 1.3],
-                               hspace=0.35, wspace=0.25)
-
-        # TOP (span über 2 Spalten) – Main LFP + Labels
-        ax_top = fig.add_subplot(gs[0, :])
-        try:
-            plot_up_classification_ax(
-                main_channel, 
-                Spontaneous_UP, Spontaneous_DOWN,
-                Pulse_triggered_UP, Pulse_triggered_DOWN,
-                Pulse_associated_UP, Pulse_associated_DOWN,
-                time_s=time_s,
-                pulse_times_1=pulse_times_1_full,
-                pulse_times_2=pulse_times_2_full,
-                ax=ax_top,
-                title="Main channel with UP classification",
-            )
-        except Exception as e:
-            ax_top.text(0.5, 0.5, f"Plot error (UP class):\n{e}", ha="center", va="center", transform=ax_top.transAxes)
-            ax_top.set_axis_off()
-
-        # MIDDLE LEFT – UP durations
-        ax_midL = fig.add_subplot(gs[1, 0])
-        try:
-            upstate_duration_compare_ax(
-                Pulse_triggered_UP, Pulse_triggered_DOWN,
-                Spontaneous_UP,    Spontaneous_DOWN,
-                dt, ax=ax_midL
-            )
-        except Exception as e:
-            ax_midL.text(0.5, 0.5, f"Plot error (durations):\n{e}", ha="center", va="center", transform=ax_midL.transAxes)
-            ax_midL.set_axis_off()
-
-        # MIDDLE RIGHT – Power spectrum compare (f
-        ax_midR = fig.add_subplot(gs[1, 1])
-        try:
-            if (freqs is not None) and (spont_mean is not None) and (pulse_mean is not None) and len(freqs):
-                Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax_midR)
-            else:
-                ax_midR.text(0.5, 0.5, "no spectra", ha="center", va="center", transform=ax_midR.transAxes)
-                ax_midR.set_axis_off()
-        except NameError:
-            # falls die Funktion in Datei fehlt
-            ax_midR.text(0.5, 0.5, "Power_spectrum_compare_ax() nicht definiert", ha="center", va="center", transform=ax_midR.transAxes)
-            ax_midR.set_axis_off()
-        except Exception as e:
-            ax_midR.text(0.5, 0.5, f"Plot error (power):\n{e}", ha="center", va="center", transform=ax_midR.transAxes)
-            ax_midR.set_axis_off()
-
-        # BOTTOM (span über 2 Spalten) – CSD side-by-side
-        ax_bottom = fig.add_subplot(gs[2, :])
-        try:
-            CSD_compare_side_by_side_ax(
-                CSD_spont, CSD_trig, dt,
-                z_mm=z_mm,
-                align_pre=align_pre_s,
-                align_post=align_post_s,
-                cmap="Spectral",
-                sat_pct=98,
-                norm_mode="linear",
-                linthresh_frac=0.02,
-                ax=ax,
-                title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
-            )
-        except Exception as e:
-            ax_bottom.text(0.5, 0.5, f"Plot error (CSD):\n{e}", ha="center", va="center", transform=ax_bottom.transAxes)
-            ax_bottom.set_axis_off()
-
-        fig.suptitle(base_tag, y=0.995)
-        fig.tight_layout(rect=[0, 0, 1, 0.985])
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-        del fig
-
-    print(f"[PDF] geschrieben: {out_pdf}")
-
-
 
 
 def plot_up_classification_ax(
@@ -1082,17 +1018,27 @@ def plot_up_classification_ax(
     y0, y1 = ax.get_ylim()
 
     # 5) Pulsezeiten als vlines (ohne die y-Limits zu verändern)
-    def _vlines(ts, style, label):
+    # 5) Pulsezeiten als vlines (ohne die y-Limits zu verändern)
+    def _vlines(ts, style, label, color="red"):
         if ts is None or len(ts) == 0:
             return
         t = np.asarray(ts, float)
         if t.size > 800:  # bei sehr vielen Pulsen etwas ausdünnen
             step = int(np.ceil(t.size / 800))
             t = t[::step]
-        ax.vlines(t, y0, y1, lw=0.6, color="red", alpha=0.35, linestyles=style, label=label, zorder=1)
+        ax.vlines(
+            t, y0, y1,
+            lw=0.9,
+            color=color,
+            alpha=0.35,
+            linestyles=style,
+            label=label,
+            zorder=1
+        )
 
-    _vlines(pulse_times_1, ":",  "Pulse 1")
-    _vlines(pulse_times_2, "--", "Pulse 2")
+    _vlines(pulse_times_1, ":", "Pulse 1", color="red")
+    _vlines(pulse_times_2, ":", "Pulse 2", color="blue")
+
 
     # 6) optionale Peaks
     if Spon_Peaks is not None and len(Spon_Peaks):
@@ -1189,6 +1135,17 @@ def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *
     del fig
     print(f"[ALL-CH] SVG geschrieben: {out_svg}")
 
+
+try:
+    _save_all_channels_svg_from_array(
+        time_s, LFP_array, [f"pri_{i}" for i in range(NUM_CHANNELS)],
+        os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_DS.svg"),
+        max_points=40000
+    )
+except Exception as e:
+    print("[ALL-CH][DS] skip:", e)
+
+
 def up_onset_mean_ax(main_channel, dt, onsets, ax=None, title="UPs – onset-aligned mean"):
     import numpy as np
     import matplotlib.pyplot as plt
@@ -1273,10 +1230,7 @@ def pulse_triggered_up_overlay_ax(
     - vertikale Linie bei 0 s (Pulse)
     - vertikale Linie beim mittleren UP-Onset relativ zum Pulse
     """
-
-    import numpy as np
-    import matplotlib.pyplot as plt
-
+    
     if ax is None:
         fig, ax = plt.subplots(figsize=(6.5, 3.0))
     else:
@@ -1375,172 +1329,6 @@ def pulse_triggered_up_overlay_ax(
     return fig
 
 
-# def refractory_any_to_type_overlay_ax(
-#     main_channel,
-#     time_s,
-#     Spontaneous_UP, Spontaneous_DOWN,
-#     Pulse_triggered_UP, Pulse_triggered_DOWN,
-#     Pulse_associated_UP, Pulse_associated_DOWN,
-#     dt,
-#     target_type="spont",   # "spont" oder "trig"
-#     pre_s=0.5,             # wie weit vor dem UP-Ende anzeigen
-#     post_s=2.0,            # wie weit nach dem UP-Ende anzeigen
-#     ax=None,
-#     title=None
-# ):
-#     """
-#     Overlay-Plot:
-#     0 s = Ende eines beliebigen UP (spont/trig/assoc)
-#     danach: LFP-Verlauf bis zum nächsten UP des Typs target_type.
-
-#     Für jeden Übergang:
-#         prev-UP (Typ egal, index i-1)
-#         next-UP (index i)
-#         dt = onset(next) - offset(prev)
-#         -> wenn Typ(next) == target_type -> Event verwenden
-#     """
-
-#     import numpy as np
-#     import matplotlib.pyplot as plt
-
-#     if ax is None:
-#         fig, ax = plt.subplots(figsize=(6.5, 3.0))
-#     else:
-#         fig = ax.figure
-
-#     # --- Alle UPs und Typen in eine chronologische Liste packen ---
-#     Spontaneous_UP   = np.asarray(Spontaneous_UP,   int)
-#     Spontaneous_DOWN = np.asarray(Spontaneous_DOWN, int)
-#     Pulse_triggered_UP   = np.asarray(Pulse_triggered_UP,   int)
-#     Pulse_triggered_DOWN = np.asarray(Pulse_triggered_DOWN, int)
-#     Pulse_associated_UP   = np.asarray(Pulse_associated_UP,   int)
-#     Pulse_associated_DOWN = np.asarray(Pulse_associated_DOWN, int)
-
-#     up_list   = []
-#     down_list = []
-#     type_list = []
-
-#     for label, U, D in [
-#         ("spont", Spontaneous_UP,      Spontaneous_DOWN),
-#         ("trig",  Pulse_triggered_UP,  Pulse_triggered_DOWN),
-#         ("assoc", Pulse_associated_UP, Pulse_associated_DOWN),
-#     ]:
-#         m = min(len(U), len(D))
-#         if m == 0:
-#             continue
-#         U = U[:m]
-#         D = D[:m]
-#         up_list.append(U)
-#         down_list.append(D)
-#         type_list.extend([label] * m)
-
-#     if not up_list:
-#         ax.text(0.5, 0.5, "no UP events", ha="center", va="center", transform=ax.transAxes)
-#         ax.set_axis_off()
-#         return fig
-
-#     up_all   = np.concatenate(up_list)
-#     down_all = np.concatenate(down_list)
-#     types    = np.array(type_list, dtype=object)
-
-#     # chronologisch sortieren nach Onset
-#     order   = np.argsort(time_s[up_all])
-#     up_all   = up_all[order]
-#     down_all = down_all[order]
-#     types    = types[order]
-
-#     pre_n  = int(round(pre_s  / dt))
-#     post_n = int(round(post_s / dt))
-
-#     segs = []
-#     refrac_times = []
-
-#     # wir starten bei i=1, i-1 = vorheriger UP
-#     for i in range(1, len(up_all)):
-#         if types[i] != target_type:
-#             continue
-
-#         idx_prev_off = down_all[i-1]
-#         idx_curr_on  = up_all[i]
-
-#         if idx_prev_off < 0 or idx_prev_off >= len(time_s):
-#             continue
-#         if idx_curr_on < 0 or idx_curr_on >= len(time_s):
-#             continue
-
-#         t_off_prev = time_s[idx_prev_off]
-#         t_on_curr  = time_s[idx_curr_on]
-#         dt_ref = t_on_curr - t_off_prev
-#         if dt_ref < 0:
-#             continue
-
-#         # Zeitfenster um das UP-Ende (0 s = Ende des vorherigen UP)
-#         s = idx_prev_off - pre_n
-#         e = idx_prev_off + post_n
-#         if s < 0 or e > len(main_channel):
-#             continue
-
-#         seg = main_channel[s:e]
-#         if len(seg) != (pre_n + post_n):
-#             continue
-
-#         segs.append(seg)
-#         refrac_times.append(dt_ref)
-
-#     if not segs:
-#         ax.text(0.5, 0.5, "no valid segments",
-#                 ha="center", va="center", transform=ax.transAxes)
-#         ax.set_axis_off()
-#         return fig
-
-#     segs = np.vstack(segs)   # (n_events, n_time)
-#     n    = segs.shape[0]
-#     t_rel = (np.arange(-pre_n, post_n) * dt)
-
-#     # alle Einzeltraces
-#     for i in range(n):
-#         ax.plot(t_rel, segs[i], alpha=0.12, lw=0.8)
-
-#     # Mittelwert-Trace
-#     mean_trace = np.nanmean(segs, axis=0)
-#     ax.plot(t_rel, mean_trace, lw=2.0, label="Mean LFP")
-
-#     # vertikale Linie beim UP-Ende (0 s)
-#     ax.axvline(0.0, color="k", lw=1.0, ls="--", label="UP offset (prev)")
-
-#     # mittlere Refraktärzeit bis nächster target-UP
-#     refrac_times = np.asarray(refrac_times, float)
-#     if refrac_times.size:
-#         mean_ref = float(np.nanmean(refrac_times))
-#         ax.axvline(mean_ref, color="red", lw=1.5, ls=":",
-#                    label=f"Mean next {target_type} UP ({mean_ref*1000:.0f} ms)")
-
-#     ax.set_xlabel("Zeit relativ zum Ende des vorherigen UP (s)")
-#     ax.set_ylabel(f"LFP ({UNIT_LABEL})")
-
-#     if title is None:
-#         if target_type == "spont":
-#             title = "Ende ANY-UP → nächster SPONT-UP (Overlay)"
-#         elif target_type == "trig":
-#             title = "Ende ANY-UP → nächster TRIG-UP (Overlay)"
-#         else:
-#             title = f"Ende ANY-UP → nächster {target_type}-UP (Overlay)"
-
-#     ax.set_title(title)
-
-#     # n-Textbox
-#     ax.text(
-#         0.02, 0.95,
-#         f"n = {n}",
-#         transform=ax.transAxes,
-#         ha="left", va="top",
-#         fontsize=10,
-#         bbox=dict(boxstyle="round", fc="white", alpha=0.7)
-#     )
-
-#     ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
-
-#     return fig
 
 
 def compute_refrac_from_spont_to_spon_and_trig(
@@ -1853,86 +1641,6 @@ def refractory_from_spont_single_folder_ax(
     return fig
 
 
-def spontaneous_up_overlay_ax(
-    main_channel,
-    dt,
-    onsets,
-    pre_s=0.5,
-    post_s=1.0,
-    ax=None,
-    title="Spontaneous UPs – onset-aligned overlay (Mean ± SEM)"
-):
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6.5, 3.2))
-    else:
-        fig = ax.figure
-
-    onsets = np.asarray(onsets, int)
-    if onsets.size == 0:
-        ax.text(0.5, 0.5, "no spontaneous onsets", ha="center", va="center", transform=ax.transAxes)
-        ax.set_axis_off()
-        return fig
-
-    pre_n  = int(round(pre_s  / dt))
-    post_n = int(round(post_s / dt))
-    n_len  = pre_n + post_n
-
-    traces = []
-    for o in onsets:
-        s = o - pre_n
-        e = o + post_n
-        if s < 0 or e > len(main_channel):
-            continue
-        seg = np.asarray(main_channel[s:e], float)
-        if seg.size == n_len and np.isfinite(seg).any():
-            traces.append(seg)
-
-    if not traces:
-        ax.text(0.5, 0.5, "no valid segments", ha="center", va="center", transform=ax.transAxes)
-        ax.set_axis_off()
-        return fig
-
-    X = np.vstack(traces)                  # (n_events, n_time)
-    n = X.shape[0]
-    t = (np.arange(-pre_n, post_n) * dt)
-
-    # Einzeltraces
-    for i in range(n):
-        ax.plot(t, X[i], alpha=0.10, lw=0.8)
-
-    # Mean ± SEM
-    m  = np.nanmean(X, axis=0)
-    se = np.nanstd(X, axis=0) / np.sqrt(max(1, n))
-    ax.plot(t, m, lw=2.2, label="Mean")
-    ax.fill_between(t, m-se, m+se, alpha=0.20, label="SEM")
-
-    ax.axvline(0.0, color="k", lw=1.0, ls="--", label="UP onset")
-
-    ax.set_xlabel("Zeit relativ zum UP-Onset (s)")
-    ax.set_ylabel(f"LFP ({UNIT_LABEL})")
-    ax.set_title(title)
-
-    ax.text(
-        0.02, 0.95,
-        f"n = {n}",
-        transform=ax.transAxes,
-        ha="left", va="top",
-        fontsize=10,
-        bbox=dict(boxstyle="round", fc="white", alpha=0.7)
-    )
-
-    # Legende ohne Duplikate
-    handles, labels = ax.get_legend_handles_labels()
-    uniq = dict(zip(labels, handles))
-    if uniq:
-        ax.legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=8, framealpha=0.9)
-
-    return fig
-
-
 def spontaneous_up_full_overlay_normtime_ax(
     main_channel,
     time_s,
@@ -1943,8 +1651,6 @@ def spontaneous_up_full_overlay_normtime_ax(
     ax=None,
     title="Spontaneous UPs (Onset→Offset) overlay, time-normalized"
 ):
-    import numpy as np
-    import matplotlib.pyplot as plt
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6.8, 3.2))
@@ -2158,17 +1864,15 @@ def pca_project_and_similarity(X, pca_fit):
 # ---------- Plotter (ax-friendly) ----------
 
 def pca_template_pc1_ax(
-    pca_fit, *, ax=None, title="Spontaneous PCA Template (PC1)"
+    pca_fit_joint, *, ax=None, title="Spontaneous PCA Template (PC1)"
 ):
-    import numpy as np
-    import matplotlib.pyplot as plt
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6.5, 3.0))
     else:
         fig = ax.figure
 
-    pc1 = np.asarray(pca_fit["components"][0], float)
+    pc1 = np.asarray(pca_fit_joint["components"][0], float)
     t = np.linspace(0.0, 100.0, pc1.size)
 
     ax.plot(t, pc1, lw=2.2, label="PC1")
@@ -2299,6 +2003,7 @@ try:
 except NameError:
     pca_fit_sp = None
 
+
 # --- PCA im gemeinsamen Raum: X_joint = spont + trig ---
 pca_fit_joint = None
 pc_scores_sp = pc1z_sp = mahal_sp = None
@@ -2369,7 +2074,10 @@ else:
     print(f"[PCA JOINT] skipped: need >=3 spont AND >=3 trig "
           f"(sp={X_spont.shape[0]}, trig={X_trig.shape[0]}) meta_sp={meta_sp} meta_tr={meta_tr}")
 
-import numpy as np
+pca_fit_sp = None
+if X_spont.shape[0] >= 3:
+    pca_fit_sp = fit_pca_from_spont(X_spont, n_components=3)
+
 
 def corr_to_template(X, template):
     template = (template - template.mean()) / template.std()
@@ -2616,8 +2324,7 @@ def permutation_cluster_test_time(
 
 def pca_pc1_overlay_corr_diff_ax(pca_fit_sp, pca_fit_tr, ax=None,
                                 title="PC1: Spont vs Triggered (overlay / corr / diff)"):
-    import numpy as np
-    import matplotlib.pyplot as plt
+
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(7.2, 3.2))
@@ -2756,8 +2463,6 @@ def cohens_d_time(x, y):
     return d
 
 
-
-
 def sliding_window_corr(mean_a, mean_b, win_s, dt):
     """Correlation of two mean traces in a sliding window."""
     mean_a = np.asarray(mean_a, float)
@@ -2829,6 +2534,17 @@ def compare_triggered_vs_spontaneous(
         "n_trials": {"trig": int(X.shape[0]), "spon": int(Y.shape[0])},
     }
 
+print("[DBG] Trig aligned:", None if Trig_UP_peak_aligned_array is None else Trig_UP_peak_aligned_array.shape,
+      "nan%=", np.isnan(Trig_UP_peak_aligned_array).mean() if Trig_UP_peak_aligned_array is not None else "na")
+print("[DBG] Spon aligned:", None if Spon_UP_peak_aligned_array is None else Spon_UP_peak_aligned_array.shape,
+      "nan%=", np.isnan(Spon_UP_peak_aligned_array).mean() if Spon_UP_peak_aligned_array is not None else "na")
+
+if Trig_UP_peak_aligned_array is not None:
+    print("[DBG] Trig all-NaN rows:", np.sum(np.all(np.isnan(Trig_UP_peak_aligned_array), axis=1)))
+if Spon_UP_peak_aligned_array is not None:
+    print("[DBG] Spon all-NaN rows:", np.sum(np.all(np.isnan(Spon_UP_peak_aligned_array), axis=1)))
+
+
 res = compare_triggered_vs_spontaneous(
     Trig_UP_peak_aligned_array,
     Spon_UP_peak_aligned_array,
@@ -2844,107 +2560,11 @@ print("significant clusters (p<0.05):",
       [(c["start"], c["end"], c["p_cluster"]) for c in res["clusters"] if c["p_cluster"] < 0.05])
 
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
-
 def _nansem(a, axis=0):
     a = np.asarray(a, float)
     n = np.sum(~np.isnan(a), axis=axis)
     return np.nanstd(a, axis=axis, ddof=1) / np.sqrt(np.maximum(n, 1))
 
-def plot_triggered_vs_spontaneous_to_pdf(
-    res,
-    trig_aligned,
-    spon_aligned,
-    pdf_path="UPstate_compare.pdf",
-    alpha=0.05,
-    title="Triggered vs Spontaneous UP states (peak-aligned)",
-    append=False,
-):
-    """
-    res: output dict from compare_triggered_vs_spontaneous(...)
-    trig_aligned, spon_aligned: (n_trials, n_time) arrays used for SEM
-    Writes one page into a PDF.
-    """
-    t = res["time"]
-    mean_trig = res["mean_trig"]
-    mean_spon = res["mean_spon"]
-    d_t = res["cohens_d"]
-    r_t = res["sliding_corr"]
-    clusters = res["clusters"]
-
-    X = np.asarray(trig_aligned, float)
-    Y = np.asarray(spon_aligned, float)
-    X = X[~np.all(np.isnan(X), axis=1)]
-    Y = Y[~np.all(np.isnan(Y), axis=1)]
-
-    sem_trig = _nansem(X, axis=0)
-    sem_spon = _nansem(Y, axis=0)
-
-    fig = plt.figure(figsize=(11.7, 8.3))  # A4 landscape-ish
-    gs = fig.add_gridspec(3, 1, height_ratios=[2.2, 1.2, 1.2], hspace=0.25)
-
-    ax0 = fig.add_subplot(gs[0, 0])
-    ax1 = fig.add_subplot(gs[1, 0], sharex=ax0)
-    ax2 = fig.add_subplot(gs[2, 0], sharex=ax0)
-
-    # --- Panel 1: mean ± SEM ---
-    ax0.plot(t, mean_trig, label=f"Triggered (n={res['n_trials']['trig']})")
-    ax0.fill_between(t, mean_trig - sem_trig, mean_trig + sem_trig, alpha=0.25)
-
-    ax0.plot(t, mean_spon, label=f"Spontaneous (n={res['n_trials']['spon']})")
-    ax0.fill_between(t, mean_spon - sem_spon, mean_spon + sem_spon, alpha=0.25)
-
-    ax0.axvline(0, linestyle="--", linewidth=1)  # alignment point (peak or onset)
-    ax0.set_ylabel("LFP (a.u.)")
-    ax0.legend(loc="upper right", frameon=False)
-    ax0.set_title(title)
-
-    # --- Significance bars (clusters) on top of panel 1 ---
-    y_top = np.nanmax([mean_trig + sem_trig, mean_spon + sem_spon])
-    y_bar = y_top + 0.05 * (np.nanmax([mean_trig, mean_spon]) - np.nanmin([mean_trig, mean_spon]) + 1e-12)
-
-    any_sig = False
-    for c in clusters:
-        if c["p_cluster"] < alpha:
-            any_sig = True
-            s, e = c["start"], c["end"]
-            ax0.plot([t[s], t[e]], [y_bar, y_bar], linewidth=4)
-    if any_sig:
-        ax0.text(t[0], y_bar, f"cluster p<{alpha}", va="bottom")
-    ax0.set_ylim(top=y_bar + 0.1 * (y_bar - np.nanmin([mean_trig, mean_spon])))
-
-    # --- Panel 2: Cohen's d(t) ---
-    ax1.plot(t, d_t)
-    ax1.axhline(0, linewidth=1)
-    ax1.axvline(0, linestyle="--", linewidth=1)
-    ax1.set_ylabel("Cohen's d(t)")
-
-    # --- Panel 3: sliding correlation ---
-    ax2.plot(t, r_t)
-    ax2.axhline(0, linewidth=1)
-    ax2.axvline(0, linestyle="--", linewidth=1)
-    ax2.set_ylabel("r (sliding)")
-    ax2.set_xlabel("Time (s)")
-
-    # Footer with params
-    params = res.get("params", {})
-    footer = f"n_perm={params.get('n_perm')} | alpha={params.get('alpha')} | corr_win_s={params.get('corr_win_s')}"
-    fig.text(0.01, 0.01, footer, fontsize=9)
-
-    # --- Write to PDF (append style via PdfPages context) ---
-    # Note: PdfPages always "creates" a file; to truly append, keep a single PdfPages open outside and pass it in.
-    # Here we support append=False/True by choosing mode; some backends ignore mode, so safest is single PdfPages in your pipeline.
-    mode = "ab" if append else "wb"
-    with open(pdf_path, mode):
-        pass  # ensure file exists / mode touched
-
-    with PdfPages(pdf_path) as pdf:
-        pdf.savefig(fig, bbox_inches="tight")
-    plt.close(fig)
-
-    return pdf_path
 
 
 def upstate_similarity_timecourse_ax(
@@ -3158,17 +2778,16 @@ layout_rows = [
     title="Spontaneous UPs (full Onset→Offset), time-normalized overlay"
 )],
 
-
 # REIHE NEU: PCA Template + Similarity Scores
 [
   lambda ax: (
-      _blank_ax(ax, "PCA skipped") if (pca_fit is None) else
-      pca_template_pc1_ax(pca_fit, ax=ax, title="Spontaneous PCA Template (PC1)")
+      _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None) else
+      pca_template_pc1_ax(pca_fit_joint, ax=ax, title="Spontaneous PCA Template (PC1)")
   ),
   lambda ax: (
-      _blank_ax(ax, "PCA skipped / no trig") if (pca_fit is None or pc1z_trig is None) else
+      _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or pc1z_trig is None) else
       pca_similarity_scores_ax(
-          pca_fit["scores_spont"],
+          pca_fit_joint["scores_spont"],
           pc1z_trig,
           mahal_trig,
           ax=ax,
@@ -3177,16 +2796,15 @@ layout_rows = [
   )
 ],
 
-
 # REIHE NEU: Mahalanobis-Distanz + Top/Bottom Trigger Overlays
 [
   lambda ax: (
-      _blank_ax(ax, "PCA skipped") if (pca_fit is None or mahal_trig is None) else
+      _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None or mahal_trig is None) else
       mahal_compare_ax(mahal_sp, mahal_trig, ax=ax,
                        title="Mahalanobis distance to spontaneous PCA space")
   ),
   lambda ax: (
-      _blank_ax(ax, "PCA skipped / no trig") if (pca_fit is None or mahal_trig is None or X_trig.shape[0]==0) else
+      _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or mahal_trig is None or X_trig.shape[0]==0) else
       ranked_trigger_overlays_ax(X_spont, X_trig, mahal_trig, ax=ax, top_n=5,
                                  title="Triggered UPs: most vs least similar (Mahalanobis)")
   )
@@ -3268,7 +2886,6 @@ layout_rows = [
         title="Triggered vs Spontaneous UP states (peak-aligned)"
     )],
 
-    # danach z.B. CSD
     [lambda ax: CSD_compare_side_by_side_ax(
         CSD_spont, CSD_trig, dt,
         z_mm=z_mm,
@@ -3280,13 +2897,6 @@ layout_rows = [
         ax=ax,
         title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
     )],
-
-
-
-
-
-
-
 ]
 
 
