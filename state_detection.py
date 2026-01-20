@@ -143,10 +143,26 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
             "Pulse_associated_DOWN_raw": Assoc_DN_raw,
         }
 
-    # ---------- 1) Bandpower aus Spektrogramm ----------
+    # 1) Bandpower aus Spektrogramm
     freqs = Spect_dat[2]
     S = np.asarray(Spect_dat[0], float)  # dB
     t_feat = np.asarray(Spect_dat[1], float) 
+        
+    print("Spect_dat lens/types:",
+        type(Spect_dat), len(Spect_dat),
+        type(Spect_dat[0]), type(Spect_dat[1]), type(Spect_dat[2]))
+
+    print("S shape:", np.shape(Spect_dat[0]))
+    print("t entry:", Spect_dat[1])
+    print("t shape:", np.shape(Spect_dat[1]))
+    print("f shape:", np.shape(Spect_dat[2]))
+
+    # falls t ein Array ist:
+    if np.ndim(Spect_dat[1]) == 1 and len(Spect_dat[1]) > 3:
+        print("t[0:5]=", Spect_dat[1][:5], "t[-1]=", Spect_dat[1][-1],
+            "dt~", np.median(np.diff(Spect_dat[1])))
+
+
 
     # 
     f_lo, f_hi = 0.5, 4.0
@@ -163,15 +179,14 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     # robuster als Summe: median reduziert “hot bins”
     S_band = S[band_mask, :]          # S ist in dB
-    Total_power = np.mean(S_band, axis=0)  # jetzt direkt dB-Mittelwert
-
+    Total_power = np.mean(linear, axis=0)  # jetzt direkt dB-Mittelwert
 
     print("Total_power stats:", np.min(Total_power), np.max(Total_power), np.isnan(Total_power).sum())
 
     # 2) Smooth 
     Total_power_smooth = gaussian_filter1d(Total_power, sigma=2)
 
-        # robust z-score auf Feature-Achse
+    # robust z-score auf Feature-Achse
     med = np.median(Total_power_smooth)
     mad = np.median(np.abs(Total_power_smooth - med)) + 1e-30
     robust_std = 1.4826 * mad
@@ -195,11 +210,11 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         up_state_binary[i] = active
 
 
-    # 4) Gap-closing: ACHTUNG Zeitauflösung! 
+    # 4) Gap-closing
     # dt für up_state_binary muss zur Feature-Zeitachse passen:
     time_s = np.asarray(time_s)
     if time_s.size >= 2 and np.all(np.isfinite(time_s)):
-        dt_feat = float(np.median(np.diff(time_s)))
+        dt_feat = float(np.median(np.diff(t_feat)))
     else:
         dt_feat = float(dt)  # fallback
 
@@ -261,6 +276,8 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     #print("[THR] thr =", threshold, "smooth min/max =", Total_power_smooth.min(), Total_power_smooth.max())
     print("[UP%] frac UP =", up_state_binary.mean(), "| dt_feat =", dt_feat, "min_gap_bins =", min_gap)
     print("[UP] onsets =", len(UP_start_i))
+    print("[time_s] = ", time_s)
+    print("t_feat = ", t_feat)
 
     if (up_state_binary.mean() < min_up_fraction) or (len(UP_start_i) < min_up_onsets):
         print("[STATES] no reliable UP states -> return empty dict")

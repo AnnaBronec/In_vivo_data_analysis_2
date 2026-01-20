@@ -172,6 +172,9 @@ else:
    #Pulse direkt aus dem DataFrame ziehen
     pulse_times_1_full = np.array([], dtype=float)
     pulse_times_2_full = np.array([], dtype=float)
+    pulse_times_1_off_full = np.array([], dtype=float)
+    pulse_times_2_off_full = np.array([], dtype=float)
+
     stim_like_cols = []
 
     time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
@@ -188,6 +191,27 @@ else:
               else (np.flatnonzero(b[1:] != b[:-1]) + 1)
         idx = idx[(idx >= 0) & (idx < time_full.size)]
         return time_full[idx].astype(float)
+        
+    def _rising_falling_from_col(col, thr=None):
+        x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(x).any():
+            return np.array([], float), np.array([], float)
+
+        if thr is None:
+            lo, hi = np.nanpercentile(x, [10, 90])
+            thr = (lo + hi) * 0.5
+
+        b = (x > thr).astype(np.int8)
+
+        rising_idx  = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1   # 0->1
+        falling_idx = np.flatnonzero((b[1:] == 0) & (b[:-1] == 1)) + 1   # 1->0
+
+        rising_idx  = rising_idx[(rising_idx >= 0) & (rising_idx < time_full.size)]
+        falling_idx = falling_idx[(falling_idx >= 0) & (falling_idx < time_full.size)]
+
+        return time_full[rising_idx].astype(float), time_full[falling_idx].astype(float)
+
+        
 
     def _is_quasi_binary(col):
         x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
@@ -202,22 +226,55 @@ else:
 
     # 1) Bevorzugte Spaltennamen durchgehen
     preferred = [c for c in ["din_1","din_2","stim","StartStop","TTL","DI0","DI1"] if c in LFP_df.columns]
+    # if "din_1" in preferred:
+    #     t = _edges_from_col("din_1", rising_only=True, thr=None)
+    #     if t.size: pulse_times_1_full, stim_like_cols = t, stim_like_cols+["din_1"]
+    # if "din_2" in preferred:
+    #     t = _edges_from_col("din_2", rising_only=True, thr=None)
+    #     if t.size: pulse_times_2_full, stim_like_cols = t, stim_like_cols+["din_2"]
     if "din_1" in preferred:
-        t = _edges_from_col("din_1", rising_only=True, thr=None)
-        if t.size: pulse_times_1_full, stim_like_cols = t, stim_like_cols+["din_1"]
+        t_on, t_off = _rising_falling_from_col("din_1", thr=None)
+        if t_on.size:
+            pulse_times_1_full = t_on
+            pulse_times_1_off_full = t_off
+            stim_like_cols = stim_like_cols + ["din_1"]
+
     if "din_2" in preferred:
-        t = _edges_from_col("din_2", rising_only=True, thr=None)
-        if t.size: pulse_times_2_full, stim_like_cols = t, stim_like_cols+["din_2"]
+        t_on, t_off = _rising_falling_from_col("din_2", thr=None)
+        if t_on.size:
+            pulse_times_2_full = t_on
+            pulse_times_2_off_full = t_off
+            stim_like_cols = stim_like_cols + ["din_2"]
+
+
     if pulse_times_1_full.size == 0 and "stim" in preferred:
-        t = _edges_from_col("stim", rising_only=True, thr=None)
-        if t.size: pulse_times_1_full, stim_like_cols = t, stim_like_cols+["stim"]
+        t_on, t_off = _rising_falling_from_col("stim", thr=None)
+        if t_on.size:
+            pulse_times_1_full = t_on
+            pulse_times_1_off_full = t_off
+            stim_like_cols = stim_like_cols + ["stim"]
+
+
+    # if pulse_times_1_full.size == 0 and "stim" in preferred:
+    #     t = _edges_from_col("stim", rising_only=True, thr=None)
+    #     if t.size: pulse_times_1_full, stim_like_cols = t, stim_like_cols+["stim"]
     # Falls StartStop/TTL nur eine Spur ist → als p1 nehmen
+    # if pulse_times_1_full.size == 0:
+    #     for cand in ["StartStop","TTL","DI0","DI1"]:
+    #         if cand in preferred:
+    #             t = _edges_from_col(cand, rising_only=True, thr=None)
+    #             if t.size:
+    #                 pulse_times_1_full, stim_like_cols = t, stim_like_cols+[cand]
+    #                 break
+
     if pulse_times_1_full.size == 0:
         for cand in ["StartStop","TTL","DI0","DI1"]:
             if cand in preferred:
-                t = _edges_from_col(cand, rising_only=True, thr=None)
-                if t.size:
-                    pulse_times_1_full, stim_like_cols = t, stim_like_cols+[cand]
+                t_on, t_off = _rising_falling_from_col(cand, thr=None)
+                if t_on.size:
+                    pulse_times_1_full = t_on
+                    pulse_times_1_off_full = t_off
+                    stim_like_cols = stim_like_cols + [cand]
                     break
 
     # 2) Auto-Detect (wenn bisher nichts gefunden): nimm (nahezu) binäre Spalte mit meisten Flanken
@@ -295,6 +352,26 @@ gc.collect()
 pulse_times_1_full = None if pulse_times_1 is None else np.array(pulse_times_1, float)
 pulse_times_2_full = None if pulse_times_2 is None else np.array(pulse_times_2, float)
 
+def _snap_event_times_to_timebase(event_times, time_s):
+    if event_times is None:
+        return None
+    t = np.asarray(event_times, float)
+    if t.size == 0:
+        return t
+    idx = np.searchsorted(time_s, t)
+    idx = np.clip(idx, 0, len(time_s)-1)
+    return time_s[idx]
+
+# Offsets -> Sekunden + snappen
+pulse_times_1_off = _snap_event_times_to_timebase(
+    _ensure_seconds(pulse_times_1_off_full, time_s, DEFAULT_FS_XDAT),
+    time_s
+)
+pulse_times_2_off = _snap_event_times_to_timebase(
+    _ensure_seconds(pulse_times_2_off_full, time_s, DEFAULT_FS_XDAT),
+    time_s
+)
+
 
 NUM_CHANNELS = LFP_array.shape[0]
 good_idx = list(range(NUM_CHANNELS))  # Fallback: alle Kanäle
@@ -350,13 +427,16 @@ else:
     time_s, LFP_array, pulse_times_1, pulse_times_2 = _safe_crop_to_pulses(
         time_s, LFP_array, pulse_times_1, pulse_times_2, pad=0.5
     )
+# Offsets müssen in denselben Crop-Bereich!
+pulse_times_1_off = _clip_events_to_bounds(pulse_times_1_off, time_s, 0.0, 0.0)
+pulse_times_2_off = _clip_events_to_bounds(pulse_times_2_off, time_s, 0.0, 0.0)
 
 
 
 
 log(f"Crop done: time={time_s[0]:.3f}->{time_s[-1]:.3f}, shape={LFP_array.shape}, p1={len(pulse_times_1) if pulse_times_1 is not None else 0}, p2={len(pulse_times_2) if pulse_times_2 is not None else 0}")
 
-# --- main_channel robust auswählen 
+# main_channel robust auswählen 
 main_channel, ch_idx_used = _ensure_main_channel(LFP_array, preferred_idx=9)
 
 # --- Für HTML: Main-Channel in µV 
@@ -527,6 +607,9 @@ freqs = spont_mean = pulse_mean = p_vals = None
 
 pulse_times_1 = _clip_events_to_bounds(pulse_times_1, time_s, align_pre_s, align_post_s)
 pulse_times_2 = _clip_events_to_bounds(pulse_times_2, time_s, align_pre_s, align_post_s)
+
+pulse_times_1_off = _clip_events_to_bounds(pulse_times_1_off, time_s, align_pre_s, align_post_s)
+pulse_times_2_off = _clip_events_to_bounds(pulse_times_2_off, time_s, align_pre_s, align_post_s)
 
 
 log(f"Calling classify_states: len(time_s)={len(time_s)}, main_len={len(main_channel)}, dt={dt}, p1={len(pulse_times_1) if pulse_times_1 is not None else 0}, p2={len(pulse_times_2) if pulse_times_2 is not None else 0}")
@@ -756,12 +839,67 @@ plt.close(fig_amp)
 print("[SVG] amplitude compare:", amp_svg_path)
 del fig_amp
 
+def _pair_on_off(t_on, t_off, max_width_s=1.0):
+    if t_on is None or t_off is None:
+        return []
+    on = np.asarray(t_on, float); off = np.asarray(t_off, float)
+    on = on[np.isfinite(on)]; off = off[np.isfinite(off)]
+    if on.size == 0 or off.size == 0:
+        return []
+    on.sort(); off.sort()
 
-# --- Interaktive HTML immer erzeugen (mit UP-Schattierung) ---
+    intervals = []
+    j = 0
+    for i in range(on.size):
+        while j < off.size and off[j] <= on[i]:
+            j += 1
+        if j >= off.size:
+            break
+        width = off[j] - on[i]
+        if 0 < width <= max_width_s:
+            intervals.append((float(on[i]), float(off[j])))
+    return intervals
+
+ttl1_intervals = _pair_on_off(pulse_times_1, pulse_times_1_off, max_width_s=1.0)
+ttl2_intervals = _pair_on_off(pulse_times_2, pulse_times_2_off, max_width_s=1.0)
+
+print("[TTL] intervals:", len(ttl1_intervals), len(ttl2_intervals))
+print("[DBG] on/off counts:",
+      "p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
+      "p1_off", 0 if pulse_times_1_off is None else len(pulse_times_1_off),
+      "| p2_on", 0 if pulse_times_2 is None else len(pulse_times_2),
+      "p2_off", 0 if pulse_times_2_off is None else len(pulse_times_2_off))
+
+if pulse_times_1 is not None and len(pulse_times_1):
+    print("[DBG] p1_on first/last:", float(pulse_times_1[0]), float(pulse_times_1[-1]))
+if pulse_times_1_off is not None and len(pulse_times_1_off):
+    print("[DBG] p1_off first/last:", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
+print("[DBG] time_s range:", float(time_s[0]), "->", float(time_s[-1]))
+
+print("[DBG] on/off counts:",
+      "p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
+      "p1_off", 0 if pulse_times_1_off is None else len(pulse_times_1_off),
+      "| p2_on", 0 if pulse_times_2 is None else len(pulse_times_2),
+      "p2_off", 0 if pulse_times_2_off is None else len(pulse_times_2_off))
+
+if pulse_times_1 is not None and len(pulse_times_1):
+    print("[DBG] p1_on first/last:", float(pulse_times_1[0]), float(pulse_times_1[-1]))
+if pulse_times_1_off is not None and len(pulse_times_1_off):
+    print("[DBG] p1_off first/last:", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
+print("[DBG] time_s range:", float(time_s[0]), "->", float(time_s[-1]))
+
+
+
+# Interaktive HTML immer erzeugen (mit UP-Schattierung) 
 export_interactive_lfp_html(
     BASE_TAG, SAVE_DIR, time_s,
     main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
-    pulse_times_1=pulse_times_1, pulse_times_2=pulse_times_2,
+    pulse_times_1=pulse_times_1,
+    pulse_times_2=pulse_times_2,
+    pulse_times_1_off=pulse_times_1_off,
+    pulse_times_2_off=pulse_times_2_off,
+    pulse_intervals_1=ttl1_intervals,
+    pulse_intervals_2=ttl2_intervals,
     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
@@ -769,6 +907,7 @@ export_interactive_lfp_html(
     title=f"{BASE_TAG} — Main LFP (interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})")
 )
+
 
 # Extras für Plots
 pulse_windows = extract_upstate_windows(Pulse_triggered_UP, main_channel[None, :], dt, window_s=1.0)
@@ -1020,7 +1159,7 @@ def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=
 
 def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *, max_points=20000):
     """
-    Alternative, falls du schon das downsampled Array hast:
+    Alternative, falls schon das downsampled Array hast:
     LFP_array: shape (n_chan, n_time)
     """
 
@@ -1566,7 +1705,6 @@ def spontaneous_up_full_overlay_normtime_ax(
     return fig
 
 def _rms(x):
-    import numpy as np
     x = np.asarray(x, float)
     return float(np.sqrt(np.nanmean(x*x))) if x.size else np.nan
 
@@ -1579,7 +1717,6 @@ def _extract_resampled_up_segments(
     baseline-subtract (Median der ersten baseline_frac) und optional RMS-normalisiert.
     Returns: X (n_events, n_points), meta dict
     """
-    import numpy as np
 
     U = np.asarray(U, int)
     D = np.asarray(D, int)
@@ -1945,9 +2082,6 @@ else:
 
 
 def mahal_compare_ax(mahal_sp, mahal_trig, ax=None, title="Mahalanobis distance to spontaneous PCA-space"):
-    import numpy as np
-    import matplotlib.pyplot as plt
-
     if ax is None:
         fig, ax = plt.subplots(figsize=(6.5, 3.4))
     else:
@@ -2277,8 +2411,6 @@ t_obs, p_point, clusters = permutation_cluster_test_time(
 )
 
 
-import numpy as np
-from scipy import stats
 
 def _nanmean(a, axis=0):
     return np.nanmean(a, axis=axis)

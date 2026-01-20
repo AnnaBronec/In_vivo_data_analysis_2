@@ -19,6 +19,8 @@ LOGFILE = os.path.join(SAVE_DIR, "runlog.txt")
 def export_interactive_lfp_html(
     base_tag, save_dir, time_s, y,
     pulse_times_1=None, pulse_times_2=None,
+    pulse_times_1_off=None, pulse_times_2_off=None,
+    pulse_intervals_1=None, pulse_intervals_2=None,
     *,
     up_spont=None,       # Tuple (UP_idx, DOWN_idx) in SAMPLE-INDIZES
     up_trig=None,        # Tuple (UP_idx, DOWN_idx)
@@ -100,6 +102,31 @@ def export_interactive_lfp_html(
                 line=dict(width=0),
                 fillcolor=fill
             ))
+        # --- Pulse-Intervalle (Onset->Offset) als rote Fläche, bewusst NACH den UP-Flächen
+    def _add_pulse_intervals(intervals, fill):
+        if intervals is None or len(intervals) == 0:
+            return
+        if len(intervals) > 2000:
+            step = int(np.ceil(len(intervals)/2000))
+            intervals = intervals[::step]
+        for (t0, t1) in intervals:
+            t0 = float(t0); t1 = float(t1)
+            if t1 <= t0:
+                continue
+            if len(t) and (t1 < t[0] or t0 > t[-1]):
+                continue
+            shapes.append(dict(
+                type="rect",
+                x0=t0, x1=t1,
+                y0=0, y1=1,
+                xref="x", yref="paper",
+                line=dict(width=0),
+                fillcolor=fill
+            ))
+
+    # deutlich sichtbarer als vorher
+    _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.28)")
+    _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.28)")
 
     # --- Pulse-Linien
     def _add_pulses(ts, dash):
@@ -120,6 +147,57 @@ def export_interactive_lfp_html(
 
     _add_pulses(pulse_times_1, "dot")
     _add_pulses(pulse_times_2, "dash")
+        # --- Pulse-OFF-Linien (Offsets) in dunklerem Rot
+
+    def _add_pulse_offs(ts, dash):
+        if ts is None or len(ts) == 0:
+            return
+        tt = np.asarray(ts, float)
+        if tt.size > 1200:
+            tt = tt[::int(np.ceil(tt.size/1200))]
+        for p in tt:
+            shapes.append(dict(
+                type="line",
+                x0=float(p), x1=float(p),
+                y0=0, y1=1,
+                xref="x", yref="paper",
+                opacity=0.55,
+                line=dict(width=1, dash=dash, color="darkred")
+            ))
+
+    _add_pulse_offs(pulse_times_1_off, "dot")
+    _add_pulse_offs(pulse_times_2_off, "dash")
+
+        # --- Pulse-Intervalle als transparente Rechtecke (Onset->Offset)
+    def _add_pulse_intervals(intervals, fill):
+        if intervals is None or len(intervals) == 0:
+            return
+        # optional ausdünnen, falls extrem viele Intervalle
+        if len(intervals) > 2000:
+            step = int(np.ceil(len(intervals)/2000))
+            intervals = intervals[::step]
+        for (t0, t1) in intervals:
+            t0 = float(t0); t1 = float(t1)
+            if t1 <= t0:
+                continue
+            # auf ggf. gekürzte Zeitachse clippen
+            if len(t) and (t1 < t[0] or t0 > t[-1]):
+                continue
+            shapes.append(dict(
+                type="rect",
+                x0=t0, x1=t1,
+                y0=0, y1=1,
+                xref="x", yref="paper",
+                line=dict(width=0),
+                fillcolor=fill
+            ))
+
+    _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.12)")   # rot transparent
+    _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.12)")   # optional: 2. Spur etwas schwächer
+
+
+    
+
 
     # --- Dummy-Traces für Legende (damit Shapes in der Legende erscheinen)
     if intervals:
@@ -131,14 +209,23 @@ def export_interactive_lfp_html(
                 name=label,
                 showlegend=True
             ))
-    if pulse_times_1 is not None and len(pulse_times_1):
+    # if pulse_times_1 is not None and len(pulse_times_1):
+    #     fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
+    #                              line=dict(width=1, dash="dot", color="red"),
+    #                              name="Pulse 1"))
+    if pulse_times_1_off is not None and len(pulse_times_1_off):
         fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-                                 line=dict(width=1, dash="dot", color="red"),
-                                 name="Pulse 1"))
-    if pulse_times_2 is not None and len(pulse_times_2):
+                                 line=dict(width=1, dash="dot", color="darkred"),
+                                 name="Pulse 1 OFF"))
+    # if pulse_times_2 is not None and len(pulse_times_2):
+    #     fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
+    #                              line=dict(width=1, dash="dash", color="red"),
+    #                              name="Pulse 2"))
+    if pulse_intervals_1 is not None and len(pulse_intervals_1):
         fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-                                 line=dict(width=1, dash="dash", color="red"),
-                                 name="Pulse 2"))
+                                 line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
+                                 name="Pulse 1 duration"))
+
 
     fig.update_layout(
         title=title,
