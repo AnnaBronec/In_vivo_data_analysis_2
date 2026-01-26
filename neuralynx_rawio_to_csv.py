@@ -7,7 +7,6 @@ import pandas as pd
 from neo.rawio import NeuralynxRawIO
 
 
-
 def _dec(x):
     if isinstance(x, (bytes, bytearray)):
         return x.decode("utf-8", errors="ignore")
@@ -49,12 +48,11 @@ def _sig_t0(rr, si):
     return float(rr.get_signal_t_start(block_index=0, seg_index=0, stream_index=si))
 
 def _get_chunk(rr, si, start, stop, chan_idx):
-    # neo 0.14.x prefers i_start/i_stop
+  
     return rr.get_analogsignal_chunk(block_index=0, seg_index=0,
                                      stream_index=si, i_start=start, i_stop=stop,
                                      channel_indexes=chan_idx)
 
-# -------------- stim (TTL hex + pulse fallback) ---------------
 
 _hex_re = re.compile(r"ttl\s*value\s*:\s*0x([0-9a-fA-F]+)", flags=re.I)
 
@@ -89,7 +87,6 @@ def _build_stim_from_ttls(event_times_s, event_ttls, time, mask=None, active_low
     if mask is None or mask == 0:
         mask = _infer_mask_from_sequence(e_v)
         if mask == 0:
-            # nothing toggled – fallback to LSB so user can try ACTIVE_LOW True/False
             mask = 0x0001
 
     idxs = np.searchsorted(e_t, time, side="right")

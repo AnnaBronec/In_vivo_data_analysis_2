@@ -5,6 +5,12 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict
+# Source/nev_events.py
+#from __future__ import annotations
+import os
+import struct
+import numpy as np
+
 
 # -------------------------
 # Zeit-/Einheiten-Helfer
@@ -254,3 +260,135 @@ def load_lightpulses_simple(base_path: str,
         pulses_rel = pulses_abs_s - lfp_t0_s
 
     return pulses_rel.astype(float)
+
+
+
+
+HEADER_BYTES = 16 * 1024  # Neuralynx headers are typically 16KB
+
+def _read_header(f):
+    hdr = f.read(HEADER_BYTES)
+    return hdr
+
+def read_nev_timestamps_and_ttl(nev_path: str):
+    """
+    Minimal reader for Neuralynx Events.nev:
+    returns (ts_us, ttl_values, event_strings)
+
+    IMPORTANT:
+    Neuralynx NEV record layouts can vary slightly by version.
+    This parser uses a very common layout where each record is 184 bytes and contains:
+      - uint64 timestamp (µs)
+      - uint16/ int16 TTL
+      - 128-byte event string
+    If your layout differs, we'll detect nonsense and raise a clear error.
+    """
+    if not os.path.exists(nev_path):
+        raise FileNotFoundError(f"NEV not found: {nev_path}")
+
+    with open(nev_path, "rb") as f:
+        _ = _read_header(f)
+        data = f.read()
+
+    # common record size
+    rec_size = 184
+    if len(data) % rec_size != 0:
+        # still try, but warn by raising a helpful error
+        raise ValueError(
+            f"NEV payload size ({len(data)}) not divisible by {rec_size}. "
+            "Your NEV record layout may differ; we need to adjust the parser."
+        )
+
+    nrec = len(data) // rec_size
+    ts = np.empty(nrec, dtype=np.uint64)
+    ttl = np.empty(nrec, dtype=np.int32)
+    estr = []
+
+    # Heuristic offsets that match a common NEV record:
+    # [ ... 8-byte timestamp ... ][ ... 2-byte TTL ... ][ ... 128-byte string ... ]
+    # We'll parse with conservative offsets and sanity-check afterwards.
+    for i in range(nrec):
+        rec = data[i*rec_size:(i+1)*rec_size]
+
+        # Timestamp often starts after 6 bytes (2+2+2) -> offset 6
+        ts_us = struct.unpack_from("<Q", rec, 6)[0]
+
+        # TTL often appears shortly after timestamp; common is offset 6+8+2 (=16) or nearby.
+        # We'll try a couple candidates and pick the one that yields plausible TTL values.
+        ttl_candidates = [
+            struct.unpack_from("<h", rec, 16)[0],
+            struct.unpack_from("<h", rec, 18)[0],
+            struct.unpack_from("<H", rec, 16)[0],
+            struct.unpack_from("<H", rec, 18)[0],
+        ]
+
+        # Event string is often last 128 bytes
+        s = rec[-128:].split(b"\x00", 1)[0].decode("latin-1", errors="ignore")
+
+        ts[i] = ts_us
+        estr.append(s)
+
+        # store temporary (we'll fix TTL below)
+        ttl[i] = ttl_candidates[0]
+
+    # --- choose best TTL candidate by re-parsing once with a better offset ---
+    # Re-evaluate TTL using offsets 16 vs 18: pick the one that gives many small integers
+    def score_ttl(offset, signed=True):
+        vals = []
+        for i in range(nrec):
+            rec = data[i*rec_size:(i+1)*rec_size]
+            fmt = "<h" if signed else "<H"
+            vals.append(struct.unpack_from(fmt, rec, offset)[0])
+        v = np.asarray(vals, dtype=np.int64)
+        # "plausible" TTL: many values between 0..65535, and not all crazy large magnitude
+        return np.mean((v >= -32768) & (v <= 65535)) - 0.001*np.mean(np.abs(v) > 1_000_000)
+
+    # Try four combinations
+    options = [
+        (16, True), (18, True), (16, False), (18, False)
+    ]
+    best = max(options, key=lambda opt: score_ttl(*opt))
+    best_off, best_signed = best
+
+    vals = []
+    fmt = "<h" if best_signed else "<H"
+    for i in range(nrec):
+        rec = data[i*rec_size:(i+1)*rec_size]
+        vals.append(struct.unpack_from(fmt, rec, best_off)[0])
+    ttl = np.asarray(vals, dtype=np.int64)
+
+    # sanity check timestamps monotonic-ish
+    if np.nanmedian(np.diff(ts.astype(np.float64))) <= 0:
+        raise ValueError("NEV timestamps do not look monotonic. Parser offsets likely wrong.")
+
+    return ts, ttl, estr
+
+
+def ttl_to_on_off(ts_us: np.ndarray, ttl: np.ndarray, bit: int = 0):
+    """
+    Convert TTL words to rising/falling edges for a given bit index.
+    Returns onset_us, offset_us.
+    """
+    ts_us = np.asarray(ts_us, dtype=np.uint64)
+    ttl = np.asarray(ttl, dtype=np.int64)
+
+    # bit mask
+    m = 1 << int(bit)
+    state = (ttl & m) != 0
+    d = np.diff(state.astype(np.int8))
+
+    on_idx = np.where(d == 1)[0] + 1
+    off_idx = np.where(d == -1)[0] + 1
+
+    onset = ts_us[on_idx]
+    offset = ts_us[off_idx]
+
+    # pair them safely
+    if onset.size and offset.size:
+        if offset[0] < onset[0]:
+            offset = offset[1:]
+        n = min(onset.size, offset.size)
+        onset = onset[:n]
+        offset = offset[:n]
+
+    return onset, offset

@@ -4,9 +4,6 @@ import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
-
-# Import der vorhandenen Converter ----
-# Neuralynx-Converter: erwartet (session_dir: str, out_csv: Optional[str])
 from neuralynx_rawio_to_csv import main as nlx_convert_main
 
 # Deine XDAT-Konvertierung als Funktion

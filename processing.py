@@ -6,6 +6,13 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
+import glob
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import re
 
 #Konstanten
 DOWNSAMPLE_FACTOR = 50
@@ -34,139 +41,6 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 LOGFILE = os.path.join(SAVE_DIR, "runlog.txt")
 
-
-def load_parts_to_array_streaming(
-    base_path: str,
-    ds_factor: int = 50,
-    stim_cols = ("stim", "din_1", "din_2", "StartStop", "TTL", "DI0", "DI1"),
-    dtype = np.float32,
-):
-    parts_dir = Path(base_path) / "_csv_parts"
-    part_files = sorted(parts_dir.glob("*.part*.csv"))
-    if not part_files:
-        raise FileNotFoundError(f"Keine Parts unter {parts_dir} gefunden.")
-
-    time_chunks = []
-    data_chunks = []
-    stim_cols_in_file = None
-    chan_cols = None
-
-    # Puls-Sammler (Listen → am Ende concat)
-    p1_list, p2_list = [], []
-
-    def _edges_from_series(t_vec, x_vec, rising_only=True, thr=None):
-        x = pd.to_numeric(x_vec, errors="coerce").to_numpy(dtype=float)
-        if not np.isfinite(x).any():
-            return np.array([], dtype=float)
-        if thr is None:
-            lo, hi = np.nanpercentile(x, [10, 90])
-            thr = (lo + hi) * 0.5
-        b = (x > thr).astype(np.int8)
-        if rising_only:
-            idx = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1
-        else:
-            idx = np.flatnonzero(b[1:] != b[:-1]) + 1
-        idx = idx[(idx >= 0) & (idx < t_vec.size)]
-        return t_vec[idx].astype(float)
-
-    for pf in part_files:
-        df = pd.read_csv(pf, low_memory=False)
-
-        # einmalig: stim-Spalten & Kanalspalten bestimmen
-        if stim_cols_in_file is None:
-            stim_cols_in_file = [c for c in stim_cols if c in df.columns]
-            raw_chan_cols = [c for c in df.columns if c not in ("time", *stim_cols_in_file)]
-            import re
-            def _key_num(s):
-                m = re.findall(r"\d+", s)
-                return int(m[-1]) if m else 0
-            chan_cols = sorted(raw_chan_cols, key=_key_num)
-
-        keep_cols = ["time", *stim_cols_in_file, *chan_cols]
-        df = df[keep_cols]
-
-        if ds_factor > 1:
-            df = df.iloc[::ds_factor, :].reset_index(drop=True)
-
-        t_local = pd.to_numeric(df["time"], errors="coerce").to_numpy(dtype=float)
-
-        # Pulse sammeln
-        if "din_1" in stim_cols_in_file:
-            p1_list.append(_edges_from_series(t_local, df["din_1"]))
-        if "din_2" in stim_cols_in_file:
-            p2_list.append(_edges_from_series(t_local, df["din_2"]))
-        if ("stim" in stim_cols_in_file) and ("din_1" not in stim_cols_in_file) and ("din_2" not in stim_cols_in_file):
-            p1_list.append(_edges_from_series(t_local, df["stim"]))
-
-        # Daten sammeln
-        time_chunks.append(t_local)
-        data_chunks.append(df[chan_cols].to_numpy(dtype=dtype))
-
-        del df  # RAM frei
-
-    time_s = np.concatenate(time_chunks, axis=0)
-    data_all = np.concatenate(data_chunks, axis=0)     # (N, n_ch)
-    LFP_array = data_all.T                              # (n_ch, N)
-
-    # Pulse zusammenführen + entdoppeln
-    pulse_times_1 = np.concatenate(p1_list, axis=0) if p1_list else np.array([], float)
-    pulse_times_2 = np.concatenate(p2_list, axis=0) if p2_list else np.array([], float)
-    if pulse_times_1.size:
-        pulse_times_1 = np.unique(np.round(pulse_times_1, 9))
-    if pulse_times_2.size:
-        pulse_times_2 = np.unique(np.round(pulse_times_2, 9))
-
-    return time_s, LFP_array, chan_cols, pulse_times_1, pulse_times_2
-
-try:
-    print(f"[INFO] pulses(from streaming): p1={len(pulse_times_1_full)}, "
-          f"p2={len(pulse_times_2_full)}, "
-          f"first/last p1: "
-          f"{pulse_times_1_full[0] if len(pulse_times_1_full) else '—'} / "
-          f"{pulse_times_1_full[-1] if len(pulse_times_1_full) else '—'}")
-except NameError:
-    print("[INFO] pulses(from streaming): (Variablen noch nicht definiert)")
-
-
-
-
-def downsample_array_simple(
-    ds_factor: int,
-    time_s: np.ndarray,
-    LFP_array: np.ndarray,
-    pulse_times_1=None,
-    pulse_times_2=None,
-    snap_pulses=True,
-):
-    """
-    Sehr einfache Array-Version vom Downsampling:
-    - nimmt jeden ds_factor-ten Sample
-    - wendet das auf time_s und alle Kanäle an
-    - optional Pulsezeiten auf nächstgelegenen Sample einrasten
-    """
-    time_s = np.asarray(time_s, float)
-    X = np.asarray(LFP_array)
-    step = int(ds_factor) if ds_factor and ds_factor > 1 else 1
-
-    time_ds = time_s[::step]
-    X_ds = X[:, ::step]
-
-    dt = float(time_ds[1] - time_ds[0]) if len(time_ds) > 1 else 1.0
-
-    def _snap(pulses):
-        if pulses is None or len(pulses) == 0:
-            return pulses
-        pulses = np.asarray(pulses, float)
-        if not snap_pulses:
-            return pulses
-        idx = np.searchsorted(time_ds, pulses)
-        idx = np.clip(idx, 0, len(time_ds)-1)
-        return time_ds[idx]
-
-    p1_ds = _snap(pulse_times_1)
-    p2_ds = _snap(pulse_times_2)
-
-    return time_ds, dt, X_ds, p1_ds, p2_ds
 
 
 
@@ -236,41 +110,46 @@ def _ensure_seconds(ts, time_ref, fs_xdat=DEFAULT_FS_XDAT):
         return ts / float(fs_xdat)
     return ts
 
-
-def _safe_crop_to_pulses(time_s, LFP_array, p1, p2, pad=0.5):
+def _safe_crop_to_pulses(time_s, LFP_array, p1, p2, p1_off, p2_off, pad=0.5):
 
     t = np.asarray(time_s, float)
     if t.size == 0:
         print("[CROP] skip: empty time_s")
-        return time_s, LFP_array, p1, p2
+        return time_s, LFP_array, p1, p2, p1_off, p2_off
 
     tmin, tmax = float(t[0]), float(t[-1])
 
     def _clamp(ts):
-        if ts is None: return None
+        if ts is None:
+            return None
         ts = np.asarray(ts, float)
-        if ts.size == 0: return ts
+        if ts.size == 0:
+            return ts
         return ts[(ts >= tmin) & (ts <= tmax)]
 
-    p1c = _clamp(p1)
-    p2c = _clamp(p2)
+    p1c     = _clamp(p1)
+    p2c     = _clamp(p2)
+    p1offc  = _clamp(p1_off)
+    p2offc  = _clamp(p2_off)
 
-    if (p1c is None or p1c.size == 0) and (p2c is None or p2c.size == 0):
-        print("[CROP] no pulses in range -> no cropping")
-        return time_s, LFP_array, p1, p2
+    if ((p1c is None or p1c.size == 0) and (p2c is None or p2c.size == 0)):
+        print("[CROP] no ON pulses in range -> no cropping")
+        return time_s, LFP_array, p1, p2, p1_off, p2_off
 
     spans = []
-    if p1c is not None and p1c.size: spans.append((float(np.min(p1c)), float(np.max(p1c))))
-    if p2c is not None and p2c.size: spans.append((float(np.min(p2c)), float(np.max(p2c))))
+    if p1c is not None and p1c.size:
+        spans.append((float(np.min(p1c)), float(np.max(p1c))))
+    if p2c is not None and p2c.size:
+        spans.append((float(np.min(p2c)), float(np.max(p2c))))
     if not spans:
         print("[CROP] no valid spans -> no cropping")
-        return time_s, LFP_array, p1, p2
+        return time_s, LFP_array, p1, p2, p1_off, p2_off
 
     t0 = max(min(s[0] for s in spans) - pad, tmin)
     t1 = min(max(s[1] for s in spans) + pad, tmax)
     if not (t1 > t0):
         print(f"[CROP] invalid window {t0}..{t1} -> no cropping")
-        return time_s, LFP_array, p1, p2
+        return time_s, LFP_array, p1, p2, p1_off, p2_off
 
     i0 = int(np.searchsorted(t, t0, side="left"))
     i1 = int(np.searchsorted(t, t1, side="right"))
@@ -281,18 +160,25 @@ def _safe_crop_to_pulses(time_s, LFP_array, p1, p2, pad=0.5):
     LFP_new  = LFP_array[:, i0:i1]
 
     def _keep_in(ts):
-        if ts is None: return None
+        if ts is None:
+            return None
         ts = np.asarray(ts, float)
-        if ts.size == 0: return ts
+        if ts.size == 0:
+            return ts
         return ts[(ts >= time_new[0]) & (ts <= time_new[-1])]
 
-    p1_new = _keep_in(p1c)
-    p2_new = _keep_in(p2c)
+    p1_new    = _keep_in(p1c)
+    p2_new    = _keep_in(p2c)
+    p1off_new = _keep_in(p1offc)
+    p2off_new = _keep_in(p2offc)
 
     print(f"[CROP] window {t0:.3f}–{t1:.3f} s -> time_s len={len(time_new)}, "
           f"LFP_array={LFP_new.shape}, p1={0 if p1_new is None else len(p1_new)}, "
-          f"p2={0 if p2_new is None else len(p2_new)}")
-    return time_new, LFP_new, p1_new, p2_new
+          f"p2={0 if p2_new is None else len(p2_new)}, "
+          f"p1_off={0 if p1off_new is None else len(p1off_new)}, "
+          f"p2_off={0 if p2off_new is None else len(p2off_new)}")
+
+    return time_new, LFP_new, p1_new, p2_new, p1off_new, p2off_new
 
 def _empty_updict():
     import numpy as np
@@ -838,7 +724,6 @@ def _as_valid_idx(arr, n):
 
 def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
 
-    
     FIELDNAMES = [
         "Parent","Experiment","Dauer [s]","Samplingrate [Hz]","Kanäle",
         "Pulse count 1","Pulse count 2",
@@ -846,6 +731,8 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         "Downstates total","UP/DOWN ratio",
         "Mean UP Dauer [s]","Mean UP Dauer Triggered [s]","Mean UP Dauer Spontaneous [s]",
         "Datum Analyse",
+        "UP rate total [Hz]",
+        "UP rate total [/min]",
     ]
     print("[ROLLUP][DEBUG] summary_path =", summary_path)
     exp_dir       = os.path.dirname(summary_path)

@@ -237,9 +237,20 @@ def export_interactive_lfp_html(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
     )
 
+            # RICHTIG: nimm den Parameter pulse_times_1
+    if pulse_times_1 is not None and len(pulse_times_1):
+        for x in pulse_times_1:
+            fig.add_vline(x=float(x), line_width=3, line_dash="solid")
+
+    if pulse_times_1_off is not None and len(pulse_times_1_off):
+        for x in pulse_times_1_off:
+            fig.add_vline(x=float(x), line_width=2, line_dash="dot")
+
+
     out_html = os.path.join(save_dir, f"{base_tag}__lfp_interactive.html")
     plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
     print(f"[HTML] interaktiver LFP-Plot: {out_html}")
+
     return out_html
 
 
@@ -277,3 +288,95 @@ def _nan_stats(name, arr):
 def _rms(a):
     a = np.asarray(a, float); a = a[np.isfinite(a)]
     return float(np.sqrt(np.mean(a*a))) if a.size else np.nan
+
+
+import os
+import struct
+import numpy as np
+
+def read_nev_ttl_events(nev_path):
+    """
+    Returns arrays: ts_us (uint64), ttl (uint16), event_id (uint16), event_str (list[str])
+    NEV format: 16 kB ASCII header, then fixed-size records (184 bytes).
+    """
+    RECORD_SIZE = 184
+    HEADER_SIZE = 16 * 1024
+
+    ts_list = []
+    ttl_list = []
+    id_list  = []
+    str_list = []
+
+    with open(nev_path, "rb") as f:
+        f.seek(HEADER_SIZE)
+
+        while True:
+            rec = f.read(RECORD_SIZE)
+            if len(rec) < RECORD_SIZE:
+                break
+
+            # Neuralynx NEV record layout (common):
+            # uint64 TimeStamp
+            # uint16 EventID
+            # uint16 TTL
+            # uint16 CRC
+            # uint16 Dummy1
+            # uint16 Dummy2
+            # int32 ExtraData[8]
+            # char EventString[128]
+            ts_us, event_id, ttl = struct.unpack_from("<QHH", rec, 0)
+
+            # EventString starts after 8+2+2+2+2+2 + 8*4 = 48 bytes
+            # 0..47 = fixed fields, 48..175 = event string (128 bytes)
+            ev_raw = rec[48:48+128]
+            ev_str = ev_raw.split(b"\x00", 1)[0].decode("latin-1", errors="replace").strip()
+
+            ts_list.append(ts_us)
+            ttl_list.append(ttl)
+            id_list.append(event_id)
+            str_list.append(ev_str)
+
+    ts_us = np.asarray(ts_list, dtype=np.uint64)
+    ttl   = np.asarray(ttl_list, dtype=np.uint16)
+    eid   = np.asarray(id_list,  dtype=np.uint16)
+    return ts_us, ttl, eid, str_list
+
+
+def ttl_on_off_from_nev(ts_us, ttl, *, bitmask=None):
+    """
+    Compute (on_us, off_us) from TTL transitions.
+    If bitmask is None: uses ttl != 0 as 'high'.
+    If bitmask is given (e.g. 1<<0): uses that bit only.
+    """
+    ts_us = np.asarray(ts_us, dtype=np.uint64)
+    ttl   = np.asarray(ttl, dtype=np.uint16)
+
+    if ts_us.size == 0:
+        return np.array([], dtype=np.uint64), np.array([], dtype=np.uint64)
+
+    if bitmask is None:
+        high = (ttl != 0).astype(np.int8)
+    else:
+        high = ((ttl & np.uint16(bitmask)) != 0).astype(np.int8)
+
+    # transitions:
+    dh = np.diff(high)
+    on_idx  = np.where(dh ==  1)[0] + 1
+    off_idx = np.where(dh == -1)[0] + 1
+
+    # Handle if starts already high
+    if high[0] == 1:
+        on_idx = np.r_[0, on_idx]
+    # Handle if ends high
+    if high[-1] == 1:
+        off_idx = np.r_[off_idx, high.size - 1]
+
+    m = min(on_idx.size, off_idx.size)
+    on_idx, off_idx = on_idx[:m], off_idx[:m]
+
+    on_us  = ts_us[on_idx].astype(np.uint64)
+    off_us = ts_us[off_idx].astype(np.uint64)
+
+    # guard: ensure off > on
+    good = off_us > on_us
+    return on_us[good], off_us[good]

@@ -12,13 +12,14 @@ import matplotlib.pyplot as plt
 from scipy import stats
 from matplotlib.colors import SymLogNorm, TwoSlopeNorm
 import gc
+from glob import glob
 from scipy.ndimage import gaussian_filter
 from sklearn.decomposition import PCA
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import TwoSlopeNorm, SymLogNorm
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Patch
-from loader_old import load_LFP_new
+from loader_old import load_LFP_new, _read_header, read_nev_timestamps_and_ttl, ttl_to_on_off
 from matplotlib import gridspec
 from scipy.signal import welch
 from matplotlib.colors import SymLogNorm
@@ -43,7 +44,7 @@ from plotter import (
     compute_refrac_from_spont_to_spon_and_trig,
 )
 
-import os, glob
+import os
 import sys, os
 from datetime import datetime
 
@@ -54,8 +55,6 @@ from Exports import (
      _rms
 )
 from processing import (
-    load_parts_to_array_streaming,
-    downsample_array_simple, 
     _counts_to_uV, _volts_to_uV, 
     convert_df_to_uV, _decimate_xy, 
     _ensure_main_channel,
@@ -107,25 +106,388 @@ parts_dir = Path(BASE_PATH) / "_csv_parts"
 is_merged_run = os.environ.get("BATCH_IS_MERGED_RUN", "0") == "1"
 has_explicit_filename = "LFP_FILENAME" in globals()
 
+# --- Default init (so we never get NameError) ---
+pulse_times_1_html     = np.array([], dtype=float)
+pulse_times_1_off_html = np.array([], dtype=float)
+pulse_times_2_html     = np.array([], dtype=float)
+pulse_times_2_off_html = np.array([], dtype=float)
 
-if (not is_merged_run) and (not has_explicit_filename) and parts_dir.exists() and any(parts_dir.glob("*.part*.csv")):
-    print(f"[INFO] Parts erkannt unter {parts_dir} -> streaming load")
-    time_s, LFP_array, chan_cols, pulse_times_1_full, pulse_times_2_full = \
-        load_parts_to_array_streaming(BASE_PATH, ds_factor=DOWNSAMPLE_FACTOR)
-    lfp_meta = {"source": "parts-streaming"}
 
-    LFP_df = None
+def edges_from_parts_csv(parts_dir, col, time_col="time", thr=None):
+    """
+    Liest col (z.B. 'stim', 'din_1', 'din_2') aus allen *_csv_parts/*.part*.csv
+    und liefert (t_on, t_off) in Sekunden.
+    Funktioniert auch, wenn die TTL-Spur 0/5V oder 0/1 ist.
+    """
 
-    log(f"MODE: streaming={ (not is_merged_run) and (not has_explicit_filename) } parts_dir={parts_dir}")
-   
+
+    # Part-Dateien sortiert
+    files = sorted(glob.glob(os.path.join(str(parts_dir), "*.part*.csv")))
+    if not files:
+        return np.array([], float), np.array([], float)
+
+
+
+    # --- time_col auto-detect
+    if time_col is None:
+        # nimm erste Datei, schau Header
+        head = pd.read_csv(files[0], nrows=1)
+        for cand in ["time", "timesamples", "timestamp", "t", "Time"]:
+            if cand in head.columns:
+                time_col = cand
+                break
+        if time_col is None:
+            return np.array([], float), np.array([], float)
+    # --- 1) Threshold bestimmen (wenn nicht gegeben)
+    # Für quasi-binary TTL reicht min/max -> thr = (min+max)/2
+    if thr is None:
+        vmin = np.inf
+        vmax = -np.inf
+        for fp in files:
+            try:
+                df = pd.read_csv(fp, usecols=[time_col, col])
+            except ValueError:
+                # Spalte existiert in diesem Part nicht
+                continue
+            x = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
+            x = x[np.isfinite(x)]
+            if x.size == 0:
+                continue
+            vmin = min(vmin, float(np.min(x)))
+            vmax = max(vmax, float(np.max(x)))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            return np.array([], float), np.array([], float)
+        thr = 0.5 * (vmin + vmax)
+
+    # --- 2) Edges finden (mit Zustand über Part-Grenzen)
+    t_on = []
+    t_off = []
+    prev_b = None
+
+    for fp in files:
+        try:
+            df = pd.read_csv(fp, usecols=[time_col, col])
+        except ValueError:
+            continue
+
+        tt = pd.to_numeric(df[time_col], errors="coerce").to_numpy(float)
+        xx = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
+
+        m = np.isfinite(tt) & np.isfinite(xx)
+        if not np.any(m):
+            continue
+        tt = tt[m]
+        xx = xx[m]
+
+        b = (xx > thr).astype(np.int8)
+
+        # chunk-interne edges
+        if b.size >= 2:
+            rise = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1
+            fall = np.flatnonzero((b[1:] == 0) & (b[:-1] == 1)) + 1
+            if rise.size:
+                t_on.extend(tt[rise].tolist())
+            if fall.size:
+                t_off.extend(tt[fall].tolist())
+
+        # edge über Part-Grenze (prev_b -> erster b in diesem chunk)
+        if prev_b is not None and b.size >= 1:
+            if prev_b == 0 and b[0] == 1:
+                t_on.append(float(tt[0]))
+            elif prev_b == 1 and b[0] == 0:
+                t_off.append(float(tt[0]))
+
+        prev_b = int(b[-1]) if b.size else prev_b
+
+    return np.asarray(t_on, float), np.asarray(t_off, float)
+
+from glob import glob
+from pathlib import Path
+
+def edges_stateful(t_vec, x_vec, thr, prev_b=None):
+    """
+    Findet rising+falling edges in einem Chunk, aber behält Zustand über Chunkgrenzen.
+    Returns: (t_on, t_off, prev_b_new)
+    """
+
+    t = np.asarray(t_vec, float)
+    x = pd.to_numeric(x_vec, errors="coerce").to_numpy(float)
+
+    m = np.isfinite(t) & np.isfinite(x)
+    if not np.any(m):
+        return np.array([], float), np.array([], float), prev_b
+
+    t = t[m]
+    x = x[m]
+    b = (x > thr).astype(np.int8)
+
+    on_idx  = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1
+    off_idx = np.flatnonzero((b[1:] == 0) & (b[:-1] == 1)) + 1
+
+    t_on  = t[on_idx].astype(float)  if on_idx.size  else np.array([], float)
+    t_off = t[off_idx].astype(float) if off_idx.size else np.array([], float)
+
+    # edge über Chunkgrenze
+    if prev_b is not None and b.size:
+        if prev_b == 0 and b[0] == 1:
+            t_on = np.concatenate([[float(t[0])], t_on])
+        elif prev_b == 1 and b[0] == 0:
+            t_off = np.concatenate([[float(t[0])], t_off])
+
+    prev_b_new = int(b[-1]) if b.size else prev_b
+    return t_on, t_off, prev_b_new
+
+def _edges_stateful_internal(t, x, thr, prev_b):
+    b = (x > thr).astype(np.int8)
+
+    on_idx  = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1
+    off_idx = np.flatnonzero((b[1:] == 0) & (b[:-1] == 1)) + 1
+
+    t_on  = t[on_idx].astype(float)
+    t_off = t[off_idx].astype(float)
+
+    # Flanke über Chunk-Grenze
+    if prev_b is not None:
+        if prev_b == 0 and b[0] == 1:
+            t_on = np.insert(t_on, 0, t[0])
+        elif prev_b == 1 and b[0] == 0:
+            t_off = np.insert(t_off, 0, t[0])
+
+    return t_on, t_off, int(b[-1])
+
+
+def load_parts_to_array_streaming_with_ttl(
+    base_path: str,
+    ds_factor: int = 50,
+    stim_cols=("stim", "din_1", "din_2", "StartStop", "TTL", "DI0", "DI1"),
+    dtype=np.float32,
+):
+    """
+    Streaming loader:
+    - LFP wird downsampled (ds_factor)
+    - TTL wird FULL-RES gelesen, edges stateful über part-Grenzen
+    Returns:
+      time_ds, LFP_array_ds, chan_cols,
+      p1_on_full, p1_off_full, p2_on_full, p2_off_full,
+      meta (dict mit stim_cols gefunden)
+    """
+
+    prev_b1 = None
+    prev_b2 = None
+    thr1 = None
+    thr2 = None
+
+    parts_dir = Path(base_path) / "_csv_parts"
+    part_files = sorted(parts_dir.glob("*.part*.csv"))
+    if not part_files:
+        raise FileNotFoundError(f"Keine Parts unter {parts_dir} gefunden.")
+
+    time_chunks = []
+    data_chunks = []
+    stim_cols_in_file = None
+    chan_cols = None
+
+    # TTL-sammler (full-res times)
+    p1_on_list, p1_off_list = [], []
+    p2_on_list, p2_off_list = [], []
+
+
+
+    def _key_num(s):
+        m = re.findall(r"\d+", str(s))
+        return int(m[-1]) if m else 0
+
+    for pf in part_files:
+        df = pd.read_csv(pf, low_memory=False)
+
+        # einmalig stim + channels bestimmen
+        if stim_cols_in_file is None:
+            stim_cols_in_file = [c for c in stim_cols if c in df.columns]
+            raw_chan_cols = [c for c in df.columns if c not in ("time", *stim_cols_in_file)]
+            chan_cols = sorted(raw_chan_cols, key=_key_num)
+
+        # -------------------------
+        # (A) TTL FULL-RES edges
+        # -------------------------
+        if "time" in df.columns:
+            t_full = pd.to_numeric(df["time"], errors="coerce").to_numpy(float)
+        else:
+            # kein time -> skip
+            t_full = None
+
+        if t_full is not None and t_full.size:
+
+            if "din_1" in stim_cols_in_file:
+                x1 = df["din_1"]
+                if thr1 is None:
+                    xx = pd.to_numeric(x1, errors="coerce").to_numpy(float)
+                    xx = xx[np.isfinite(xx)]
+                    if xx.size:
+                        lo, hi = np.nanpercentile(xx, [10, 90])
+                        thr1 = 0.5 * (lo + hi)
+                if thr1 is not None:
+                    on, off, prev_b1 = edges_stateful(t_full, x1, thr1, prev_b1)
+                    p1_on_list.append(on); p1_off_list.append(off)
+
+            if "din_2" in stim_cols_in_file:
+                x2 = df["din_2"]
+                if thr2 is None:
+                    xx = pd.to_numeric(x2, errors="coerce").to_numpy(float)
+                    xx = xx[np.isfinite(xx)]
+                    if xx.size:
+                        lo, hi = np.nanpercentile(xx, [10, 90])
+                        thr2 = 0.5 * (lo + hi)
+                if thr2 is not None:
+                    on, off, prev_b2 = edges_stateful(t_full, x2, thr2, prev_b2)
+                    p2_on_list.append(on); p2_off_list.append(off)
+
+            # Fallback: wenn weder din_1 noch din_2 existiert, nimm stim als p1
+            if ("din_1" not in stim_cols_in_file) and ("din_2" not in stim_cols_in_file) and ("stim" in stim_cols_in_file):
+                x1 = df["stim"]
+                if thr1 is None:
+                    xx = pd.to_numeric(x1, errors="coerce").to_numpy(float)
+                    xx = xx[np.isfinite(xx)]
+                    if xx.size:
+                        lo, hi = np.nanpercentile(xx, [10, 90])
+                        thr1 = 0.5 * (lo + hi)
+                if thr1 is not None:
+                    on, off, prev_b1 = edges_stateful(t_full, x1, thr1, prev_b1)
+                    p1_on_list.append(on); p1_off_list.append(off)
+
+        # -------------------------
+        # (B) LFP DOWNSAMPLED
+        # -------------------------
+        keep_cols = ["time", *chan_cols]
+        df_lfp = df[keep_cols]
+
+        if ds_factor and ds_factor > 1:
+            df_lfp = df_lfp.iloc[::int(ds_factor), :].reset_index(drop=True)
+
+        t_ds = pd.to_numeric(df_lfp["time"], errors="coerce").to_numpy(float)
+        time_chunks.append(t_ds)
+        data_chunks.append(df_lfp[chan_cols].to_numpy(dtype=dtype))
+
+        del df, df_lfp
+
+    # concat LFP
+    time_ds = np.concatenate(time_chunks, axis=0)
+    data_all = np.concatenate(data_chunks, axis=0)      # (N, n_ch)
+    LFP_array_ds = data_all.T                           # (n_ch, N)
+
+    # concat pulses + uniq
+    def _cat_uniq(lst):
+        import numpy as np
+        if not lst:
+            return np.array([], float)
+        x = np.concatenate(lst, axis=0)
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            return np.array([], float)
+        return np.unique(np.round(x.astype(float), 9))
+
+    p1_on_full  = _cat_uniq(p1_on_list)
+    p1_off_full = _cat_uniq(p1_off_list)
+    p2_on_full  = _cat_uniq(p2_on_list)
+    p2_off_full = _cat_uniq(p2_off_list)
+
+    meta = {"stim_cols_in_file": stim_cols_in_file, "parts_dir": str(parts_dir)}
+    return time_ds, LFP_array_ds, chan_cols, p1_on_full, p1_off_full, p2_on_full, p2_off_full, meta
+
+
+
+def snap_times_to_timebase(times, time_s):
+    """
+    Snap event times (in seconds) to nearest sample in time_s (monotonic).
+    """
+    import numpy as np
+    if times is None:
+        return None
+    t = np.asarray(times, float)
+    t = t[np.isfinite(t)]
+    if t.size == 0:
+        return np.array([], float)
+    idx = np.searchsorted(time_s, t)
+    idx = np.clip(idx, 0, len(time_s)-1)
+    return time_s[idx]
+
+
+parts_dir = Path(BASE_PATH) / "_csv_parts"
+is_merged_run = os.environ.get("BATCH_IS_MERGED_RUN", "0") == "1"
+has_explicit_filename = "LFP_FILENAME" in globals()
+
+USE_STREAM = (
+    (not is_merged_run) and (not has_explicit_filename)
+    and parts_dir.exists()
+    and any(parts_dir.glob("*.part*.csv"))
+)
+
+if USE_STREAM:
+    print(f"[INFO] Parts erkannt unter {parts_dir} -> streaming load (LFP downsampled, TTL full-res)")
+    time_s, LFP_array, chan_cols, p1_on_full, p1_off_full, p2_on_full, p2_off_full, lfp_meta = \
+        load_parts_to_array_streaming_with_ttl(BASE_PATH, ds_factor=DOWNSAMPLE_FACTOR)
+
+    LFP_df = None  # wichtig: signalisiert downstream "stream"
+    print(f"[STREAM] pulses(full-res): p1_on={len(p1_on_full)} p1_off={len(p1_off_full)} "
+          f"| p2_on={len(p2_on_full)} p2_off={len(p2_off_full)}")
 
 else:
     LFP_df, chan_cols, lfp_meta = load_LFP_new(BASE_PATH, LFP_FILENAME)
     time_s = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
     LFP_array = LFP_df[chan_cols].to_numpy(dtype=np.float32).T
-    log(f"Streaming load OK: time={time_s.shape}, LFP_array={LFP_array.shape}, chans={len(chan_cols)}")
+    print(f"[INFO] Non-stream load OK: time={time_s.shape}, LFP_array={LFP_array.shape}, chans={len(chan_cols)}")
 
 FROM_STREAM = (LFP_df is None)
+
+# EV wins: init pulses only if not already set
+if "pulse_times_1_full" not in globals() or pulse_times_1_full is None:
+    pulse_times_1_full = np.array([], dtype=float)
+if "pulse_times_1_off_full" not in globals() or pulse_times_1_off_full is None:
+    pulse_times_1_off_full = np.array([], dtype=float)
+if "pulse_times_2_full" not in globals() or pulse_times_2_full is None:
+    pulse_times_2_full = np.array([], dtype=float)
+if "pulse_times_2_off_full" not in globals() or pulse_times_2_off_full is None:
+    pulse_times_2_off_full = np.array([], dtype=float)
+
+HAVE_NEV = False  # wird ggf. nach NEV-read True
+
+
+
+
+nev_path = os.path.join(BASE_PATH, "Events.nev")
+if os.path.exists(nev_path):
+    try:
+        ts_us, ttl_words, _ = read_nev_timestamps_and_ttl(nev_path)
+
+        # TTL bit wählen (0 ist Start; wenn 0 nix liefert: 1..15 testen)
+        on_us, off_us = ttl_to_on_off(ts_us, ttl_words, bit=0)
+
+        t0_us = None
+        if isinstance(lfp_meta, dict):
+            # typische Keys (je nach Loader)
+            for k in ["csc_t0_us", "t0_us", "first_ts_us", "start_ts_us", "first_timestamp_us"]:
+                if k in lfp_meta and lfp_meta[k] is not None:
+                    t0_us = int(lfp_meta[k])
+                    break
+
+        if t0_us is None:
+            # Fallback: setze NEV so, dass ts_us[0] -> time_s[0]
+            # (funktioniert, wenn time_s in Sekunden relativ zu Start ist oder konstant verschoben)
+            t0_us = int(ts_us[0] - float(time_s[0]) * 1e6)
+
+        pulse_times_1_full     = (on_us  - t0_us) / 1e6
+        pulse_times_1_off_full = (off_us - t0_us) / 1e6
+
+        # optional: direkt auch intervals (full) bauen
+        pulse_intervals_1_full = list(zip(pulse_times_1_full, pulse_times_1_off_full))
+
+        print(f"[NEV] pulses loaded: on={len(pulse_times_1_full)} off={len(pulse_times_1_off_full)} "
+              f"(t0_us={t0_us})")
+
+    except Exception as e:
+        print("[NEV][WARN] reading/parsing failed:", e)
+else:
+    print("[NEV] Events.nev not found -> fallback to CSV stim/din edges")
+
 
 if not FROM_STREAM:
     assert "time" in LFP_df.columns, "CSV braucht eine Spalte 'time'."
@@ -162,137 +524,148 @@ UNIT_LABEL = "µV/mm²"
 PSD_UNIT_LABEL = "µV²/Hz"
 
 
+
 if ANALYSE_IN_AU:
     UNIT_LABEL = "a.u."
     PSD_UNIT_LABEL = "a.u.^2/Hz"
 
+
+
 if FROM_STREAM:
     print(f"[INFO] pulses(from streaming): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)}")
 else:
-   #Pulse direkt aus dem DataFrame ziehen
-    pulse_times_1_full = np.array([], dtype=float)
-    pulse_times_2_full = np.array([], dtype=float)
-    pulse_times_1_off_full = np.array([], dtype=float)
-    pulse_times_2_off_full = np.array([], dtype=float)
+    # -------------------------------------------------------
+    # CSV edge detect only if NO NEV pulses were loaded
+    # -------------------------------------------------------
+    HAVE_NEV = (pulse_times_1_full is not None) and (len(pulse_times_1_full) > 0)
 
-    stim_like_cols = []
+    if not HAVE_NEV:
+        # Pulse direkt aus dem DataFrame ziehen (Fallback)
+        pulse_times_1_full = np.array([], dtype=float)
+        pulse_times_2_full = np.array([], dtype=float)
+        pulse_times_1_off_full = np.array([], dtype=float)
+        pulse_times_2_off_full = np.array([], dtype=float)
 
-    time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
+        stim_like_cols = []
 
-    def _edges_from_col(col, rising_only=True, thr=None):
-        x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
-        if not np.isfinite(x).any():
-            return np.array([], dtype=float)
-        if thr is None:
-            lo, hi = np.nanpercentile(x, [10, 90])
-            thr = (lo + hi) * 0.5
-        b = (x > thr).astype(np.int8)
-        idx = (np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1) if rising_only \
-              else (np.flatnonzero(b[1:] != b[:-1]) + 1)
-        idx = idx[(idx >= 0) & (idx < time_full.size)]
-        return time_full[idx].astype(float)
-        
-    def _rising_falling_from_col(col, thr=None):
-        x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
-        if not np.isfinite(x).any():
-            return np.array([], float), np.array([], float)
+        time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
 
-        if thr is None:
-            lo, hi = np.nanpercentile(x, [10, 90])
-            thr = (lo + hi) * 0.5
+        def _edges_from_col(col, rising_only=True, thr=None):
+            x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+            if not np.isfinite(x).any():
+                return np.array([], dtype=float)
+            if thr is None:
+                lo, hi = np.nanpercentile(x, [10, 90])
+                thr = (lo + hi) * 0.5
+            b = (x > thr).astype(np.int8)
+            idx = (np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1) if rising_only \
+                  else (np.flatnonzero(b[1:] != b[:-1]) + 1)
+            idx = idx[(idx >= 0) & (idx < time_full.size)]
+            return time_full[idx].astype(float)
 
-        b = (x > thr).astype(np.int8)
+        def _rising_falling_from_col(col, thr=None):
+            x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+            if not np.isfinite(x).any():
+                return np.array([], float), np.array([], float)
 
-        rising_idx  = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1   # 0->1
-        falling_idx = np.flatnonzero((b[1:] == 0) & (b[:-1] == 1)) + 1   # 1->0
+            if thr is None:
+                lo, hi = np.nanpercentile(x, [10, 90])
+                thr = (lo + hi) * 0.5
 
-        rising_idx  = rising_idx[(rising_idx >= 0) & (rising_idx < time_full.size)]
-        falling_idx = falling_idx[(falling_idx >= 0) & (falling_idx < time_full.size)]
+            b = (x > thr).astype(np.int8)
+            rising_idx  = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1
+            falling_idx = np.flatnonzero((b[1:] == 0) & (b[:-1] == 1)) + 1
 
-        return time_full[rising_idx].astype(float), time_full[falling_idx].astype(float)
+            rising_idx  = rising_idx[(rising_idx >= 0) & (rising_idx < time_full.size)]
+            falling_idx = falling_idx[(falling_idx >= 0) & (falling_idx < time_full.size)]
 
-        
+            return time_full[rising_idx].astype(float), time_full[falling_idx].astype(float)
 
-    def _is_quasi_binary(col):
-        x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
-        x = x[np.isfinite(x)]
-        if x.size < 10:
-            return False
-        vals = np.unique(np.round(x, 3))
-        if len(vals) <= 4:
-            return True
-        p01 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
-        return p01 >= 0.95
+        def _is_quasi_binary(col):
+            x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
+            x = x[np.isfinite(x)]
+            if x.size < 10:
+                return False
+            vals = np.unique(np.round(x, 3))
+            if len(vals) <= 4:
+                return True
+            p01 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
+            return p01 >= 0.95
 
-    # 1) Bevorzugte Spaltennamen durchgehen
-    preferred = [c for c in ["din_1","din_2","stim","StartStop","TTL","DI0","DI1"] if c in LFP_df.columns]
-    # if "din_1" in preferred:
-    #     t = _edges_from_col("din_1", rising_only=True, thr=None)
-    #     if t.size: pulse_times_1_full, stim_like_cols = t, stim_like_cols+["din_1"]
-    # if "din_2" in preferred:
-    #     t = _edges_from_col("din_2", rising_only=True, thr=None)
-    #     if t.size: pulse_times_2_full, stim_like_cols = t, stim_like_cols+["din_2"]
-    if "din_1" in preferred:
-        t_on, t_off = _rising_falling_from_col("din_1", thr=None)
-        if t_on.size:
-            pulse_times_1_full = t_on
+        preferred = [c for c in ["din_1","din_2","stim","StartStop","TTL","DI0","DI1"] if c in LFP_df.columns]
+
+        if "din_1" in preferred:
+            t_on, t_off = _rising_falling_from_col("din_1", thr=None)
+            if t_on.size:
+                pulse_times_1_full = t_on
+                pulse_times_1_off_full = t_off
+                stim_like_cols += ["din_1"]
+
+        if "din_2" in preferred:
+            t_on, t_off = _rising_falling_from_col("din_2", thr=None)
+            if t_on.size:
+                pulse_times_2_full = t_on
+                pulse_times_2_off_full = t_off
+                stim_like_cols += ["din_2"]
+
+        if pulse_times_1_full.size == 0 and "stim" in preferred:
+            t_on, t_off = _rising_falling_from_col("stim", thr=None)
+            if t_on.size:
+                pulse_times_1_full = t_on
+                pulse_times_1_off_full = t_off
+                stim_like_cols += ["stim"]
+
+        if pulse_times_1_full.size == 0:
+            for cand in ["StartStop","TTL","DI0","DI1"]:
+                if cand in preferred:
+                    t_on, t_off = _rising_falling_from_col(cand, thr=None)
+                    if t_on.size:
+                        pulse_times_1_full = t_on
+                        pulse_times_1_off_full = t_off
+                        stim_like_cols += [cand]
+                        break
+
+        if pulse_times_1_full.size == 0 and pulse_times_2_full.size == 0:
+            candidates = [c for c in LFP_df.columns if c not in ("time",)]
+            bin_cols = [c for c in candidates if _is_quasi_binary(c)]
+            best_col, best_count = None, -1
+            for c in bin_cols:
+                t_on = _edges_from_col(c, rising_only=True, thr=None)
+                if t_on.size > best_count:
+                    best_col, best_count = c, t_on.size
+            if best_col is not None and best_count > 0:
+                t_on, t_off = _rising_falling_from_col(best_col, thr=None)
+                pulse_times_1_full = t_on
+                pulse_times_1_off_full = t_off
+                stim_like_cols += [best_col]
+                print(f"[INFO] Auto-detected stim channel: {best_col} (on={len(t_on)} off={len(t_off)})")
+
+        print(f"[INFO] pulses(full): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)} "
+              f"| from columns: {', '.join(stim_like_cols) if stim_like_cols else '—'}")
+
+    else:
+        # NEV already provided pulses -> DON'T overwrite
+        print(f"[NEV] using NEV pulses: p1_on={len(pulse_times_1_full)} p1_off={len(pulse_times_1_off_full)}")
+
+
+print("[PULSE SOURCE CHECK] HAVE_NEV =", (pulse_times_1_full is not None and len(pulse_times_1_full) > 0),
+      "| p1_on =", 0 if pulse_times_1_full is None else len(pulse_times_1_full),
+      "| p1_off =", 0 if pulse_times_1_off_full is None else len(pulse_times_1_off_full))
+
+
+# --- HARD GUARANTEE: if we detected a stim column, compute OFF too ---
+if (pulse_times_1_full is not None and len(pulse_times_1_full) > 0):
+    # try to infer which column produced p1
+    stim_col_used = None
+    if 'stim_like_cols' in locals() and len(stim_like_cols) > 0:
+        stim_col_used = stim_like_cols[0]
+
+    if stim_col_used is not None and ('LFP_df' in globals()) and (LFP_df is not None) and (stim_col_used in LFP_df.columns):
+        t_on, t_off = _rising_falling_from_col(stim_col_used, thr=None)
+        if (pulse_times_1_off_full is None) or (len(pulse_times_1_off_full) == 0):
             pulse_times_1_off_full = t_off
-            stim_like_cols = stim_like_cols + ["din_1"]
+        print(f"[FORCE-OFF] from '{stim_col_used}': on={len(t_on)} off={len(t_off)}")
 
-    if "din_2" in preferred:
-        t_on, t_off = _rising_falling_from_col("din_2", thr=None)
-        if t_on.size:
-            pulse_times_2_full = t_on
-            pulse_times_2_off_full = t_off
-            stim_like_cols = stim_like_cols + ["din_2"]
-
-
-    if pulse_times_1_full.size == 0 and "stim" in preferred:
-        t_on, t_off = _rising_falling_from_col("stim", thr=None)
-        if t_on.size:
-            pulse_times_1_full = t_on
-            pulse_times_1_off_full = t_off
-            stim_like_cols = stim_like_cols + ["stim"]
-
-
-    # if pulse_times_1_full.size == 0 and "stim" in preferred:
-    #     t = _edges_from_col("stim", rising_only=True, thr=None)
-    #     if t.size: pulse_times_1_full, stim_like_cols = t, stim_like_cols+["stim"]
-    # Falls StartStop/TTL nur eine Spur ist → als p1 nehmen
-    # if pulse_times_1_full.size == 0:
-    #     for cand in ["StartStop","TTL","DI0","DI1"]:
-    #         if cand in preferred:
-    #             t = _edges_from_col(cand, rising_only=True, thr=None)
-    #             if t.size:
-    #                 pulse_times_1_full, stim_like_cols = t, stim_like_cols+[cand]
-    #                 break
-
-    if pulse_times_1_full.size == 0:
-        for cand in ["StartStop","TTL","DI0","DI1"]:
-            if cand in preferred:
-                t_on, t_off = _rising_falling_from_col(cand, thr=None)
-                if t_on.size:
-                    pulse_times_1_full = t_on
-                    pulse_times_1_off_full = t_off
-                    stim_like_cols = stim_like_cols + [cand]
-                    break
-
-    # 2) Auto-Detect (wenn bisher nichts gefunden): nimm (nahezu) binäre Spalte mit meisten Flanken
-    if pulse_times_1_full.size == 0 and pulse_times_2_full.size == 0:
-        candidates = [c for c in LFP_df.columns if c not in ("time",)]
-        bin_cols = [c for c in candidates if _is_quasi_binary(c)]
-        best_col, best_count = None, -1
-        for c in bin_cols:
-            t = _edges_from_col(c, rising_only=True, thr=None)
-            if t.size > best_count:
-                best_col, best_count = c, t.size
-        if best_col is not None and best_count > 0:
-            pulse_times_1_full = _edges_from_col(best_col, rising_only=True, thr=None)
-            stim_like_cols.append(best_col)
-            print(f"[INFO] Auto-detected stim channel: {best_col} (rising edges: {len(pulse_times_1_full)})")
-
-    print(f"[INFO] pulses(full): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)} "
-          f"| from columns: {', '.join(stim_like_cols) if stim_like_cols else '—'}")
 
 if not FROM_STREAM:
     chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
@@ -319,25 +692,50 @@ else:
 
 
 if FROM_STREAM:
-    # direktes Array-Downsampling, KEIN DataFrame
-    time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = downsample_array_simple(
-        DOWNSAMPLE_FACTOR,
-        time_s,
-        LFP_array,
-        pulse_times_1=pulse_times_1_full,
-        pulse_times_2=pulse_times_2_full,
-        snap_pulses=True,
-    )
+    dt = float(np.median(np.diff(time_s))) if len(time_s) > 1 else 1.0
+
+    pulse_times_1_html     = np.asarray(p1_on_full,  float)
+    pulse_times_1_off_html = np.asarray(p1_off_full, float)
+    pulse_times_2_html     = np.asarray(p2_on_full,  float)
+    pulse_times_2_off_html = np.asarray(p2_off_full, float)
+
+    pulse_times_1     = snap_times_to_timebase(pulse_times_1_html,     time_s)
+    pulse_times_1_off = snap_times_to_timebase(pulse_times_1_off_html, time_s)
+    pulse_times_2     = snap_times_to_timebase(pulse_times_2_html,     time_s)
+    pulse_times_2_off = snap_times_to_timebase(pulse_times_2_off_html, time_s)
+
+
+    print(f"[STREAM] after snap: p1_on={len(pulse_times_1)} p1_off={len(pulse_times_1_off)} "
+          f"| p2_on={len(pulse_times_2)} p2_off={len(pulse_times_2_off)}")
+
 else:
-    # alter Weg für nicht-gesplittete CSV
-    time_s = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
-    LFP_array = LFP_df[chan_cols].to_numpy(dtype=np.float32).T
+    # alter Weg: DataFrame downsampling (wie bei dir)
+    time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
+
+    # LFP_df_ds bauen (wie du es schon machst)
+    LFP_df_ds = pd.DataFrame({"timesamples": time_full})
+    for i, col in enumerate(chan_cols):
+        LFP_df_ds[f"pri_{i}"] = pd.to_numeric(LFP_df[col], errors="coerce")
+
+    NUM_CHANNELS = len(chan_cols)
+
     time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(
         DOWNSAMPLE_FACTOR, LFP_df_ds, NUM_CHANNELS,
         pulse_times_1=pulse_times_1_full,
         pulse_times_2=pulse_times_2_full,
         snap_pulses=True
     )
+
+    # OFF pulses: seconds normalize + snap
+    pulse_times_1_off = snap_times_to_timebase(
+        _ensure_seconds(pulse_times_1_off_full, time_s, DEFAULT_FS_XDAT), time_s
+    )
+    pulse_times_2_off = snap_times_to_timebase(
+        _ensure_seconds(pulse_times_2_off_full, time_s, DEFAULT_FS_XDAT), time_s
+    )
+
+    # cleanup
+    del LFP_df, LFP_df_ds
 
 log(f"DS done: N={len(time_s)}, dt={dt}, shape={LFP_array.shape}, p1={0 if pulse_times_1 is None else len(pulse_times_1)}, p2={0 if pulse_times_2 is None else len(pulse_times_2)}")
 
@@ -349,8 +747,8 @@ if 'LFP_df_ds' in globals():
 gc.collect()
 
 
-pulse_times_1_full = None if pulse_times_1 is None else np.array(pulse_times_1, float)
-pulse_times_2_full = None if pulse_times_2 is None else np.array(pulse_times_2, float)
+pulse_times_1_ds = None if pulse_times_1 is None else np.array(pulse_times_1, float)
+pulse_times_2_ds = None if pulse_times_2 is None else np.array(pulse_times_2, float)
 
 def _snap_event_times_to_timebase(event_times, time_s):
     if event_times is None:
@@ -362,6 +760,7 @@ def _snap_event_times_to_timebase(event_times, time_s):
     idx = np.clip(idx, 0, len(time_s)-1)
     return time_s[idx]
 
+
 # Offsets -> Sekunden + snappen
 pulse_times_1_off = _snap_event_times_to_timebase(
     _ensure_seconds(pulse_times_1_off_full, time_s, DEFAULT_FS_XDAT),
@@ -371,6 +770,10 @@ pulse_times_2_off = _snap_event_times_to_timebase(
     _ensure_seconds(pulse_times_2_off_full, time_s, DEFAULT_FS_XDAT),
     time_s
 )
+
+if FROM_STREAM:
+    print("[XDAT] after DS: p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
+          "p1_off_full", 0 if pulse_times_1_off_full is None else len(pulse_times_1_off_full))
 
 
 NUM_CHANNELS = LFP_array.shape[0]
@@ -383,6 +786,11 @@ if dt and (dt > 0) and ((1.0/dt) > 1e4 or dt > 1.0):  # sehr grob: "klein" => Se
     dt = dt / DEFAULT_FS_XDAT  # dt war in Samples
 
 print("[CHECK] dt(s)=", dt, " median Δt from time_s=", float(np.median(np.diff(time_s))))
+if len(pulse_times_1_full) and len(pulse_times_1_off_full):
+    widths = pulse_times_1_off_full[:min(len(pulse_times_1_full), len(pulse_times_1_off_full))] - \
+             pulse_times_1_full[:min(len(pulse_times_1_full), len(pulse_times_1_off_full))]
+    print("[TTL][DBG] median width (s) =", float(np.median(widths[np.isfinite(widths)])))
+    print("[TTL][DBG] example widths (s) =", widths[:10])
 
 
 # ebenfalls auf Sekunden bringen:
@@ -414,22 +822,27 @@ svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED.svg")
 
 
 
-# direkt nach _ds_fun(...)
+# safety normalize (nur falls irgendwas noch samples war)
 pulse_times_1 = _ensure_seconds(pulse_times_1, time_s, DEFAULT_FS_XDAT)
 pulse_times_2 = _ensure_seconds(pulse_times_2, time_s, DEFAULT_FS_XDAT)
+pulse_times_1_off = _ensure_seconds(pulse_times_1_off, time_s, DEFAULT_FS_XDAT)
+pulse_times_2_off = _ensure_seconds(pulse_times_2_off, time_s, DEFAULT_FS_XDAT)
 
-
-# vor dem Crop:
 if ((pulse_times_1 is None or len(pulse_times_1)==0) and
     (pulse_times_2 is None or len(pulse_times_2)==0)):
     print("[CROP] skip: no pulses -> keep full time range")
 else:
-    time_s, LFP_array, pulse_times_1, pulse_times_2 = _safe_crop_to_pulses(
-        time_s, LFP_array, pulse_times_1, pulse_times_2, pad=0.5
+    time_s, LFP_array, pulse_times_1, pulse_times_2, pulse_times_1_off, pulse_times_2_off = _safe_crop_to_pulses(
+        time_s, LFP_array,
+        pulse_times_1, pulse_times_2,
+        pulse_times_1_off, pulse_times_2_off,
+        pad=5.0
     )
-# Offsets müssen in denselben Crop-Bereich!
+
+# clamp OFF inside crop
 pulse_times_1_off = _clip_events_to_bounds(pulse_times_1_off, time_s, 0.0, 0.0)
 pulse_times_2_off = _clip_events_to_bounds(pulse_times_2_off, time_s, 0.0, 0.0)
+
 
 
 
@@ -696,6 +1109,57 @@ Spon_UP_peak_aligned_array = Up.get("Spon_UP_peak_aligned_array", None)
 UP_Time = Up.get("UP_Time", None)
 
 
+def compute_upstate_rate(time_s,
+                          Spontaneous_UP, Pulse_triggered_UP, Pulse_associated_UP,
+                          Spontaneous_DOWN=None, Pulse_triggered_DOWN=None, Pulse_associated_DOWN=None,
+                          use_pairs_for_duration=False):
+    """
+    Berechnet UPstate-Frequenzen (Hz) für total + pro Typ.
+    Default: Dauer = time_s[-1] - time_s[0] (nach Cropping).
+    Optional: use_pairs_for_duration=True -> Dauer aus UP/DOWN-Paaren (meist nicht nötig).
+
+    Returns dict:
+      duration_s, total_up, rate_total_hz, rate_total_per_min,
+      counts & rates pro Typ.
+    """
+
+    # --- Dauer bestimmen ---
+    if time_s is None or len(time_s) < 2:
+        duration_s = np.nan
+    else:
+        duration_s = float(time_s[-1] - time_s[0])
+
+    def _count(x):
+        return int(len(x)) if x is not None else 0
+
+    n_sp  = _count(Spontaneous_UP)
+    n_tr  = _count(Pulse_triggered_UP)
+    n_as  = _count(Pulse_associated_UP)
+    n_tot = n_sp + n_tr + n_as
+
+    def _rate(n):
+        if not np.isfinite(duration_s) or duration_s <= 0:
+            return np.nan
+        return float(n) / duration_s
+
+    out = {
+        "duration_s": duration_s,
+        "total_up": n_tot,
+        "spont_up": n_sp,
+        "trig_up": n_tr,
+        "assoc_up": n_as,
+
+        "rate_total_hz": _rate(n_tot),
+        "rate_spont_hz": _rate(n_sp),
+        "rate_trig_hz": _rate(n_tr),
+        "rate_assoc_hz": _rate(n_as),
+    }
+    out["rate_total_per_min"] = out["rate_total_hz"] * 60.0 if np.isfinite(out["rate_total_hz"]) else np.nan
+    out["rate_spont_per_min"] = out["rate_spont_hz"] * 60.0 if np.isfinite(out["rate_spont_hz"]) else np.nan
+    out["rate_trig_per_min"]  = out["rate_trig_hz"]  * 60.0 if np.isfinite(out["rate_trig_hz"])  else np.nan
+    out["rate_assoc_per_min"] = out["rate_assoc_hz"] * 60.0 if np.isfinite(out["rate_assoc_hz"]) else np.nan
+    
+    return out
 
 
 nT = LFP_array.shape[1]
@@ -736,6 +1200,38 @@ if Trig_Peaks is None or Trig_Peaks.size == 0:
 print("[COUNTS] sponUP:", len(Spontaneous_UP), " trigUP:", len(Pulse_triggered_UP), " assocUP:", len(Pulse_associated_UP))
 log(f"States: spon={len(Spontaneous_UP)}, trig={len(Pulse_triggered_UP)}, assoc={len(Pulse_associated_UP)}")
 
+# --- UP-State-Frequenz berechnen ---
+up_rate = compute_upstate_rate(
+    time_s,
+    Spontaneous_UP,
+    Pulse_triggered_UP,
+    Pulse_associated_UP
+)
+
+print(
+    f"[UP-RATE] duration={up_rate['duration_s']:.2f}s | "
+    f"total={up_rate['total_up']} -> "
+    f"{up_rate['rate_total_hz']:.4f} Hz "
+    f"({up_rate['rate_total_per_min']:.2f}/min)"
+)
+
+print(
+    f"[UP-RATE] spont={up_rate['spont_up']} "
+    f"({up_rate['rate_spont_hz']:.4f} Hz), "
+    f"trig={up_rate['trig_up']} "
+    f"({up_rate['rate_trig_hz']:.4f} Hz), "
+    f"assoc={up_rate['assoc_up']} "
+    f"({up_rate['rate_assoc_hz']:.4f} Hz)"
+)
+
+log(
+    f"UP_RATE duration_s={up_rate['duration_s']:.3f} "
+    f"total={up_rate['total_up']} "
+    f"rate_total_hz={up_rate['rate_total_hz']:.6f} "
+    f"rate_spont_hz={up_rate['rate_spont_hz']:.6f} "
+    f"rate_trig_hz={up_rate['rate_trig_hz']:.6f} "
+    f"rate_assoc_hz={up_rate['rate_assoc_hz']:.6f}"
+)
 
 # Refraktärzeiten (Ende eines UP bis Beginn des nächsten UP) 
 refrac_spont = compute_refractory_period(
@@ -839,7 +1335,29 @@ plt.close(fig_amp)
 print("[SVG] amplitude compare:", amp_svg_path)
 del fig_amp
 
-def _pair_on_off(t_on, t_off, max_width_s=1.0):
+print("[DBG before pair] p1_on/off:",
+      0 if pulse_times_1 is None else len(pulse_times_1),
+      0 if pulse_times_1_off is None else len(pulse_times_1_off))
+print("[DBG before pair] off head:",
+      None if pulse_times_1_off is None else pulse_times_1_off[:5])
+
+
+# --- HTML pulses must be in SECONDS and within plotted time range ---
+pulse_times_1_html     = _ensure_seconds(pulse_times_1_full,     time_s, DEFAULT_FS_XDAT)
+pulse_times_1_off_html = _ensure_seconds(pulse_times_1_off_full, time_s, DEFAULT_FS_XDAT)
+pulse_times_2_html     = _ensure_seconds(pulse_times_2_full,     time_s, DEFAULT_FS_XDAT)
+pulse_times_2_off_html = _ensure_seconds(pulse_times_2_off_full, time_s, DEFAULT_FS_XDAT)
+
+# clip to current plot window (after cropping)
+t0, t1 = float(time_s[0]), float(time_s[-1])
+pulse_times_1_html     = pulse_times_1_html[(pulse_times_1_html >= t0) & (pulse_times_1_html <= t1)]
+pulse_times_1_off_html = pulse_times_1_off_html[(pulse_times_1_off_html >= t0) & (pulse_times_1_off_html <= t1)]
+pulse_times_2_html     = pulse_times_2_html[(pulse_times_2_html >= t0) & (pulse_times_2_html <= t1)]
+pulse_times_2_off_html = pulse_times_2_off_html[(pulse_times_2_off_html >= t0) & (pulse_times_2_off_html <= t1)]
+
+
+
+def _pair_on_off(t_on, t_off, max_width_s=10.0):
     if t_on is None or t_off is None:
         return []
     on = np.asarray(t_on, float); off = np.asarray(t_off, float)
@@ -858,10 +1376,21 @@ def _pair_on_off(t_on, t_off, max_width_s=1.0):
         width = off[j] - on[i]
         if 0 < width <= max_width_s:
             intervals.append((float(on[i]), float(off[j])))
+            j += 1   # <-- entscheidend
     return intervals
 
-ttl1_intervals = _pair_on_off(pulse_times_1, pulse_times_1_off, max_width_s=1.0)
-ttl2_intervals = _pair_on_off(pulse_times_2, pulse_times_2_off, max_width_s=1.0)
+ttl1_intervals = _pair_on_off(pulse_times_1_html, pulse_times_1_off_html, max_width_s=5.0)
+ttl2_intervals = _pair_on_off(pulse_times_2_html, pulse_times_2_off_html, max_width_s=5.0)
+
+print("[HTML DBG] time range:", float(time_s[0]), "->", float(time_s[-1]))
+print("[HTML DBG] p1_on/off:", len(pulse_times_1_html), len(pulse_times_1_off_html))
+if len(pulse_times_1_html) and len(pulse_times_1_off_html):
+    m = min(len(pulse_times_1_html), len(pulse_times_1_off_html))
+    w = pulse_times_1_off_html[:m] - pulse_times_1_html[:m]
+    print("[HTML DBG] width median (s):", float(np.nanmedian(w)))
+print("[HTML DBG] intervals:", len(ttl1_intervals))
+
+
 
 print("[TTL] intervals:", len(ttl1_intervals), len(ttl2_intervals))
 print("[DBG] on/off counts:",
@@ -888,16 +1417,54 @@ if pulse_times_1_off is not None and len(pulse_times_1_off):
     print("[DBG] p1_off first/last:", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
 print("[DBG] time_s range:", float(time_s[0]), "->", float(time_s[-1]))
 
+print("[HTML-DBG] pulse_times_1 on/off:",
+      0 if pulse_times_1 is None else len(pulse_times_1),
+      0 if pulse_times_1_off is None else len(pulse_times_1_off))
+print("[HTML-DBG] ttl1_intervals:", len(ttl1_intervals), "example:", ttl1_intervals[:3])
+print("[HTML-CHECK] time range:", float(time_s[0]), "->", float(time_s[-1]))
+print("[HTML-CHECK] p1_on first/last:", pulse_times_1[:1], pulse_times_1[-1:])
+print("[HTML-CHECK] p1_off first/last:", pulse_times_1_off[:1], pulse_times_1_off[-1:])
+
+# ---------- FINAL HTML PULSE CLIP (MUST MATCH time_s WINDOW) ----------
+tmin = float(time_s[0])
+tmax = float(time_s[-1])
+
+def _clip_to_window(t, tmin, tmax):
+    if t is None:
+        return np.array([], float)
+    t = np.asarray(t, float)
+    t = t[np.isfinite(t)]
+    if t.size == 0:
+        return np.array([], float)
+    return t[(t >= tmin) & (t <= tmax)]
+
+pulse_times_1_html     = _clip_to_window(pulse_times_1_html,     tmin, tmax)
+pulse_times_1_off_html = _clip_to_window(pulse_times_1_off_html, tmin, tmax)
+pulse_times_2_html     = _clip_to_window(pulse_times_2_html,     tmin, tmax)
+pulse_times_2_off_html = _clip_to_window(pulse_times_2_off_html, tmin, tmax)
+
+# Intervals neu bauen (nach dem Clip!)
+ttl1_intervals = _pair_on_off(pulse_times_1_html, pulse_times_1_off_html, max_width_s=5.0)
+ttl2_intervals = _pair_on_off(pulse_times_2_html, pulse_times_2_off_html, max_width_s=5.0)
+
+print("[HTML FINAL] p1_on/off:", len(pulse_times_1_html), len(pulse_times_1_off_html),
+      "| ttl1_intervals:", len(ttl1_intervals))
+print("[HTML FINAL] time window:", tmin, "->", tmax)
 
 
-# Interaktive HTML immer erzeugen (mit UP-Schattierung) 
+
+
+
+
+# Interaktive HTML (mit UP-Schattierung) 
 export_interactive_lfp_html(
     BASE_TAG, SAVE_DIR, time_s,
     main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
-    pulse_times_1=pulse_times_1,
-    pulse_times_2=pulse_times_2,
-    pulse_times_1_off=pulse_times_1_off,
-    pulse_times_2_off=pulse_times_2_off,
+
+    pulse_times_1=pulse_times_1_html,
+    pulse_times_2=pulse_times_2_html,
+    pulse_times_1_off=pulse_times_1_off_html,
+    pulse_times_2_off=pulse_times_2_off_html,
     pulse_intervals_1=ttl1_intervals,
     pulse_intervals_2=ttl2_intervals,
     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
@@ -1130,6 +1697,9 @@ def plot_up_classification_ax(
 #     ax.axis("off")
 #     if msg:
 #         ax.text(0.5, 0.5, msg, ha="center", va="center", transform=ax.transAxes, alpha=0.4)
+
+
+
 
 def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=0.05, ax=None):
     if ax is None:
@@ -2604,8 +3174,81 @@ def upstate_similarity_timecourse_ax(
     ax.set_ylim(top=y_bar + 0.12 * (y_bar - y_min))
     ax.set_xlabel("Time (s)")
 
+def plot_upstate_rates_bar(rates, out_path, title="UP-state rate (total)"):
+    """
+    Balkenplot für rate_total_per_min und rate_total_hz.
+    Speichert als SVG/PNG je nach Dateiendung in out_path.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
 
-# --- Refraktärzeiten ab SPONT-UP-Off getrennt nach nächstem UP-Typ ---
+    labels = ["total [/min]", "total [Hz]"]
+    values = [
+        float(rates.get("rate_total_per_min", np.nan)),
+        float(rates.get("rate_total_hz", np.nan)),
+    ]
+
+    fig, ax = plt.subplots(figsize=(4.2, 3.0), dpi=200)
+    x = np.arange(len(labels))
+    ax.bar(x, values)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=0)
+    ax.set_ylabel("value")
+    ax.set_title(title)
+
+    # optional: Zahlen über die Balken
+    for xi, v in zip(x, values):
+        if np.isfinite(v):
+            ax.text(xi, v, f"{v:.3g}", ha="center", va="bottom", fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+def upstate_rate_bar_ax(rates, ax=None, title="UP-state rate (total)"):
+    """
+    Balkendiagramm: total rate [/min] und total rate [Hz]
+    erwartet keys: 'rate_total_per_min' und 'rate_total_hz'
+    """
+    import numpy as np
+
+    if ax is None:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(4, 3))
+
+    labels = ["total [/min]", "total [Hz]"]
+    vals = [
+        float(rates.get("rate_total_per_min", np.nan)),
+        float(rates.get("rate_total_hz", np.nan)),
+    ]
+
+    x = np.arange(len(labels))
+    ax.bar(x, vals)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("value")
+    ax.set_title(title)
+
+    # Werte über die Balken schreiben
+    for xi, v in zip(x, vals):
+        if np.isfinite(v):
+            ax.text(xi, v, f"{v:.3g}", ha="center", va="bottom", fontsize=9)
+
+    return ax
+
+# Refraktärzeiten ab SPONT-UP-Off getrennt nach nächstem UP-Typ 
+print("[CHECK FINAL PULSES]",
+      "p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
+      "p1_off", 0 if pulse_times_1_off is None else len(pulse_times_1_off),
+      "| p2_on", 0 if pulse_times_2 is None else len(pulse_times_2),
+      "p2_off", 0 if pulse_times_2_off is None else len(pulse_times_2_off))
+print("[CHECK time range]", float(time_s[0]), "->", float(time_s[-1]))
+if pulse_times_1 is not None and len(pulse_times_1):
+    print("[CHECK p1 first/last]", float(pulse_times_1[0]), float(pulse_times_1[-1]))
+if pulse_times_1_off is not None and len(pulse_times_1_off):
+    print("[CHECK p1_off first/last]", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
+print("[CHECK intervals] ttl1", len(ttl1_intervals), "ttl2", len(ttl2_intervals))
 
 
 
@@ -2617,11 +3260,284 @@ refrac_spon2spon, refrac_spon2trig = compute_refrac_from_spont_to_spon_and_trig(
     time_s
 )
 
+
+rates = compute_upstate_rate(
+    time_s,
+    Spontaneous_UP,
+    Pulse_triggered_UP,
+    Pulse_associated_UP
+)
+
+
+
 print(f"[REFRAC SPONT] spon→spon: n={len(refrac_spon2spon)}, "
       f"spon→trig: n={len(refrac_spon2trig)}")
-#  Layout definieren (Zeilen)
+# #  Layout definieren (Zeilen)
+# layout_rows = [
+#     # REIHE 1: Main channel (volle Breite)
+#     [lambda ax: plot_up_classification_ax(
+#         main_channel, time_s,
+#         Spontaneous_UP, Spontaneous_DOWN,
+#         Pulse_triggered_UP, Pulse_triggered_DOWN,
+#         Pulse_associated_UP, Pulse_associated_DOWN,
+#         pulse_times_1=pulse_times_1,
+#         pulse_times_2=pulse_times_2,
+#         ax=ax
+#     )],
+
+#     # REIHE 2: links Durations, rechts Power
+#     [lambda ax: upstate_duration_compare_ax(
+#         Trig_UP_crop, Trig_DOWN_crop,
+#         Spon_UP_crop, Spon_DOWN_crop, dt, ax=ax
+#     ),
+#      lambda ax: Power_spectrum_compare_ax(
+#         freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax
+#     )],
+    
+#  # REIHE 3: Amplituden-Vergleich (volle Breite)
+#     [lambda ax: upstate_amplitude_compare_ax(
+#         spont_amp, trig_amp, ax=ax, title="UP Amplitude (max-min): Spontan vs. Getriggert"
+#     )],
+
+#     # REIHE 4: CSD (volle Breite)
+#     [lambda ax: CSD_compare_side_by_side_ax(
+#         CSD_spont, CSD_trig, dt,
+#         z_mm=z_mm,
+#         align_pre=align_pre_s, align_post=align_post_s,
+#         # Paper-look:
+#         cmap="Spectral_r",          # <--- klassisches Diverging-Map
+#         sat_pct=95,             # <--- etwas weniger aggressiv
+#         norm_mode="linear",
+#         #vmax_abs=15,     # <--- einfache lineare Skala
+#         linthresh_frac=0.03,    # hier egal bei linear, kann bleiben
+#         ax=ax,
+#         title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
+#     )],
+
+
+
+#       # REIHE 4 (NEU): Mittel-LFP um Onsets – Spont vs. Trig
+#     [lambda ax: up_onset_mean_ax(
+#         main_channel, dt, Spon_Onsets,
+#         ax=ax, title="Spont-UPs – onset-aligned mean"
+#     ),
+#      lambda ax: up_onset_mean_ax(
+#         main_channel, dt, Trig_Onsets,
+#         ax=ax, title="Trig-UPs – onset-aligned mean"
+#     )],
+
+#         # REIHE 4: CSD – zwei Panels nebeneinander (Spont / Trig)
+#     [lambda ax: CSD_single_panel_ax(
+#             CSD_spont, dt,
+#             z_mm=z_mm,
+#             align_pre=align_pre_s,
+#             align_post=align_post_s,
+#             ax=ax,
+#             title="CSD Spontaneous"
+#         ),
+#     lambda ax: CSD_single_panel_ax(
+#             CSD_trig, dt,
+#             z_mm=z_mm,
+#             align_pre=align_pre_s,
+#             align_post=align_post_s,
+#             ax=ax,
+#             title="CSD Triggered"
+    
+#         )],
+#     # REIHE X: Pulse→UP Latenzen (Histogramm)
+#     [lambda ax: pulse_to_up_latency_hist_ax(latencies_trig, ax=ax)],
+
+#     [lambda ax: pulse_triggered_up_overlay_ax(
+#     main_channel,
+#     time_s,
+#     pulse_times_1,          # ggf. pulse_times_2
+#     Pulse_triggered_UP,
+#     dt,
+#     pre_s=0.2,
+#     post_s=1.0,
+#     max_win_s=1.0,
+#     ax=ax,
+#     title="Pulse-alignierte Trigger-UPs (LFP overlay)"
+#     )],
+
+#     [lambda ax: refractory_compare_ax(
+#         refrac_spont, refrac_trig, ax=ax,
+#         title="Refraktärzeit nach UP bis nächster UP"
+#     )],
+    
+
+#     [lambda ax: refractory_from_spont_to_type_overlay_ax(
+#         main_channel,
+#         time_s,
+#         Spontaneous_UP, Spontaneous_DOWN,
+#         Pulse_triggered_UP, Pulse_triggered_DOWN,
+#         Pulse_associated_UP, Pulse_associated_DOWN,
+#         dt,
+#         target_type="spont",
+#         pre_s=10.0,
+#         post_s=30.0,
+#         ax=ax,
+#         title="SPONT offset → nächste SPONT-UPs"
+#     )],
+#     [lambda ax: refractory_from_spont_to_type_overlay_ax(
+#         main_channel,
+#         time_s,
+#         Spontaneous_UP, Spontaneous_DOWN,
+#         Pulse_triggered_UP, Pulse_triggered_DOWN,
+#         Pulse_associated_UP, Pulse_associated_DOWN,
+#         dt,
+#         target_type="trig",
+#         pre_s=10.0,
+#         post_s=30.0,
+#         ax=ax,
+#         title="SPONT offset → nächste TRIG-UPs"
+#     )],
+
+#     [lambda ax: refractory_from_spont_single_folder_ax(
+#         refrac_spon2spon, refrac_spon2trig,
+#         folder_name=BASE_TAG,
+#         ax=ax
+#     )],
+#     [lambda ax: spontaneous_up_full_overlay_normtime_ax(
+#     main_channel, time_s,
+#     Spontaneous_UP, Spontaneous_DOWN,
+#     n_points=300,
+#     ax=ax,
+#     title="Spontaneous UPs (full Onset→Offset), time-normalized overlay"
+# )],
+
+# [
+#   lambda ax: (
+#       _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None) else
+#       pca_template_pc1_ax(pca_fit_joint, ax=ax, title="Spontaneous PCA Template (PC1)")
+#   ),
+#   lambda ax: (
+#       _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or pc1z_trig is None) else
+#       pca_similarity_scores_ax(
+#           pca_fit_joint["scores_spont"],
+#           pc1z_trig,
+#           mahal_trig,
+#           ax=ax,
+#           title="Triggered similarity vs. spontaneous PCA"
+#       )
+#   )
+# ],
+
+# # REIHE NEU: Mahalanobis-Distanz + Top/Bottom Trigger Overlays
+# [
+#   lambda ax: (
+#       _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None or mahal_trig is None) else
+#       mahal_compare_ax(mahal_sp, mahal_trig, ax=ax,
+#                        title="Mahalanobis distance to spontaneous PCA space")
+#   ),
+#   lambda ax: (
+#       _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or mahal_trig is None or X_trig.shape[0]==0) else
+#       ranked_trigger_overlays_ax(X_spont, X_trig, mahal_trig, ax=ax, top_n=5,
+#                                  title="Triggered UPs: most vs least similar (Mahalanobis)")
+#   )
+# ],
+
+
+# # PCA Template + Similarity Scores
+# [
+#   lambda ax: (
+#       _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None) else
+#       pca_template_pc1_ax(pca_fit_joint, ax=ax, title="JOINT PCA Template (PC1) (spont+trig)")
+#   ),
+#   lambda ax: (
+#       _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or pc1z_trig is None) else
+#       pca_similarity_scores_ax(
+#           pca_fit_joint["scores_spont"],
+#           pc1z_trig,
+#           mahal_trig,
+#           ax=ax,
+#           title="Triggered similarity in JOINT PCA space"
+#       )
+#   )
+# ],
+
+# # Mahalanobis + Ranked overlays
+# [
+#   lambda ax: (
+#       _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None or mahal_trig is None) else
+#       mahal_compare_ax(mahal_sp, mahal_trig, ax=ax,
+#                        title="Mahalanobis distance in JOINT PCA space")
+#   ),
+#   lambda ax: (
+#       _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or mahal_trig is None or X_trig.shape[0]==0) else
+#       ranked_trigger_overlays_ax(X_spont, X_trig, mahal_trig, ax=ax, top_n=5,
+#                                  title="Triggered UPs ranked (JOINT PCA space)")
+#   )
+# ],
+
+# # REIHE: Separate PCA – Templates & Overlay
+# [
+#   lambda ax: (
+#       _blank_ax(ax, "PCA spont skipped") if (pca_fit_sp is None) else
+#       pca_template_pc1_ax(pca_fit_sp, ax=ax, title="Spontaneous PCA Template (PC1)")
+#   ),
+#   lambda ax: (
+#       _blank_ax(ax, "PCA trig skipped") if (pca_fit_tr is None) else
+#       pca_template_pc1_ax(pca_fit_tr, ax=ax, title="Triggered PCA Template (PC1)")
+#   )
+# ],
+# [
+#   lambda ax: (
+#       _blank_ax(ax, "Need both PCAs") if (pca_fit_sp is None or pca_fit_tr is None) else
+#       pca_pc1_overlay_corr_diff_ax(pca_fit_sp, pca_fit_tr, ax=ax,
+#                                    title="PC1 overlay + corr + diff (spont vs trig)")
+#   )
+# ],
+
+# [
+#     lambda ax: (
+#         _blank_ax(ax, "no PCA stats")
+#         if (corr_sp is None or corr_tr is None)
+#         else pca_similarity_stats_ax(
+#             corr_sp,
+#             corr_tr,
+#             p_val=p,
+#             ax=ax,
+#             title="Similarity to spontaneous UP template (PC1)"
+#         )
+#     )
+# ],
+
+#     [lambda ax: upstate_similarity_timecourse_ax(
+#         res,
+#         Trig_UP_peak_aligned_array,
+#         Spon_UP_peak_aligned_array,
+#         ax=ax,
+#         alpha=0.05,
+#         title="Triggered vs Spontaneous UP states (peak-aligned)"
+#     )],
+
+#     [lambda ax: CSD_compare_side_by_side_ax(
+#         CSD_spont, CSD_trig, dt,
+#         z_mm=z_mm,
+#         align_pre=align_pre_s, align_post=align_post_s,
+#         cmap="Spectral_r",
+#         sat_pct=95,
+#         norm_mode="linear",
+#         linthresh_frac=0.03,
+#         ax=ax,
+#         title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
+#     )],
+#         # REIHE NEU: UP-rate Balkendiagramm (volle Breite)
+#     [lambda ax: upstate_rate_bar_ax(
+#         rates,
+#         ax=ax,
+#         title="UP rate (total): [/min] vs [Hz]"
+#     )],
+
+# ]
+
+
 layout_rows = [
-    # REIHE 1: Main channel (volle Breite)
+
+    # ========================================================
+    # REIHE 1: Main channel (volle Breite) – UP-Klassifikation + Pulse
+    # ========================================================
     [lambda ax: plot_up_classification_ax(
         main_channel, time_s,
         Spontaneous_UP, Spontaneous_DOWN,
@@ -2632,7 +3548,9 @@ layout_rows = [
         ax=ax
     )],
 
-    # REIHE 2: links Durations, rechts Power
+    # ========================================================
+    # REIHE 2: UP-Dauern (links) + Power Spectrum (rechts)
+    # ========================================================
     [lambda ax: upstate_duration_compare_ax(
         Trig_UP_crop, Trig_DOWN_crop,
         Spon_UP_crop, Spon_DOWN_crop, dt, ax=ax
@@ -2640,30 +3558,34 @@ layout_rows = [
      lambda ax: Power_spectrum_compare_ax(
         freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax
     )],
-    
- # REIHE 3: Amplituden-Vergleich (volle Breite)
+
+    # ========================================================
+    # REIHE 3: UP-Amplitudenvergleich (volle Breite)
+    # ========================================================
     [lambda ax: upstate_amplitude_compare_ax(
-        spont_amp, trig_amp, ax=ax, title="UP Amplitude (max-min): Spontan vs. Getriggert"
+        spont_amp, trig_amp, ax=ax,
+        title="UP Amplitude (max-min): Spontan vs. Getriggert"
     )],
 
-    # REIHE 4: CSD (volle Breite)
+    # ========================================================
+    # REIHE 4: CSD Vergleich (Spont vs Trig; side-by-side) – (volle Breite)
+    # (Einmal reicht; die spätere Wiederholung wurde entfernt.)
+    # ========================================================
     [lambda ax: CSD_compare_side_by_side_ax(
         CSD_spont, CSD_trig, dt,
         z_mm=z_mm,
         align_pre=align_pre_s, align_post=align_post_s,
-        # Paper-look:
-        cmap="Spectral_r",          # <--- klassisches Diverging-Map
-        sat_pct=95,             # <--- etwas weniger aggressiv
+        cmap="Spectral_r",
+        sat_pct=95,
         norm_mode="linear",
-        #vmax_abs=15,     # <--- einfache lineare Skala
-        linthresh_frac=0.03,    # hier egal bei linear, kann bleiben
+        linthresh_frac=0.03,
         ax=ax,
         title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
     )],
 
-
-
-      # REIHE 4 (NEU): Mittel-LFP um Onsets – Spont vs. Trig
+    # ========================================================
+    # REIHE 5: Mittel-LFP um Onsets – Spont (links) vs Trig (rechts)
+    # ========================================================
     [lambda ax: up_onset_mean_ax(
         main_channel, dt, Spon_Onsets,
         ax=ax, title="Spont-UPs – onset-aligned mean"
@@ -2673,46 +3595,38 @@ layout_rows = [
         ax=ax, title="Trig-UPs – onset-aligned mean"
     )],
 
-        # REIHE 4: CSD – zwei Panels nebeneinander (Spont / Trig)
-    [lambda ax: CSD_single_panel_ax(
-            CSD_spont, dt,
-            z_mm=z_mm,
-            align_pre=align_pre_s,
-            align_post=align_post_s,
-            ax=ax,
-            title="CSD Spontaneous"
-        ),
-    lambda ax: CSD_single_panel_ax(
-            CSD_trig, dt,
-            z_mm=z_mm,
-            align_pre=align_pre_s,
-            align_post=align_post_s,
-            ax=ax,
-            title="CSD Triggered"
-    
-        )],
-    # REIHE X: Pulse→UP Latenzen (Histogramm)
+    # ========================================================
+    # REIHE 6: Pulse → UP Latenzen (Histogramm) – (volle Breite)
+    # ========================================================
     [lambda ax: pulse_to_up_latency_hist_ax(latencies_trig, ax=ax)],
 
+    # ========================================================
+    # REIHE 7: Pulse-alignierte Trigger-UPs (Overlay) – (volle Breite)
+    # ========================================================
     [lambda ax: pulse_triggered_up_overlay_ax(
-    main_channel,
-    time_s,
-    pulse_times_1,          # ggf. pulse_times_2
-    Pulse_triggered_UP,
-    dt,
-    pre_s=0.2,
-    post_s=1.0,
-    max_win_s=1.0,
-    ax=ax,
-    title="Pulse-alignierte Trigger-UPs (LFP overlay)"
+        main_channel,
+        time_s,
+        pulse_times_1,
+        Pulse_triggered_UP,
+        dt,
+        pre_s=0.2,
+        post_s=1.0,
+        max_win_s=1.0,
+        ax=ax,
+        title="Pulse-alignierte Trigger-UPs (LFP overlay)"
     )],
 
+    # ========================================================
+    # REIHE 8: Refraktärzeit Vergleich (Spont vs Trig) – (volle Breite)
+    # ========================================================
     [lambda ax: refractory_compare_ax(
         refrac_spont, refrac_trig, ax=ax,
         title="Refraktärzeit nach UP bis nächster UP"
     )],
-    
 
+    # ========================================================
+    # REIHE 9: Refraktär-Overlay: SPONT offset → nächste SPONT-UPs – (volle Breite)
+    # ========================================================
     [lambda ax: refractory_from_spont_to_type_overlay_ax(
         main_channel,
         time_s,
@@ -2726,132 +3640,111 @@ layout_rows = [
         ax=ax,
         title="SPONT offset → nächste SPONT-UPs"
     )],
-    [lambda ax: refractory_from_spont_to_type_overlay_ax(
-        main_channel,
-        time_s,
-        Spontaneous_UP, Spontaneous_DOWN,
-        Pulse_triggered_UP, Pulse_triggered_DOWN,
-        Pulse_associated_UP, Pulse_associated_DOWN,
-        dt,
-        target_type="trig",
-        pre_s=10.0,
-        post_s=30.0,
-        ax=ax,
-        title="SPONT offset → nächste TRIG-UPs"
-    )],
 
+    # ========================================================
+    # REIHE 10: Refraktär-Summary pro Folder – (volle Breite)
+    # (Das zweite Overlay „…→ nächste TRIG-UPs“ hab ich rausgekürzt, weil sehr ähnlich.)
+    # ========================================================
     [lambda ax: refractory_from_spont_single_folder_ax(
         refrac_spon2spon, refrac_spon2trig,
         folder_name=BASE_TAG,
         ax=ax
     )],
+
+    # ========================================================
+    # REIHE 11: Spontaneous UPs – time-normalized overlay – (volle Breite)
+    # ========================================================
     [lambda ax: spontaneous_up_full_overlay_normtime_ax(
-    main_channel, time_s,
-    Spontaneous_UP, Spontaneous_DOWN,
-    n_points=300,
-    ax=ax,
-    title="Spontaneous UPs (full Onset→Offset), time-normalized overlay"
-)],
+        main_channel, time_s,
+        Spontaneous_UP, Spontaneous_DOWN,
+        n_points=300,
+        ax=ax,
+        title="Spontaneous UPs (full Onset→Offset), time-normalized overlay"
+    )],
 
-# REIHE NEU: PCA Template + Similarity Scores
-[
-  lambda ax: (
-      _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None) else
-      pca_template_pc1_ax(pca_fit_joint, ax=ax, title="Spontaneous PCA Template (PC1)")
-  ),
-  lambda ax: (
-      _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or pc1z_trig is None) else
-      pca_similarity_scores_ax(
-          pca_fit_joint["scores_spont"],
-          pc1z_trig,
-          mahal_trig,
-          ax=ax,
-          title="Triggered similarity vs. spontaneous PCA"
+    # ========================================================
+    # REIHE 12: PCA (JOINT) – Template + Similarity (2 Panels)
+    # (Nur EIN konsistenter JOINT-Block; die doppelte Variante wurde entfernt.)
+    # ========================================================
+    [
+      lambda ax: (
+          _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None) else
+          pca_template_pc1_ax(pca_fit_joint, ax=ax, title="JOINT PCA Template (PC1) (spont+trig)")
+      ),
+      lambda ax: (
+          _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or pc1z_trig is None) else
+          pca_similarity_scores_ax(
+              pca_fit_joint["scores_spont"],
+              pc1z_trig,
+              mahal_trig,
+              ax=ax,
+              title="Triggered similarity in JOINT PCA space"
+          )
       )
-  )
-],
+    ],
 
-# REIHE NEU: Mahalanobis-Distanz + Top/Bottom Trigger Overlays
-[
-  lambda ax: (
-      _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None or mahal_trig is None) else
-      mahal_compare_ax(mahal_sp, mahal_trig, ax=ax,
-                       title="Mahalanobis distance to spontaneous PCA space")
-  ),
-  lambda ax: (
-      _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or mahal_trig is None or X_trig.shape[0]==0) else
-      ranked_trigger_overlays_ax(X_spont, X_trig, mahal_trig, ax=ax, top_n=5,
-                                 title="Triggered UPs: most vs least similar (Mahalanobis)")
-  )
-],
-
-
-# PCA Template + Similarity Scores
-[
-  lambda ax: (
-      _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None) else
-      pca_template_pc1_ax(pca_fit_joint, ax=ax, title="JOINT PCA Template (PC1) (spont+trig)")
-  ),
-  lambda ax: (
-      _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or pc1z_trig is None) else
-      pca_similarity_scores_ax(
-          pca_fit_joint["scores_spont"],
-          pc1z_trig,
-          mahal_trig,
-          ax=ax,
-          title="Triggered similarity in JOINT PCA space"
+    # ========================================================
+    # REIHE 13: PCA (JOINT) – Mahalanobis + Ranked Overlays (2 Panels)
+    # ========================================================
+    [
+      lambda ax: (
+          _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None or mahal_trig is None) else
+          mahal_compare_ax(mahal_sp, mahal_trig, ax=ax,
+                           title="Mahalanobis distance in JOINT PCA space")
+      ),
+      lambda ax: (
+          _blank_ax(ax, "PCA skipped / no trig")
+          if (pca_fit_joint is None or mahal_trig is None or X_trig.shape[0] == 0) else
+          ranked_trigger_overlays_ax(X_spont, X_trig, mahal_trig, ax=ax, top_n=5,
+                                     title="Triggered UPs ranked (JOINT PCA space)")
       )
-  )
-],
+    ],
 
-# Mahalanobis + Ranked overlays
-[
-  lambda ax: (
-      _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None or mahal_trig is None) else
-      mahal_compare_ax(mahal_sp, mahal_trig, ax=ax,
-                       title="Mahalanobis distance in JOINT PCA space")
-  ),
-  lambda ax: (
-      _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or mahal_trig is None or X_trig.shape[0]==0) else
-      ranked_trigger_overlays_ax(X_spont, X_trig, mahal_trig, ax=ax, top_n=5,
-                                 title="Triggered UPs ranked (JOINT PCA space)")
-  )
-],
+    # ========================================================
+    # REIHE 14: Separate PCA – Spont vs Trig Templates (2 Panels)
+    # ========================================================
+    [
+      lambda ax: (
+          _blank_ax(ax, "PCA spont skipped") if (pca_fit_sp is None) else
+          pca_template_pc1_ax(pca_fit_sp, ax=ax, title="Spontaneous PCA Template (PC1)")
+      ),
+      lambda ax: (
+          _blank_ax(ax, "PCA trig skipped") if (pca_fit_tr is None) else
+          pca_template_pc1_ax(pca_fit_tr, ax=ax, title="Triggered PCA Template (PC1)")
+      )
+    ],
 
-# REIHE: Separate PCA – Templates & Overlay
-[
-  lambda ax: (
-      _blank_ax(ax, "PCA spont skipped") if (pca_fit_sp is None) else
-      pca_template_pc1_ax(pca_fit_sp, ax=ax, title="Spontaneous PCA Template (PC1)")
-  ),
-  lambda ax: (
-      _blank_ax(ax, "PCA trig skipped") if (pca_fit_tr is None) else
-      pca_template_pc1_ax(pca_fit_tr, ax=ax, title="Triggered PCA Template (PC1)")
-  )
-],
-[
-  lambda ax: (
-      _blank_ax(ax, "Need both PCAs") if (pca_fit_sp is None or pca_fit_tr is None) else
-      pca_pc1_overlay_corr_diff_ax(pca_fit_sp, pca_fit_tr, ax=ax,
-                                   title="PC1 overlay + corr + diff (spont vs trig)")
-  )
-],
+    # ========================================================
+    # REIHE 15: Separate PCA – PC1 Overlay + corr + diff – (volle Breite)
+    # ========================================================
+    [
+      lambda ax: (
+          _blank_ax(ax, "Need both PCAs") if (pca_fit_sp is None or pca_fit_tr is None) else
+          pca_pc1_overlay_corr_diff_ax(pca_fit_sp, pca_fit_tr, ax=ax,
+                                       title="PC1 overlay + corr + diff (spont vs trig)")
+      )
+    ],
 
-# REIHE NEU: PCA Similarity – Statistik
-[
-    lambda ax: (
-        _blank_ax(ax, "no PCA stats")
-        if (corr_sp is None or corr_tr is None)
-        else pca_similarity_stats_ax(
-            corr_sp,
-            corr_tr,
-            p_val=p,
-            ax=ax,
-            title="Similarity to spontaneous UP template (PC1)"
-        )
-    )
-],
+    # ========================================================
+    # REIHE 16: PCA Similarity Stats – (volle Breite)
+    # ========================================================
+    [
+      lambda ax: (
+          _blank_ax(ax, "no PCA stats")
+          if (corr_sp is None or corr_tr is None)
+          else pca_similarity_stats_ax(
+              corr_sp,
+              corr_tr,
+              p_val=p,
+              ax=ax,
+              title="Similarity to spontaneous UP template (PC1)"
+          )
+      )
+    ],
 
+    # ========================================================
+    # REIHE 17: Similarity Timecourse (peak-aligned) – (volle Breite)
+    # ========================================================
     [lambda ax: upstate_similarity_timecourse_ax(
         res,
         Trig_UP_peak_aligned_array,
@@ -2861,19 +3754,15 @@ layout_rows = [
         title="Triggered vs Spontaneous UP states (peak-aligned)"
     )],
 
-    [lambda ax: CSD_compare_side_by_side_ax(
-        CSD_spont, CSD_trig, dt,
-        z_mm=z_mm,
-        align_pre=align_pre_s, align_post=align_post_s,
-        cmap="Spectral_r",
-        sat_pct=95,
-        norm_mode="linear",
-        linthresh_frac=0.03,
+    # ========================================================
+    # REIHE 18: UP-rate Balkendiagramm – (volle Breite)
+    # ========================================================
+    [lambda ax: upstate_rate_bar_ax(
+        rates,
         ax=ax,
-        title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
+        title="UP rate (total): [/min] vs [Hz]"
     )],
 ]
-
 
 
 def _write_summary_csv():
@@ -2892,6 +3781,13 @@ def _write_summary_csv():
         except Exception:
             pass  # bleibt bei ';'
 
+    rates = compute_upstate_rate(
+        time_s,
+        Spontaneous_UP,
+        Pulse_triggered_UP,
+        Pulse_associated_UP
+    )
+
     # Feldnamen (Schema)
     FIELDNAMES = [
         "Parent","Experiment","Dauer [s]","Samplingrate [Hz]","Kanäle",
@@ -2900,6 +3796,8 @@ def _write_summary_csv():
         "Downstates total","UP/DOWN ratio",
         "Mean UP Dauer [s]","Mean UP Dauer Triggered [s]","Mean UP Dauer Spontaneous [s]",
         "Datum Analyse",
+        "UP rate total [Hz]",
+        "UP rate total [/min]",
     ]
 
     # Helfer: numpy/NaN -> plain
@@ -2938,6 +3836,9 @@ def _write_summary_csv():
     UP_start_i, DOWN_start_i = _pairs(Up, time_s)
     total_up   = len(Spontaneous_UP) + len(Pulse_triggered_UP) + len(Pulse_associated_UP)
     total_down = len(Spontaneous_DOWN) + len(Pulse_triggered_DOWN) + len(Pulse_associated_DOWN)
+    
+   
+
 
     def _mean_or_blank(arr):
         arr = np.asarray(arr)
@@ -2961,6 +3862,8 @@ def _write_summary_csv():
         "Mean UP Dauer Triggered [s]": _mean_or_blank((Pulse_triggered_DOWN - Pulse_triggered_UP) * dt) if len(Pulse_triggered_UP) else "",
         "Mean UP Dauer Spontaneous [s]": _mean_or_blank((Spontaneous_DOWN - Spontaneous_UP) * dt) if len(Spontaneous_UP) else "",
         "Datum Analyse": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "UP rate total [Hz]": rates["rate_total_hz"],
+        "UP rate total [/min]": rates["rate_total_per_min"],
     }
 
     # Debug: zeig die Zeile im Log
@@ -3002,6 +3905,18 @@ def _write_summary_csv():
         _build_rollups(summary_path)
     except Exception as e:
         print("[SUMMARY][ROLLUP][ERROR]", e)
+    
+    
+rates = compute_upstate_rate(
+        time_s,
+        Spontaneous_UP,
+        Pulse_triggered_UP,
+        Pulse_associated_UP
+    )
+
+
+rate_bar_svg = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_rate_bar.svg")
+plot_upstate_rates_bar(rates, rate_bar_svg)
 
 
 def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_save_each_svg=False):
