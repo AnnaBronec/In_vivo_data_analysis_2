@@ -452,36 +452,111 @@ HAVE_NEV = False  # wird ggf. nach NEV-read True
 
 
 
-
-nev_path = os.path.join(BASE_PATH, "Events.nev")
+nev_path = os.path.join(BASE_PATH, "Events.Nev")
 if os.path.exists(nev_path):
     try:
-        ts_us, ttl_words, _ = read_nev_timestamps_and_ttl(nev_path)
+        import numpy as np
 
-        # TTL bit wählen (0 ist Start; wenn 0 nix liefert: 1..15 testen)
-        on_us, off_us = ttl_to_on_off(ts_us, ttl_words, bit=0)
+        # --- read NEV ---
+        ts_ticks, ttl_words, _ = read_nev_timestamps_and_ttl(nev_path)
 
+        # --- TTL: ensure unsigned 16-bit ---
+        ttl_u16 = (np.asarray(ttl_words, dtype=np.int32) & 0xFFFF).astype(np.uint16)
+
+        # --- timestamps: ticks -> microseconds ---
+        NEV_TS_HZ = 30000  # adjust if needed
+        ts_us = (np.asarray(ts_ticks, dtype=np.int64) * 1_000_000) / NEV_TS_HZ
+        ts_us = ts_us.astype(np.int64)
+
+        # --- choose TTL bit (auto) ---
+        best_bit, best_edges = None, 0
+        for b in range(16):
+            x = (ttl_u16 >> b) & 1
+            edges = int(np.count_nonzero(np.diff(x) != 0))
+            if edges > best_edges:
+                best_edges = edges
+                best_bit = b
+
+        # If you want to force bit 12, uncomment next line:
+        # best_bit = 12
+
+        print(f"[NEV] best bit: {best_bit} edges: {best_edges}")
+
+        # --- detect on/off in NEV timebase (us) ---
+        on_us, off_us = ttl_to_on_off(ts_us, ttl_u16, bit=int(best_bit) if best_bit is not None else 0)
+        on_us  = np.asarray(on_us, dtype=np.int64)
+        off_us = np.asarray(off_us, dtype=np.int64)
+
+        # --- robust pairing: off must be after on ---
+        i = j = 0
+        on2, off2 = [], []
+        while i < len(on_us) and j < len(off_us):
+            if off_us[j] <= on_us[i]:
+                j += 1
+                continue
+            on2.append(on_us[i])
+            off2.append(off_us[j])
+            i += 1
+            j += 1
+
+        on_us_p  = np.asarray(on2, dtype=np.int64)
+        off_us_p = np.asarray(off2, dtype=np.int64)
+        print(f"[NEV] pairing: on={len(on_us)} off={len(off_us)} -> paired={len(on_us_p)}")
+
+        if len(on_us_p) == 0 or len(off_us_p) == 0:
+            raise ValueError("No valid NEV on/off pairs after pairing.")
+
+        # Duration sanity check
+        dur_ms = (off_us_p - on_us_p) / 1000.0
+        print("[NEV] dur ms (min/median/max):",
+              float(np.min(dur_ms)), float(np.median(dur_ms)), float(np.max(dur_ms)))
+
+        # --- pick t0_us (mapping NEV-us -> LFP seconds) ---
         t0_us = None
         if isinstance(lfp_meta, dict):
-            # typische Keys (je nach Loader)
             for k in ["csc_t0_us", "t0_us", "first_ts_us", "start_ts_us", "first_timestamp_us"]:
                 if k in lfp_meta and lfp_meta[k] is not None:
                     t0_us = int(lfp_meta[k])
                     break
 
         if t0_us is None:
-            # Fallback: setze NEV so, dass ts_us[0] -> time_s[0]
-            # (funktioniert, wenn time_s in Sekunden relativ zu Start ist oder konstant verschoben)
-            t0_us = int(ts_us[0] - float(time_s[0]) * 1e6)
+            # Fallback: map first NEV on to first LFP time
+            t0_us = int(on_us_p[0] - float(time_s[0]) * 1e6)
 
-        pulse_times_1_full     = (on_us  - t0_us) / 1e6
-        pulse_times_1_off_full = (off_us - t0_us) / 1e6
+        # --- convert to seconds in LFP time coordinates ---
+        pulse_times_1_full     = (on_us_p  - t0_us) / 1e6
+        pulse_times_1_off_full = (off_us_p - t0_us) / 1e6
 
-        # optional: direkt auch intervals (full) bauen
+        # --- optional: align to CSV if available (and avoids crashing if not) ---
+        try:
+            if "pulse_times_csv_on" in globals() and pulse_times_csv_on is not None:
+                if len(pulse_times_csv_on) > 0 and len(pulse_times_1_full) > 0:
+                    N = min(len(pulse_times_csv_on), len(pulse_times_1_full))
+                    offset = float(np.median(np.asarray(pulse_times_csv_on[:N]) - np.asarray(pulse_times_1_full[:N])))
+                    pulse_times_1_full     = pulse_times_1_full + offset
+                    pulse_times_1_off_full = pulse_times_1_off_full + offset
+                    print("[NEV][ALIGN] offset(s):", offset)
+        except Exception as _e_align:
+            print("[NEV][ALIGN][WARN] CSV alignment skipped:", _e_align)
+
+        # # --- crop to LFP window (helps plotting; keeps only in-range pulses) ---
+        # tmin, tmax = float(time_s[0]), float(time_s[-1])
+        # mask = (pulse_times_1_full >= tmin) & (pulse_times_1_full <= tmax)
+
+        # pulse_times_1_full     = pulse_times_1_full[mask]
+        # pulse_times_1_off_full = pulse_times_1_off_full[mask]
+
+        print(f"[NEV] pulses in LFP range: on={len(pulse_times_1_full)} off={len(pulse_times_1_off_full)} "
+              f"(t0_us={t0_us})")
+
+        # --- build intervals for plotting ---
         pulse_intervals_1_full = list(zip(pulse_times_1_full, pulse_times_1_off_full))
 
-        print(f"[NEV] pulses loaded: on={len(pulse_times_1_full)} off={len(pulse_times_1_off_full)} "
-              f"(t0_us={t0_us})")
+        # Final sanity check right before plotting:
+        if len(pulse_times_1_full) > 0:
+            dur_s = np.asarray(pulse_times_1_off_full) - np.asarray(pulse_times_1_full)
+            print("[NEV][PLOT CHECK] dur_s median/min/max:",
+                  float(np.median(dur_s)), float(np.min(dur_s)), float(np.max(dur_s)))
 
     except Exception as e:
         print("[NEV][WARN] reading/parsing failed:", e)
@@ -492,7 +567,22 @@ else:
 if not FROM_STREAM:
     assert "time" in LFP_df.columns, "CSV braucht eine Spalte 'time'."
 
+# print("[LFP] time_s range:", float(time_s[0]), "to", float(time_s[-1]), " (s)")
+# print("[NEV] pulse on range:", float(pulse_times_1_full[0]), "to", float(pulse_times_1_full[-1]), " (s)")
+# print("[NEV] pulse off range:", float(pulse_times_1_off_full[0]), "to", float(pulse_times_1_off_full[-1]), " (s)")
 
+print("NEV pulses on (first/last/count):",
+      pulse_times_1_full[:3], pulse_times_1_full[-3:], len(pulse_times_1_full))
+print("NEV pulses off (first/last/count):",
+      pulse_times_1_off_full[:3], pulse_times_1_off_full[-3:], len(pulse_times_1_off_full))
+
+
+
+
+
+for i in range(0, min(30, len(ttl_words))):
+    w = int(ttl_words[i])
+    print(i, w, format(w, "016b"))
 
 if LFP_df is not None:
     # alter Weg: wir haben ein DataFrame aus einer einzelnen CSV
@@ -844,6 +934,10 @@ pulse_times_1_off = _clip_events_to_bounds(pulse_times_1_off, time_s, 0.0, 0.0)
 pulse_times_2_off = _clip_events_to_bounds(pulse_times_2_off, time_s, 0.0, 0.0)
 
 
+print("AFTER CROP time_s:", time_s[0], time_s[-1], "len:", len(time_s))
+print("AFTER CROP p1 on/off:", len(pulse_times_1), len(pulse_times_1_off))
+print("AFTER CROP p1 range:",
+      (pulse_times_1[0], pulse_times_1[-1]) if len(pulse_times_1) else None)
 
 
 
@@ -1589,6 +1683,7 @@ if len(pulse_times_2):
 
 
 
+
 def plot_up_classification_ax(
     main_channel, time_s,
     Spontaneous_UP, Spontaneous_DOWN,
@@ -1599,8 +1694,7 @@ def plot_up_classification_ax(
     Spon_Peaks=None, Trig_Peaks=None,
     ax=None, title="Main channel with UP classification"
 ):
-  
-   
+    
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(10, 3))
@@ -1615,7 +1709,6 @@ def plot_up_classification_ax(
         last_pulse_time = None
 
 
-    
 
     # 1) LFP trace
     ax.plot(time_s, main_channel, lw=0.8, color="black", label="LFP (main)")
@@ -3272,265 +3365,6 @@ rates = compute_upstate_rate(
 
 print(f"[REFRAC SPONT] spon→spon: n={len(refrac_spon2spon)}, "
       f"spon→trig: n={len(refrac_spon2trig)}")
-# #  Layout definieren (Zeilen)
-# layout_rows = [
-#     # REIHE 1: Main channel (volle Breite)
-#     [lambda ax: plot_up_classification_ax(
-#         main_channel, time_s,
-#         Spontaneous_UP, Spontaneous_DOWN,
-#         Pulse_triggered_UP, Pulse_triggered_DOWN,
-#         Pulse_associated_UP, Pulse_associated_DOWN,
-#         pulse_times_1=pulse_times_1,
-#         pulse_times_2=pulse_times_2,
-#         ax=ax
-#     )],
-
-#     # REIHE 2: links Durations, rechts Power
-#     [lambda ax: upstate_duration_compare_ax(
-#         Trig_UP_crop, Trig_DOWN_crop,
-#         Spon_UP_crop, Spon_DOWN_crop, dt, ax=ax
-#     ),
-#      lambda ax: Power_spectrum_compare_ax(
-#         freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax
-#     )],
-    
-#  # REIHE 3: Amplituden-Vergleich (volle Breite)
-#     [lambda ax: upstate_amplitude_compare_ax(
-#         spont_amp, trig_amp, ax=ax, title="UP Amplitude (max-min): Spontan vs. Getriggert"
-#     )],
-
-#     # REIHE 4: CSD (volle Breite)
-#     [lambda ax: CSD_compare_side_by_side_ax(
-#         CSD_spont, CSD_trig, dt,
-#         z_mm=z_mm,
-#         align_pre=align_pre_s, align_post=align_post_s,
-#         # Paper-look:
-#         cmap="Spectral_r",          # <--- klassisches Diverging-Map
-#         sat_pct=95,             # <--- etwas weniger aggressiv
-#         norm_mode="linear",
-#         #vmax_abs=15,     # <--- einfache lineare Skala
-#         linthresh_frac=0.03,    # hier egal bei linear, kann bleiben
-#         ax=ax,
-#         title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
-#     )],
-
-
-
-#       # REIHE 4 (NEU): Mittel-LFP um Onsets – Spont vs. Trig
-#     [lambda ax: up_onset_mean_ax(
-#         main_channel, dt, Spon_Onsets,
-#         ax=ax, title="Spont-UPs – onset-aligned mean"
-#     ),
-#      lambda ax: up_onset_mean_ax(
-#         main_channel, dt, Trig_Onsets,
-#         ax=ax, title="Trig-UPs – onset-aligned mean"
-#     )],
-
-#         # REIHE 4: CSD – zwei Panels nebeneinander (Spont / Trig)
-#     [lambda ax: CSD_single_panel_ax(
-#             CSD_spont, dt,
-#             z_mm=z_mm,
-#             align_pre=align_pre_s,
-#             align_post=align_post_s,
-#             ax=ax,
-#             title="CSD Spontaneous"
-#         ),
-#     lambda ax: CSD_single_panel_ax(
-#             CSD_trig, dt,
-#             z_mm=z_mm,
-#             align_pre=align_pre_s,
-#             align_post=align_post_s,
-#             ax=ax,
-#             title="CSD Triggered"
-    
-#         )],
-#     # REIHE X: Pulse→UP Latenzen (Histogramm)
-#     [lambda ax: pulse_to_up_latency_hist_ax(latencies_trig, ax=ax)],
-
-#     [lambda ax: pulse_triggered_up_overlay_ax(
-#     main_channel,
-#     time_s,
-#     pulse_times_1,          # ggf. pulse_times_2
-#     Pulse_triggered_UP,
-#     dt,
-#     pre_s=0.2,
-#     post_s=1.0,
-#     max_win_s=1.0,
-#     ax=ax,
-#     title="Pulse-alignierte Trigger-UPs (LFP overlay)"
-#     )],
-
-#     [lambda ax: refractory_compare_ax(
-#         refrac_spont, refrac_trig, ax=ax,
-#         title="Refraktärzeit nach UP bis nächster UP"
-#     )],
-    
-
-#     [lambda ax: refractory_from_spont_to_type_overlay_ax(
-#         main_channel,
-#         time_s,
-#         Spontaneous_UP, Spontaneous_DOWN,
-#         Pulse_triggered_UP, Pulse_triggered_DOWN,
-#         Pulse_associated_UP, Pulse_associated_DOWN,
-#         dt,
-#         target_type="spont",
-#         pre_s=10.0,
-#         post_s=30.0,
-#         ax=ax,
-#         title="SPONT offset → nächste SPONT-UPs"
-#     )],
-#     [lambda ax: refractory_from_spont_to_type_overlay_ax(
-#         main_channel,
-#         time_s,
-#         Spontaneous_UP, Spontaneous_DOWN,
-#         Pulse_triggered_UP, Pulse_triggered_DOWN,
-#         Pulse_associated_UP, Pulse_associated_DOWN,
-#         dt,
-#         target_type="trig",
-#         pre_s=10.0,
-#         post_s=30.0,
-#         ax=ax,
-#         title="SPONT offset → nächste TRIG-UPs"
-#     )],
-
-#     [lambda ax: refractory_from_spont_single_folder_ax(
-#         refrac_spon2spon, refrac_spon2trig,
-#         folder_name=BASE_TAG,
-#         ax=ax
-#     )],
-#     [lambda ax: spontaneous_up_full_overlay_normtime_ax(
-#     main_channel, time_s,
-#     Spontaneous_UP, Spontaneous_DOWN,
-#     n_points=300,
-#     ax=ax,
-#     title="Spontaneous UPs (full Onset→Offset), time-normalized overlay"
-# )],
-
-# [
-#   lambda ax: (
-#       _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None) else
-#       pca_template_pc1_ax(pca_fit_joint, ax=ax, title="Spontaneous PCA Template (PC1)")
-#   ),
-#   lambda ax: (
-#       _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or pc1z_trig is None) else
-#       pca_similarity_scores_ax(
-#           pca_fit_joint["scores_spont"],
-#           pc1z_trig,
-#           mahal_trig,
-#           ax=ax,
-#           title="Triggered similarity vs. spontaneous PCA"
-#       )
-#   )
-# ],
-
-# # REIHE NEU: Mahalanobis-Distanz + Top/Bottom Trigger Overlays
-# [
-#   lambda ax: (
-#       _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None or mahal_trig is None) else
-#       mahal_compare_ax(mahal_sp, mahal_trig, ax=ax,
-#                        title="Mahalanobis distance to spontaneous PCA space")
-#   ),
-#   lambda ax: (
-#       _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or mahal_trig is None or X_trig.shape[0]==0) else
-#       ranked_trigger_overlays_ax(X_spont, X_trig, mahal_trig, ax=ax, top_n=5,
-#                                  title="Triggered UPs: most vs least similar (Mahalanobis)")
-#   )
-# ],
-
-
-# # PCA Template + Similarity Scores
-# [
-#   lambda ax: (
-#       _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None) else
-#       pca_template_pc1_ax(pca_fit_joint, ax=ax, title="JOINT PCA Template (PC1) (spont+trig)")
-#   ),
-#   lambda ax: (
-#       _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or pc1z_trig is None) else
-#       pca_similarity_scores_ax(
-#           pca_fit_joint["scores_spont"],
-#           pc1z_trig,
-#           mahal_trig,
-#           ax=ax,
-#           title="Triggered similarity in JOINT PCA space"
-#       )
-#   )
-# ],
-
-# # Mahalanobis + Ranked overlays
-# [
-#   lambda ax: (
-#       _blank_ax(ax, "PCA skipped") if (pca_fit_joint is None or mahal_trig is None) else
-#       mahal_compare_ax(mahal_sp, mahal_trig, ax=ax,
-#                        title="Mahalanobis distance in JOINT PCA space")
-#   ),
-#   lambda ax: (
-#       _blank_ax(ax, "PCA skipped / no trig") if (pca_fit_joint is None or mahal_trig is None or X_trig.shape[0]==0) else
-#       ranked_trigger_overlays_ax(X_spont, X_trig, mahal_trig, ax=ax, top_n=5,
-#                                  title="Triggered UPs ranked (JOINT PCA space)")
-#   )
-# ],
-
-# # REIHE: Separate PCA – Templates & Overlay
-# [
-#   lambda ax: (
-#       _blank_ax(ax, "PCA spont skipped") if (pca_fit_sp is None) else
-#       pca_template_pc1_ax(pca_fit_sp, ax=ax, title="Spontaneous PCA Template (PC1)")
-#   ),
-#   lambda ax: (
-#       _blank_ax(ax, "PCA trig skipped") if (pca_fit_tr is None) else
-#       pca_template_pc1_ax(pca_fit_tr, ax=ax, title="Triggered PCA Template (PC1)")
-#   )
-# ],
-# [
-#   lambda ax: (
-#       _blank_ax(ax, "Need both PCAs") if (pca_fit_sp is None or pca_fit_tr is None) else
-#       pca_pc1_overlay_corr_diff_ax(pca_fit_sp, pca_fit_tr, ax=ax,
-#                                    title="PC1 overlay + corr + diff (spont vs trig)")
-#   )
-# ],
-
-# [
-#     lambda ax: (
-#         _blank_ax(ax, "no PCA stats")
-#         if (corr_sp is None or corr_tr is None)
-#         else pca_similarity_stats_ax(
-#             corr_sp,
-#             corr_tr,
-#             p_val=p,
-#             ax=ax,
-#             title="Similarity to spontaneous UP template (PC1)"
-#         )
-#     )
-# ],
-
-#     [lambda ax: upstate_similarity_timecourse_ax(
-#         res,
-#         Trig_UP_peak_aligned_array,
-#         Spon_UP_peak_aligned_array,
-#         ax=ax,
-#         alpha=0.05,
-#         title="Triggered vs Spontaneous UP states (peak-aligned)"
-#     )],
-
-#     [lambda ax: CSD_compare_side_by_side_ax(
-#         CSD_spont, CSD_trig, dt,
-#         z_mm=z_mm,
-#         align_pre=align_pre_s, align_post=align_post_s,
-#         cmap="Spectral_r",
-#         sat_pct=95,
-#         norm_mode="linear",
-#         linthresh_frac=0.03,
-#         ax=ax,
-#         title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
-#     )],
-#         # REIHE NEU: UP-rate Balkendiagramm (volle Breite)
-#     [lambda ax: upstate_rate_bar_ax(
-#         rates,
-#         ax=ax,
-#         title="UP rate (total): [/min] vs [Hz]"
-#     )],
-
-# ]
 
 
 layout_rows = [
