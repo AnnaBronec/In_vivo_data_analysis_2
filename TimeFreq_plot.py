@@ -64,7 +64,12 @@ def Compute_spectrogram(y,t_win):
 
 #Spect = spectrogram(Win_EEG_FF[0:-1:25],Win_T[0:-1:25])
 def Run_spectrogram(V_Signal,t_signal):
-	DownSample = int(0.001/np.diff(t_signal[0:2]))
+	print("t:signal = ", t_signal)
+	# DownSample = int(0.001/np.diff(t_signal[0:2]))
+	dt = float(t_signal[1] - t_signal[0])     # Skalar
+	DownSample = int(round(0.001 / dt))
+	DownSample = max(1, DownSample)           # wichtig, sonst wird es bei dt>1ms zu 0
+
 	print(np.diff(t_signal[0:2]))
 	Spect = Compute_spectrogram(V_Signal,t_signal)#Win_T[0:-1:25])
 	# There are several outputs for spectrogram, we only want the first Spect[0]

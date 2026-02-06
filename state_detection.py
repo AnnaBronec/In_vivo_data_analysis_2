@@ -108,7 +108,8 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     # helpers 
     def _empty_states(Total_power, time_s, dt, align_pre, align_len):
-        time_s = np.asarray(time_s)
+        # Total_power ist Feature-Länge; time_s kann Raw-Länge haben -> nicht für Shapes verwenden
+        Total_power = np.asarray(Total_power)
         return {
             "Pulse_triggered_UP": np.array([], dtype=int),
             "Pulse_triggered_DOWN": np.array([], dtype=int),
@@ -132,22 +133,70 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
             "Total_power": Total_power,
             "UP_start_i": np.array([], dtype=int),
             "DOWN_start_i": np.array([], dtype=int),
-            "up_state_binary": np.zeros_like(time_s, dtype=bool),
-             "t_feat": t_feat,
-            "dt_feat": dt_feat,
-            "Spontaneous_UP_raw": Spont_UP_raw,
-            "Spontaneous_DOWN_raw": Spont_DN_raw,
-            "Pulse_triggered_UP_raw": Trig_UP_raw,
-            "Pulse_triggered_DOWN_raw": Trig_DN_raw,
-            "Pulse_associated_UP_raw": Assoc_UP_raw,
-            "Pulse_associated_DOWN_raw": Assoc_DN_raw,
+            "up_state_binary": np.zeros_like(Total_power, dtype=bool),  # Feature-Länge!
+            "t_feat": np.array([], dtype=float),
+            "dt_feat": np.nan,
+            "Spontaneous_UP_raw": np.array([], dtype=int),
+            "Spontaneous_DOWN_raw": np.array([], dtype=int),
+            "Pulse_triggered_UP_raw": np.array([], dtype=int),
+            "Pulse_triggered_DOWN_raw": np.array([], dtype=int),
+            "Pulse_associated_UP_raw": np.array([], dtype=int),
+            "Pulse_associated_DOWN_raw": np.array([], dtype=int),
         }
+
+    # --- ALIGN: robust (align_pre/align_post can be seconds OR samples) ---
+
+    def _looks_like_samples(a, dt):
+        # If a is "large" but corresponds to a reasonable number of seconds when multiplied by dt,
+        # it's almost certainly already in samples.
+        try:
+            a = float(a)
+        except Exception:
+            return False
+        return (a >= 5) and (a * dt < 10.0)  # e.g. 320 samples * 0.00156 = 0.5s
+
+    if _looks_like_samples(align_pre, dt) and _looks_like_samples(align_post, dt):
+        align_pre_samp  = int(round(align_pre))
+        align_post_samp = int(round(align_post))
+        align_pre_sec   = align_pre_samp * dt
+        align_post_sec  = align_post_samp * dt
+    else:
+        align_pre_sec   = float(align_pre)
+        align_post_sec  = float(align_post)
+        align_pre_samp  = int(round(align_pre_sec  / dt))
+        align_post_samp = int(round(align_post_sec / dt))
+
+    align_len_expected = align_pre_samp + align_post_samp
+
+    if align_len != align_len_expected:
+        print(f"[ALIGN-FIX] align_len {align_len} -> {align_len_expected}")
+        align_len = align_len_expected
+
+    print("[DBG ALIGN]",
+        "align_len", align_len,
+        "pre_samp", align_pre_samp, "post_samp", align_post_samp,
+        "pre_sec", align_pre_sec, "post_sec", align_post_sec)
+
 
     # 1) Bandpower aus Spektrogramm
     freqs = Spect_dat[2]
     S = np.asarray(Spect_dat[0], float)  # dB
     t_feat = np.asarray(Spect_dat[1], float) 
-        
+
+    dt_feat = float(np.median(np.diff(t_feat))) if (t_feat.size >= 2 and np.all(np.isfinite(t_feat))) else float(dt)
+
+    #     # align_pre/align_post are in seconds in this pipeline -> convert to samples for indexing
+    # align_pre_samp  = int(round(align_pre  / dt))
+    # align_post_samp = int(round(align_post / dt))
+
+    # # keep align_len as given, but if it's inconsistent, enforce it
+    # if align_len != (align_pre_samp + align_post_samp):
+    #     align_len = align_pre_samp + align_post_samp
+
+        # align_pre/align_post are seconds -> convert to samples
+
+
+
     print("Spect_dat lens/types:",
         type(Spect_dat), len(Spect_dat),
         type(Spect_dat[0]), type(Spect_dat[1]), type(Spect_dat[2]))
@@ -177,48 +226,145 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     S_clip = np.clip(S[band_mask, :], -120, 30)
     linear = 10 ** (S_clip / 10.0)
 
-    # robuster als Summe: median reduziert “hot bins”
-    S_band = S[band_mask, :]          # S ist in dB
-    Total_power = np.mean(linear, axis=0)  # jetzt direkt dB-Mittelwert
+    # robust gegen Hot-Bins (median statt mean)
+    Total_power = np.median(linear, axis=0)
+    # optionale Dynamik-Kompression (macht Thresholding stabiler)
+    Total_power = np.log10(Total_power + 1e-30)
+
+
 
     print("Total_power stats:", np.min(Total_power), np.max(Total_power), np.isnan(Total_power).sum())
 
     # 2) Smooth 
-    Total_power_smooth = gaussian_filter1d(Total_power, sigma=2)
+    # 2) Smooth in *Sekunden* (weil t_feat ~ dt ist)
+    # Ziel: 100 ms Glättung (passt oft gut für UP/DOWN)
+    smooth_s = 0.05
+    sigma_bins = max(1, int(round(smooth_s / dt_feat)))  # dt_feat später gesetzt? -> siehe unten
+    # Falls dt_feat hier noch nicht existiert, nimm median diff von t_feat:
+    # dt_feat_tmp = float(np.median(np.diff(t_feat))) if (t_feat.size > 1) else float(dt)
+    # sigma_bins = max(1, int(round(smooth_s / dt_feat_tmp)))
 
-    # robust z-score auf Feature-Achse
-    med = np.median(Total_power_smooth)
-    mad = np.median(np.abs(Total_power_smooth - med)) + 1e-30
+    Total_power_smooth = gaussian_filter1d(Total_power, sigma=sigma_bins)
+
+    # # robust z-score auf Feature-Achse
+    # med = np.median(Total_power_smooth)
+    # mad = np.median(np.abs(Total_power_smooth - med)) + 1e-30
+    # robust_std = 1.4826 * mad
+
+    # z = (Total_power_smooth - med) / robust_std
+    x = Total_power_smooth
+
+    # baseline = "untere" Zustände (ruhig / DOWN-lastig)
+    q = np.quantile(x, 0.15)
+    base = x[x <= q]
+    if base.size < 10:
+        base = x  # fallback
+
+    mu = np.median(base)
+    mad = np.median(np.abs(base - mu)) + 1e-30
     robust_std = 1.4826 * mad
 
-    z = (Total_power_smooth - med) / robust_std
+    z = (x - mu) / robust_std
 
-    k_hi = 3.0   # Start-Schwelle (strenger)
-    k_lo = 2.5   # Halte-Schwelle (lockerer)
 
-    hi = z > k_hi
-    lo = z > k_lo
+    # k_hi = 3.0   # Start-Schwelle (strenger)
+    # k_lo = 2.5   # Halte-Schwelle (lockerer)
 
-    # hysteresis reconstruction: UP startet bei hi, läuft weiter solange lo true ist
-    up_state_binary = np.zeros_like(hi, dtype=bool)
-    active = False
-    for i in range(len(hi)):
-        if not active and hi[i]:
-            active = True
-        if active and not lo[i]:
-            active = False
-        up_state_binary[i] = active
+    # hi = z > k_hi
+    # lo = z > k_lo
+
+    # # hysteresis reconstruction: UP startet bei hi, läuft weiter solange lo true ist
+    # up_state_binary = np.zeros_like(hi, dtype=bool)
+    # active = False
+    # for i in range(len(hi)):
+    #     if not active and hi[i]:
+    #         active = True
+    #     if active and not lo[i]:
+    #         active = False
+    #     up_state_binary[i] = active
+
+
+
+    # max_up_fraction = 0.60  # wenn >60% UP → zu permissiv
+    # if up_state_binary.mean() > max_up_fraction:
+    #     # Schwelle schrittweise anziehen, bis UP-Anteil plausibel wird
+    #     for k_hi_try, k_lo_try in [(3.5, 3.0), (4.0, 3.5), (4.5, 4.0), (5.0, 4.5)]:
+    #         hi = z > k_hi_try
+    #         lo = z > k_lo_try
+
+    #         up_tmp = np.zeros_like(hi, dtype=bool)
+    #         active = False
+    #         for i in range(len(hi)):
+    #             if not active and hi[i]:
+    #                 active = True
+    #             if active and not lo[i]:
+    #                 active = False
+    #             up_tmp[i] = active
+
+    #         if up_tmp.mean() <= max_up_fraction:
+    #             up_state_binary = up_tmp
+    #             k_hi, k_lo = k_hi_try, k_lo_try
+    #             break
+    def _hysteresis(z, k_hi, k_lo):
+        hi = z > k_hi
+        lo = z > k_lo
+        out = np.zeros_like(hi, dtype=bool)
+        active = False
+        for i in range(len(hi)):
+            if (not active) and hi[i]:
+                active = True
+            if active and (not lo[i]):
+                active = False
+            out[i] = active
+        return out
+
+    # Zielbereich für UP-Anteil (Feature-Zeitachse)
+    target_min = 0.05
+    target_max = 0.50
+
+    # Startwerte
+    k_hi = 3.5
+    k_lo = 3.0
+
+    # Wir passen k an (hoch -> weniger UP, runter -> mehr UP)
+    for _ in range(20):
+        up_tmp = _hysteresis(z, k_hi, k_lo)
+        frac = float(up_tmp.mean())
+
+        # passt -> fertig
+        if target_min <= frac <= target_max:
+            up_state_binary = up_tmp
+            break
+
+        # zu viel UP -> strenger
+        if frac > target_max:
+            k_hi += 0.5
+            k_lo += 0.5
+
+        # zu wenig UP -> lockerer
+        else:  # frac < target_min
+            k_hi -= 0.5
+            k_lo -= 0.5
+            k_hi = max(1.5, k_hi)
+            k_lo = max(1.0, k_lo)
+    else:
+        up_state_binary = up_tmp
+
+    print(f"[AUTO-THR] k_hi={k_hi:.2f} k_lo={k_lo:.2f} fracUP={up_state_binary.mean():.3f}")
+    print("[Z] min/med/max:", float(np.nanmin(z)), float(np.nanmedian(z)), float(np.nanmax(z)))
+    print("[Z] p95/p99:", float(np.nanpercentile(z, 95)), float(np.nanpercentile(z, 99)))
+
 
 
     # 4) Gap-closing
     # dt für up_state_binary muss zur Feature-Zeitachse passen:
-    time_s = np.asarray(time_s)
-    if time_s.size >= 2 and np.all(np.isfinite(time_s)):
-        dt_feat = float(np.median(np.diff(t_feat)))
-    else:
-        dt_feat = float(dt)  # fallback
+    # time_s = np.asarray(time_s)
+    # if time_s.size >= 2 and np.all(np.isfinite(time_s)):
+    #     dt_feat = float(np.median(np.diff(t_feat)))
+    # else:
+    #     dt_feat = float(dt)  # fallback
 
-    min_gap_s = 0.5
+    min_gap_s = 0.05
     min_gap = max(1, int(round(min_gap_s / dt_feat)))
 
     binary = up_state_binary.astype(np.int8)
@@ -260,7 +406,9 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         filtered_UP = []
         filtered_DOWN = []
         for u, d in zip(up_transitions, down_transitions):
-            duration = time_s[d] - time_s[u]
+            # duration = time_s[d] - time_s[u]
+            duration = t_feat[d] - t_feat[u]
+
             if duration >= min_up_len_s:
                 filtered_UP.append(u)
                 filtered_DOWN.append(d)
@@ -288,7 +436,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     Pulse_triggered_array = [[1, 0]]
     for i in range(len(UP_start_i) - 1):
-        t_up = time_s[UP_start_i[i]]
+        t_up = t_feat[UP_start_i[i]]
         if Pulse_times_array.size == 0:
             continue
         triggered = np.where((Pulse_times_array >= t_up - 0.35) & (Pulse_times_array <= t_up + 0.35))[0]
@@ -297,7 +445,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     Pulse_associated_array = [[1, 0]]
     for j in range(len(UP_start_i) - 1):
-        t_up, t_down = time_s[UP_start_i[j]], time_s[DOWN_start_i[j]]
+        t_up, t_down = t_feat[UP_start_i[j]], t_feat[DOWN_start_i[j]]
         if Pulse_times_array.size == 0:
             continue
         associated = np.where((Pulse_times_array >= t_up) & (Pulse_times_array <= t_down))[0]
@@ -336,8 +484,12 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     # 8) Dauer/Stats
     if len(Spontaneous_UP) > 1 and len(Pulse_triggered_UP) > 1:
         Duration_Pulse_Triggered = time_s[Pulse_triggered_DOWN] - time_s[Pulse_triggered_UP]
-        Duration_Spontaneous = time_s[Spontaneous_DOWN] - time_s[Spontaneous_UP]
-        Duration_Pulse_Associated = time_s[Pulse_associated_DOWN] - time_s[Pulse_associated_UP] if len(Pulse_associated_UP) else np.array([])
+        # Duration_Spontaneous = time_s[Spontaneous_DOWN] - time_s[Spontaneous_UP]
+        Duration_Spontaneous = t_feat[Spontaneous_DOWN] - t_feat[Spontaneous_UP]
+        Duration_Pulse_Triggered = t_feat[Pulse_triggered_DOWN] - t_feat[Pulse_triggered_UP]
+        Duration_Pulse_Associated = t_feat[Pulse_associated_DOWN] - t_feat[Pulse_associated_UP] if len(Pulse_associated_UP) else np.array([])
+
+        # Duration_Pulse_Associated = time_s[Pulse_associated_DOWN] - time_s[Pulse_associated_UP] if len(Pulse_associated_UP) else np.array([])
         Dur_stat, Dur_p = stats.ttest_ind(Duration_Spontaneous, Duration_Pulse_Triggered)
     else:
         Duration_Pulse_Triggered = np.array([])
@@ -358,16 +510,27 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     #  9) Peaks / aligned arrays
     Spon_UP_array = np.zeros((len(Spontaneous_UP), align_len))
     Spon_UP_peak_aligned_array = np.full((len(Spontaneous_UP), align_len), np.nan)
-    UP_Time = np.arange(align_len) * dt - align_pre * dt
+    # UP_Time = np.arange(align_len) * dt - align_pre * dt
+    # UP_Time = np.arange(align_len) * dt - align_pre
+    UP_Time = (np.arange(align_len) - align_pre_samp) * dt
+
+
     Spon_Peaks = []
 
     for i_Spon in range(len(Spontaneous_UP)):
         # Feature-Index → Zeit (s)
-        t_up = time_s[Spontaneous_UP[i_Spon]]
+        # t_feat = time_s[Spontaneous_UP[i_Spon]]
 
-        # Zeit → Rohsample-Index
-        start_idx = int((t_up - 0.75) / dt)
-        end_idx   = int((t_up + 2.0) / dt)
+        # # Zeit → Rohsample-Index
+        # start_idx = int((t_feat - 0.75) / dt)
+        # end_idx   = int((t_feat + 2.0) / dt)
+
+        t_up = t_feat[Spontaneous_UP[i_Spon]]
+
+        # Zeit relativ zum Start -> Sample-Index
+        t0 = t_feat[0]
+        start_idx = int(((t_up - t0) - 0.75) / dt)
+        end_idx   = int(((t_up - t0) + 2.0) / dt)
 
 
         start_idx = int(start_idx)
@@ -412,20 +575,26 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
             Spon_Peaks.append(float(peak_global))
 
-            a0 = peaks[0] - align_pre
-            a1 = peaks[0] + align_post
+            # a0 = peaks[0] - align_pre
+            # a1 = peaks[0] + align_post
+            a0 = int(peaks[0] - align_pre_samp)
+            a1 = int(peaks[0] + align_post_samp)
+
             if a0 >= 0 and a1 <= len(current_data):
                 Spon_UP_peak_aligned_array[i_Spon] = current_data[a0:a1]
         else:
             Spon_Peaks.append(np.nan)
 
     Spon_Peaks = np.array(Spon_Peaks, dtype=float)
+    print("[DBG ALIGN]", "align_len", align_len,
+      "pre_samp", align_pre_samp, "post_samp", align_post_samp,
+      "Spon_arr shape", Spon_UP_peak_aligned_array.shape)
 
     # Trigger peaks via helper
     Trig_Peaks, Trig_UP_peak_aligned_array = compute_peak_aligned_segments(
         Pulse_triggered_UP, time_s, LFP_array, dt,
         b_lp, a_lp, b_hp, a_hp,
-        align_pre, align_post, align_len,
+        align_pre_samp, align_post_samp, align_len,
         offset_start=0.2, offset_end=2.0,
         search_start_s=0.2, search_end_s=2.0,
         min_peak_spacing_s=0.1

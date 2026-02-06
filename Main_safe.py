@@ -988,7 +988,13 @@ else:
 
 
 S = np.asarray(Spect_dat[0])
-t_feat = np.asarray(Spect_dat[1])
+t_feat = np.asarray(Spect_dat[1], float)
+# dt auf Feature-Zeitachse sofort definieren (wird später gebraucht!)
+if t_feat.size >= 2 and np.all(np.isfinite(t_feat)):
+    dt_feat = float(np.median(np.diff(t_feat)))
+else:
+    dt_feat = float(dt)
+
 print("[CHECK] len(time_s) =", len(time_s))
 print("[CHECK] S.shape =", S.shape, "-> timebins =", S.shape[1])
 print("[CHECK] len(t_feat) =", len(t_feat))
@@ -2802,6 +2808,25 @@ def _tstats_time(x, y):
     return tvals, pvals
 
 
+def _is_valid_2d(a, min_trials=3, min_time=2):
+    return (
+        a is not None
+        and isinstance(a, np.ndarray)
+        and a.ndim == 2
+        and a.shape[0] >= min_trials
+        and a.shape[1] >= min_time
+    )
+
+X_ = globals().get("X", None)
+Y_ = globals().get("Y", None)
+
+if (not _is_valid_2d(X_)) or (not _is_valid_2d(Y_)):
+    print(f"[CLUSTER] skipped: X={None if X_ is None else X_.shape} "
+          f"Y={None if Y_ is None else Y_.shape}")
+    t_obs, p_point, clusters = None, None, None
+else:
+    t_obs, p_point, clusters = permutation_cluster_test_time(X_, Y_, seed=1)
+
 def permutation_cluster_test_time(
     x, y,
     n_perm=2000,
@@ -2811,25 +2836,62 @@ def permutation_cluster_test_time(
 ):
     """
     Cluster permutation test across time.
+
+    Inputs:
+      x: array-like, shape (n_trials_x, n_time)
+      y: array-like, shape (n_trials_y, n_time)
+
     Returns:
       t_obs (n_time,), p_pointwise (n_time,),
       clusters: list of dicts {start, end, mass, p_cluster}
+
+    If inputs are missing/invalid/too small, returns (None, None, None).
     """
+
+    # -------- guard: never crash on missing/invalid data --------
+    if x is None or y is None:
+        return None, None, None
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    # Must be 2D
+    if x.ndim != 2 or y.ndim != 2:
+        return None, None, None
+
+    # Must have enough trials and timepoints
+    if x.shape[0] < 3 or y.shape[0] < 3 or x.shape[1] < 2 or y.shape[1] < 2:
+        return None, None, None
+
+    # Must match time dimension
+    if x.shape[1] != y.shape[1]:
+        return None, None, None
+
+    # Must have finite variance somewhere (avoid degenerate t-stats)
+    # (optional but helpful in noisy pipelines)
+    if (np.nanstd(x, axis=0).sum() == 0) or (np.nanstd(y, axis=0).sum() == 0):
+        return None, None, None
+
     rng = np.random.default_rng(seed)
 
-    x = np.asarray(x, float)
-    y = np.asarray(y, float)
-
-    # observed
+    # -------- observed stats --------
     t_obs, p_obs = _tstats_time(x, y)
+
+    # If stats returned weird shapes, bail safely
+    if t_obs is None or p_obs is None:
+        return None, None, None
+    t_obs = np.asarray(t_obs, dtype=float).ravel()
+    p_obs = np.asarray(p_obs, dtype=float).ravel()
+    if t_obs.size != x.shape[1] or p_obs.size != x.shape[1]:
+        return None, None, None
 
     # pointwise threshold mask
     sig_mask = p_obs < alpha
     clusters_obs = _find_clusters(sig_mask)
 
-    # cluster mass statistic
+    # -------- cluster mass statistic --------
     def cluster_mass(tvals, start, end):
-        seg = tvals[start:end+1]
+        seg = tvals[start:end + 1]
         if tail == "two-sided":
             return np.nansum(np.abs(seg))
         elif tail == "greater":
@@ -2841,32 +2903,50 @@ def permutation_cluster_test_time(
 
     obs_masses = [cluster_mass(t_obs, s, e) for s, e in clusters_obs]
 
-    # build permutation null of max cluster mass
+    # -------- permutation null of max cluster mass --------
     all_data = np.vstack([x, y])
     n_x = x.shape[0]
     n_total = all_data.shape[0]
 
-    max_masses = np.zeros(n_perm)
-    for p in range(n_perm):
+    max_masses = np.zeros(int(n_perm), dtype=float)
+    for p in range(int(n_perm)):
         perm_idx = rng.permutation(n_total)
         xp = all_data[perm_idx[:n_x], :]
         yp = all_data[perm_idx[n_x:], :]
+
         t_p, p_p = _tstats_time(xp, yp)
+        if t_p is None or p_p is None:
+            max_masses[p] = 0.0
+            continue
+
+        t_p = np.asarray(t_p, dtype=float).ravel()
+        p_p = np.asarray(p_p, dtype=float).ravel()
+        if t_p.size != x.shape[1] or p_p.size != x.shape[1]:
+            max_masses[p] = 0.0
+            continue
+
         mask_p = p_p < alpha
         cl_p = _find_clusters(mask_p)
         if len(cl_p) == 0:
             max_masses[p] = 0.0
         else:
             masses = [cluster_mass(t_p, s, e) for s, e in cl_p]
-            max_masses[p] = np.nanmax(masses)
+            max_masses[p] = np.nanmax(masses) if len(masses) else 0.0
 
-    # cluster p-values
+    # -------- cluster p-values --------
     clusters = []
     for (s, e), mass in zip(clusters_obs, obs_masses):
-        p_cluster = (np.sum(max_masses >= mass) + 1) / (n_perm + 1)  # conservative
-        clusters.append({"start": s, "end": e, "mass": float(mass), "p_cluster": float(p_cluster)})
+        p_cluster = (np.sum(max_masses >= mass) + 1) / (int(n_perm) + 1)  # conservative
+        clusters.append({
+            "start": int(s),
+            "end": int(e),
+            "mass": float(mass),
+            "p_cluster": float(p_cluster),
+        })
 
     return t_obs, p_obs, clusters
+
+
 
 
 def pca_pc1_overlay_corr_diff_ax(pca_fit_sp, pca_fit_tr, ax=None,
@@ -3046,6 +3126,27 @@ def compare_triggered_vs_spontaneous(
 
     Returns dict with all results.
     """
+
+    def _empty_compare():
+        return {
+            "X": None, "Y": None,
+            "t_obs": None,
+            "p_pointwise": None,
+            "clusters": [],
+            "n_trials": {"trig": 0, "spon": 0},
+        }
+
+    def compare_triggered_vs_spontaneous(X, Y, *args, **kwargs):
+        if X is None or Y is None:
+            return _empty_compare()
+        X = np.asarray(X)
+        Y = np.asarray(Y)
+        if X.ndim != 2 or Y.ndim != 2:
+            return _empty_compare()
+        if X.shape[0] < 3 or Y.shape[0] < 3:
+            return _empty_compare()
+        # ... dann normal weiter ...
+
     X = np.asarray(trig_aligned, float)
     Y = np.asarray(spon_aligned, float)
 
@@ -3094,15 +3195,23 @@ res = compare_triggered_vs_spontaneous(
     Trig_UP_peak_aligned_array,
     Spon_UP_peak_aligned_array,
     dt=dt,
-    up_time=UP_Time,      # falls du UP_Time schon hast
+    up_time=UP_Time,
     n_perm=2000,
     alpha=0.05,
     seed=1
-)
+) or {}
 
-print("n trials:", res["n_trials"])
-print("significant clusters (p<0.05):",
-      [(c["start"], c["end"], c["p_cluster"]) for c in res["clusters"] if c["p_cluster"] < 0.05])
+n_trials = res.get("n_trials", {})
+clusters = res.get("clusters") or []
+
+print("n trials:", n_trials)
+
+sig = [(c.get("start"), c.get("end"), c.get("p_cluster"))
+       for c in clusters
+       if isinstance(c, dict) and c.get("p_cluster", 1.0) < 0.05]
+
+print("significant clusters (p<0.05):", sig if sig else "[CLUSTER] none/empty")
+
 
 
 def _nansem(a, axis=0):
