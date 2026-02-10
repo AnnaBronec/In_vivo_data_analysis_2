@@ -1,7 +1,15 @@
 import csv
+import os
 import numpy as np
 import matplotlib
-matplotlib.use("TkAgg")  # oder "Qt5Agg", wenn Tk nicht installiert ist
+try:
+    # In headless Umgebungen (z. B. Server/CI) auf non-interactive Backend fallen.
+    if os.environ.get("DISPLAY"):
+        matplotlib.use("TkAgg")
+    else:
+        matplotlib.use("Agg")
+except Exception:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from tempfile import TemporaryFile
@@ -13,7 +21,6 @@ from CSD import CSD_calc
 import seaborn as sns
 from scipy.signal import find_peaks
 import scipy.stats as stats
-import os
 import random
 import numpy as np
 import pandas as pd
@@ -159,7 +166,6 @@ def pre_post_condition(dt):
     align_len = align_pre + align_post
 
     return(pre, post, win_len, align_pre, align_post, align_len)
-
 
 
 

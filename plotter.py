@@ -1,8 +1,16 @@
 import csv
+import os
 import numpy as np
 import matplotlib
-matplotlib.use("TkAgg")  # oder "Qt5Agg", wenn Tk nicht installiert ist
+try:
+    if os.environ.get("DISPLAY"):
+        matplotlib.use("TkAgg")
+    else:
+        matplotlib.use("Agg")
+except Exception:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm, SymLogNorm
 from matplotlib.gridspec import GridSpec
 from tempfile import TemporaryFile
 import pandas as pd
@@ -13,7 +21,7 @@ from CSD import CSD_calc
 import seaborn as sns
 from scipy.signal import find_peaks
 import scipy.stats as stats
-import os
+from scipy.ndimage import gaussian_filter
 import random
 import numpy as np
 import pandas as pd
@@ -201,7 +209,7 @@ def CSD_compare_side_by_side_ax(
     
 
     # --- Robustheitschecks ---
-    ok = lambda A: (isinstance(A, _np.ndarray) and A.ndim == 2 and A.size > 0)
+    ok = lambda A: (isinstance(A, np.ndarray) and A.ndim == 2 and A.size > 0)
     if not (ok(CSD_spont) and ok(CSD_trig)):
         if ax is None:
             fig, ax = plt.subplots(figsize=(8, 3))
@@ -217,8 +225,8 @@ def CSD_compare_side_by_side_ax(
         fig = ax.figure
 
     # --- 1) In float umwandeln & 2D glätten (time × depth) ---
-    CSD_sp = _np.asarray(CSD_spont, float)
-    CSD_tr = _np.asarray(CSD_trig,  float)
+    CSD_sp = np.asarray(CSD_spont, float)
+    CSD_tr = np.asarray(CSD_trig,  float)
 
     # sigma=(depth, time) – hier moderat, nicht zu stark
     CSD_sp_sm = gaussian_filter(CSD_sp, sigma=(2.0, 3.0))
@@ -229,25 +237,25 @@ def CSD_compare_side_by_side_ax(
         CSD_sp_plot = CSD_sp_sm[::-1, :]
         CSD_tr_plot = CSD_tr_sm[::-1, :]
         if z_mm is not None:
-            z_plot = _np.asarray(z_mm)[::-1]
+            z_plot = np.asarray(z_mm)[::-1]
         else:
             z_plot = None
     else:
         CSD_sp_plot = CSD_sp_sm
         CSD_tr_plot = CSD_tr_sm
-        z_plot = _np.asarray(z_mm) if z_mm is not None else None
+        z_plot = np.asarray(z_mm) if z_mm is not None else None
 
     # --- 3) Gemeinsame Skala (linear, zero-centered) ---
-    stack = _np.concatenate([
-        _np.abs(CSD_sp_plot).ravel(),
-        _np.abs(CSD_tr_plot).ravel()
+    stack = np.concatenate([
+        np.abs(CSD_sp_plot).ravel(),
+        np.abs(CSD_tr_plot).ravel()
     ])
-    stack = stack[_np.isfinite(stack)]
+    stack = stack[np.isfinite(stack)]
     if stack.size == 0:
         vmax = 1.0
     else:
-        vmax = float(_np.nanpercentile(stack, sat_pct))
-        if not _np.isfinite(vmax) or vmax <= 0:
+        vmax = float(np.nanpercentile(stack, sat_pct))
+        if not np.isfinite(vmax) or vmax <= 0:
             vmax = 1.0
 
         if vmax_abs is not None:
@@ -262,17 +270,17 @@ def CSD_compare_side_by_side_ax(
 
     # --- 4) Zeitachse: centers & edges ---
     n_t = CSD_sp_plot.shape[1]
-    t_centers = _np.linspace(-float(align_pre), float(align_post), n_t)
+    t_centers = np.linspace(-float(align_pre), float(align_post), n_t)
 
     def _edges_from_centers(c):
-        c = _np.asarray(c, float)
+        c = np.asarray(c, float)
         if c.size == 1:
             d = 0.5
-            return _np.array([c[0]-d, c[0]+d], float)
+            return np.array([c[0]-d, c[0]+d], float)
         mid = 0.5 * (c[:-1] + c[1:])
         first = c[0] - (mid[0] - c[0])
         last  = c[-1] + (c[-1] - mid[-1])
-        return _np.concatenate([[first], mid, [last]])
+        return np.concatenate([[first], mid, [last]])
 
     t_edges = _edges_from_centers(t_centers)
 
@@ -323,7 +331,7 @@ def CSD_compare_side_by_side_ax(
 
     else:
         if z_plot is None:
-            z_plot = _np.arange(CSD_sp_plot.shape[0], dtype=float)
+            z_plot = np.arange(CSD_sp_plot.shape[0], dtype=float)
         z_edges = _edges_from_centers(z_plot)
 
         imL = ax_left.pcolormesh(

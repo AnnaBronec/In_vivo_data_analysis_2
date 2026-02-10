@@ -62,7 +62,7 @@ def main_safe(base_path: str, lfp_filename: str | None = None):
         }
 
         # Run your original analysis (produces all plots/CSVs/PDFs)
-        runpy.run_path(str(MAIN_FILE), init_globals=init_globals)
+        runpy.run_path(str(MAIN_FILE), init_globals=init_globals, run_name="__main__")
 
         return session_name, True, "OK (converted+analyzed)"
 

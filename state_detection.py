@@ -1,7 +1,14 @@
 import csv
+import os
 import numpy as np
 import matplotlib
-matplotlib.use("TkAgg")  # oder "Qt5Agg", wenn Tk nicht installiert ist
+try:
+    if os.environ.get("DISPLAY"):
+        matplotlib.use("TkAgg")
+    else:
+        matplotlib.use("Agg")
+except Exception:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from tempfile import TemporaryFile
@@ -13,7 +20,6 @@ from CSD import CSD_calc
 import seaborn as sns
 from scipy.signal import find_peaks
 import scipy.stats as stats
-import os
 import random
 from scipy.ndimage import gaussian_filter
 from scipy import signal
@@ -184,6 +190,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     t_feat = np.asarray(Spect_dat[1], float) 
 
     dt_feat = float(np.median(np.diff(t_feat))) if (t_feat.size >= 2 and np.all(np.isfinite(t_feat))) else float(dt)
+    t0_feat = float(t_feat[0]) if t_feat.size else 0.0
 
     #     # align_pre/align_post are in seconds in this pipeline -> convert to samples for indexing
     # align_pre_samp  = int(round(align_pre  / dt))
@@ -483,7 +490,6 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     # 8) Dauer/Stats
     if len(Spontaneous_UP) > 1 and len(Pulse_triggered_UP) > 1:
-        Duration_Pulse_Triggered = time_s[Pulse_triggered_DOWN] - time_s[Pulse_triggered_UP]
         # Duration_Spontaneous = time_s[Spontaneous_DOWN] - time_s[Spontaneous_UP]
         Duration_Spontaneous = t_feat[Spontaneous_DOWN] - t_feat[Spontaneous_UP]
         Duration_Pulse_Triggered = t_feat[Pulse_triggered_DOWN] - t_feat[Pulse_triggered_UP]
@@ -504,7 +510,9 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         Ctrl_UP = np.zeros(len(Pulse_triggered_UP), dtype=int)
         Ctrl_DOWN = np.zeros(len(Pulse_triggered_UP), dtype=int)
         for i in range(len(Ctrl_UP)):
-            Ctrl_UP[i] = random.randint(0, len(time_s) - int(4 / dt_feat))
+            max0 = len(t_feat) - int(4.0/dt_feat)
+            Ctrl_UP[i] = random.randint(0, max(0, max0))
+            #Ctrl_UP[i] = random.randint(0, len(t_feat) - int(4 / dt_feat))
             Ctrl_DOWN[i] = Ctrl_UP[i] + int(Pulse_triggered_DOWN[i] - Pulse_triggered_UP[i])
 
     #  9) Peaks / aligned arrays
@@ -602,17 +610,47 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     print("freqs min/max/df:", freqs.min(), freqs.max(), np.median(np.diff(freqs)))
     print("band bins:", band_mask.sum(), "f_lo/f_hi:", f_lo, f_hi)
     print("effective band:", freqs[band_mask].min(), freqs[band_mask].max())
-    # Feature -> Raw
-    UP_start_raw   = np.asarray(np.round(t_feat[UP_start_i]   / dt), int) if UP_start_i.size else np.array([], int)
-    DOWN_start_raw = np.asarray(np.round(t_feat[DOWN_start_i] / dt), int) if DOWN_start_i.size else np.array([], int)
 
-    # und ebenso für die Kategorien:
-    Spont_UP_raw = np.asarray(np.round(t_feat[Spontaneous_UP] / dt), int) if Spontaneous_UP.size else np.array([], int)
-    Spont_DN_raw = np.asarray(np.round(t_feat[Spontaneous_DOWN] / dt), int) if Spontaneous_DOWN.size else np.array([], int)
-    Trig_UP_raw  = np.asarray(np.round(t_feat[Pulse_triggered_UP] / dt), int) if Pulse_triggered_UP.size else np.array([], int)
-    Trig_DN_raw  = np.asarray(np.round(t_feat[Pulse_triggered_DOWN] / dt), int) if Pulse_triggered_DOWN.size else np.array([], int)
-    Assoc_UP_raw = np.asarray(np.round(t_feat[Pulse_associated_UP] / dt), int) if Pulse_associated_UP.size else np.array([], int)
-    Assoc_DN_raw = np.asarray(np.round(t_feat[Pulse_associated_DOWN] / dt), int) if Pulse_associated_DOWN.size else np.array([], int)
+
+    UP_start_raw   = (
+        np.asarray(np.round((t_feat[UP_start_i] - t0_feat) / dt), int)
+        if UP_start_i.size else np.array([], int)
+    )
+
+    DOWN_start_raw = (
+        np.asarray(np.round((t_feat[DOWN_start_i] - t0_feat) / dt), int)
+        if DOWN_start_i.size else np.array([], int)
+    )
+
+    Spont_UP_raw = (
+        np.asarray(np.round((t_feat[Spontaneous_UP] - t0_feat) / dt), int)
+        if Spontaneous_UP.size else np.array([], int)
+    )
+
+    Spont_DN_raw = (
+        np.asarray(np.round((t_feat[Spontaneous_DOWN] - t0_feat) / dt), int)
+        if Spontaneous_DOWN.size else np.array([], int)
+    )
+
+    Trig_UP_raw  = (
+        np.asarray(np.round((t_feat[Pulse_triggered_UP] - t0_feat) / dt), int)
+        if Pulse_triggered_UP.size else np.array([], int)
+    )
+
+    Trig_DN_raw  = (
+        np.asarray(np.round((t_feat[Pulse_triggered_DOWN] - t0_feat) / dt), int)
+        if Pulse_triggered_DOWN.size else np.array([], int)
+    )
+
+    Assoc_UP_raw = (
+        np.asarray(np.round((t_feat[Pulse_associated_UP] - t0_feat) / dt), int)
+        if Pulse_associated_UP.size else np.array([], int)
+    )
+
+    Assoc_DN_raw = (
+        np.asarray(np.round((t_feat[Pulse_associated_DOWN] - t0_feat) / dt), int)
+        if Pulse_associated_DOWN.size else np.array([], int)
+    )
 
   
     return {

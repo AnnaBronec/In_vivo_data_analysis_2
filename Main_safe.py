@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, math
+import os
 import numpy as np
 import numpy as _np 
 import re
@@ -10,19 +10,15 @@ import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
 from scipy import stats
-from matplotlib.colors import SymLogNorm, TwoSlopeNorm
 import gc
 from glob import glob
 from scipy.ndimage import gaussian_filter
 from sklearn.decomposition import PCA
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.colors import TwoSlopeNorm, SymLogNorm
-from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Patch
-from loader_old import load_LFP_new, _read_header, read_nev_timestamps_and_ttl, ttl_to_on_off
+from loader_old import load_LFP_new, read_nev_timestamps_and_ttl, ttl_to_on_off
 from matplotlib import gridspec
 from scipy.signal import welch
-from matplotlib.colors import SymLogNorm
 try:
     from preprocessing import downsampling_old as _ds_fun
 except ImportError:
@@ -43,10 +39,6 @@ from plotter import (
     _blank_ax,
     compute_refrac_from_spont_to_spon_and_trig,
 )
-
-import os
-import sys, os
-from datetime import datetime
 
 from Exports import (
     export_interactive_lfp_html, 
@@ -111,6 +103,14 @@ pulse_times_1_html     = np.array([], dtype=float)
 pulse_times_1_off_html = np.array([], dtype=float)
 pulse_times_2_html     = np.array([], dtype=float)
 pulse_times_2_off_html = np.array([], dtype=float)
+chan_cols_raw = []
+FLIP_DEPTH = False
+DEBUG_MAIN_SAFE = os.environ.get("DEBUG_MAIN_SAFE", "0") == "1"
+
+
+def debug_log(*args, **kwargs):
+    if DEBUG_MAIN_SAFE:
+        print(*args, **kwargs)
 
 
 def edges_from_parts_csv(parts_dir, col, time_col="time", thr=None):
@@ -200,9 +200,6 @@ def edges_from_parts_csv(parts_dir, col, time_col="time", thr=None):
         prev_b = int(b[-1]) if b.size else prev_b
 
     return np.asarray(t_on, float), np.asarray(t_off, float)
-
-from glob import glob
-from pathlib import Path
 
 def edges_stateful(t_vec, x_vec, thr, prev_b=None):
     """
@@ -648,9 +645,9 @@ else:
         print(f"[NEV] using NEV pulses: p1_on={len(pulse_times_1_full)} p1_off={len(pulse_times_1_off_full)}")
 
 
-print("[PULSE SOURCE CHECK] HAVE_NEV =", (pulse_times_1_full is not None and len(pulse_times_1_full) > 0),
-      "| p1_on =", 0 if pulse_times_1_full is None else len(pulse_times_1_full),
-      "| p1_off =", 0 if pulse_times_1_off_full is None else len(pulse_times_1_off_full))
+debug_log("[PULSE SOURCE CHECK] HAVE_NEV =", (pulse_times_1_full is not None and len(pulse_times_1_full) > 0),
+          "| p1_on =", 0 if pulse_times_1_full is None else len(pulse_times_1_full),
+          "| p1_off =", 0 if pulse_times_1_off_full is None else len(pulse_times_1_off_full))
 
 
 # --- HARD GUARANTEE: if we detected a stim column, compute OFF too ---
@@ -785,12 +782,12 @@ reasons = []                          # für Log-Ausgaben des Kanalfilters
 if dt and (dt > 0) and ((1.0/dt) > 1e4 or dt > 1.0):  # sehr grob: "klein" => Sekunden, "groß" => Samples
     dt = dt / DEFAULT_FS_XDAT  # dt war in Samples
 
-print("[CHECK] dt(s)=", dt, " median Δt from time_s=", float(np.median(np.diff(time_s))))
+debug_log("[CHECK] dt(s)=", dt, " median Δt from time_s=", float(np.median(np.diff(time_s))))
 if len(pulse_times_1_full) and len(pulse_times_1_off_full):
     widths = pulse_times_1_off_full[:min(len(pulse_times_1_full), len(pulse_times_1_off_full))] - \
              pulse_times_1_full[:min(len(pulse_times_1_full), len(pulse_times_1_off_full))]
-    print("[TTL][DBG] median width (s) =", float(np.median(widths[np.isfinite(widths)])))
-    print("[TTL][DBG] example widths (s) =", widths[:10])
+    debug_log("[TTL][DBG] median width (s) =", float(np.median(widths[np.isfinite(widths)])))
+    debug_log("[TTL][DBG] example widths (s) =", widths[:10])
 
 
 # ebenfalls auf Sekunden bringen:
@@ -921,7 +918,7 @@ else:
         f, Pxx = welch(np.nan_to_num(x, nan=0.0), fs=fs, nperseg=min(len(x), 4096))
         def bp(f1,f2):
             m = (f>=f1) & (f<=f2)
-            return float(np.trapz(Pxx[m], f[m])) if m.any() else 0.0
+            return float(np.trapezoid(Pxx[m], f[m])) if m.any() else 0.0
         total = bp(0.5, 120.0)
         line  = bp(49.0, 51.0)
         return line / (total + 1e-12)
@@ -995,26 +992,26 @@ if t_feat.size >= 2 and np.all(np.isfinite(t_feat)):
 else:
     dt_feat = float(dt)
 
-print("[CHECK] len(time_s) =", len(time_s))
-print("[CHECK] S.shape =", S.shape, "-> timebins =", S.shape[1])
-print("[CHECK] len(t_feat) =", len(t_feat))
+debug_log("[CHECK] len(time_s) =", len(time_s))
+debug_log("[CHECK] S.shape =", S.shape, "-> timebins =", S.shape[1])
+debug_log("[CHECK] len(t_feat) =", len(t_feat))
 
 
 t_feat = np.asarray(Spect_dat[1], float)
-print("[CHECK] len(t_feat) =", len(t_feat))
-print("[CHECK] time_s[0], time_s[-1] =", float(time_s[0]), float(time_s[-1]))
-print("[CHECK] t_feat[0], t_feat[-1] =", float(t_feat[0]), float(t_feat[-1]))
-print("[CHECK] median dt time_s =", float(np.median(np.diff(time_s))))
-print("[CHECK] median dt t_feat  =", float(np.median(np.diff(t_feat))))
+debug_log("[CHECK] len(t_feat) =", len(t_feat))
+debug_log("[CHECK] time_s[0], time_s[-1] =", float(time_s[0]), float(time_s[-1]))
+debug_log("[CHECK] t_feat[0], t_feat[-1] =", float(t_feat[0]), float(t_feat[-1]))
+debug_log("[CHECK] median dt time_s =", float(np.median(np.diff(time_s))))
+debug_log("[CHECK] median dt t_feat  =", float(np.median(np.diff(t_feat))))
 
 # Vergleich der ersten paar Werte
-print("[CHECK] first 5 time_s:", time_s[:5])
-print("[CHECK] first 5 t_feat :", t_feat[:5])
+debug_log("[CHECK] first 5 time_s:", time_s[:5])
+debug_log("[CHECK] first 5 t_feat :", t_feat[:5])
 
 # max absolute difference (wenn Längen kompatibel)
 m = min(len(time_s), len(t_feat))
-print("[CHECK] max|time_s - t_feat| over first m:",
-      float(np.nanmax(np.abs(time_s[:m] - t_feat[:m]))))
+debug_log("[CHECK] max|time_s - t_feat| over first m:",
+          float(np.nanmax(np.abs(time_s[:m] - t_feat[:m]))))
 
 
 
@@ -1081,17 +1078,17 @@ try:
 
 
 
-    print("[DEBUG] Up keys:", sorted(list(Up.keys()))[:50])
-    print("[DEBUG] aligned arrays:",
-        type(Up.get("Trig_UP_peak_aligned_array")),
-        getattr(Up.get("Trig_UP_peak_aligned_array"), "shape", None),
-        type(Up.get("Spon_UP_peak_aligned_array")),
-        getattr(Up.get("Spon_UP_peak_aligned_array"), "shape", None))
-    print("[DBG] peaks dtype:", Up["Spon_Peaks"].dtype, Up["Trig_Peaks"].dtype)
-    print("[DBG] peaks min/max:", 
-        (Up["Spon_Peaks"].min() if Up["Spon_Peaks"].size else None),
-        (Up["Spon_Peaks"].max() if Up["Spon_Peaks"].size else None))
-    print("[DBG] n_sig:", n_sig, "align_len:", align_len)
+    debug_log("[DEBUG] Up keys:", sorted(list(Up.keys()))[:50])
+    debug_log("[DEBUG] aligned arrays:",
+              type(Up.get("Trig_UP_peak_aligned_array")),
+              getattr(Up.get("Trig_UP_peak_aligned_array"), "shape", None),
+              type(Up.get("Spon_UP_peak_aligned_array")),
+              getattr(Up.get("Spon_UP_peak_aligned_array"), "shape", None))
+    debug_log("[DBG] peaks dtype:", Up["Spon_Peaks"].dtype, Up["Trig_Peaks"].dtype)
+    debug_log("[DBG] peaks min/max:",
+              (Up["Spon_Peaks"].min() if Up["Spon_Peaks"].size else None),
+              (Up["Spon_Peaks"].max() if Up["Spon_Peaks"].size else None))
+    debug_log("[DBG] n_sig:", n_sig, "align_len:", align_len)
 
 
 
@@ -1341,11 +1338,11 @@ plt.close(fig_amp)
 print("[SVG] amplitude compare:", amp_svg_path)
 del fig_amp
 
-print("[DBG before pair] p1_on/off:",
-      0 if pulse_times_1 is None else len(pulse_times_1),
-      0 if pulse_times_1_off is None else len(pulse_times_1_off))
-print("[DBG before pair] off head:",
-      None if pulse_times_1_off is None else pulse_times_1_off[:5])
+debug_log("[DBG before pair] p1_on/off:",
+          0 if pulse_times_1 is None else len(pulse_times_1),
+          0 if pulse_times_1_off is None else len(pulse_times_1_off))
+debug_log("[DBG before pair] off head:",
+          None if pulse_times_1_off is None else pulse_times_1_off[:5])
 
 
 # --- HTML pulses must be in SECONDS and within plotted time range ---
@@ -1388,48 +1385,48 @@ def _pair_on_off(t_on, t_off, max_width_s=10.0):
 ttl1_intervals = _pair_on_off(pulse_times_1_html, pulse_times_1_off_html, max_width_s=5.0)
 ttl2_intervals = _pair_on_off(pulse_times_2_html, pulse_times_2_off_html, max_width_s=5.0)
 
-print("[HTML DBG] time range:", float(time_s[0]), "->", float(time_s[-1]))
-print("[HTML DBG] p1_on/off:", len(pulse_times_1_html), len(pulse_times_1_off_html))
+debug_log("[HTML DBG] time range:", float(time_s[0]), "->", float(time_s[-1]))
+debug_log("[HTML DBG] p1_on/off:", len(pulse_times_1_html), len(pulse_times_1_off_html))
 if len(pulse_times_1_html) and len(pulse_times_1_off_html):
     m = min(len(pulse_times_1_html), len(pulse_times_1_off_html))
     w = pulse_times_1_off_html[:m] - pulse_times_1_html[:m]
-    print("[HTML DBG] width median (s):", float(np.nanmedian(w)))
-print("[HTML DBG] intervals:", len(ttl1_intervals))
+    debug_log("[HTML DBG] width median (s):", float(np.nanmedian(w)))
+debug_log("[HTML DBG] intervals:", len(ttl1_intervals))
 
 
 
 print("[TTL] intervals:", len(ttl1_intervals), len(ttl2_intervals))
-print("[DBG] on/off counts:",
-      "p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
-      "p1_off", 0 if pulse_times_1_off is None else len(pulse_times_1_off),
-      "| p2_on", 0 if pulse_times_2 is None else len(pulse_times_2),
-      "p2_off", 0 if pulse_times_2_off is None else len(pulse_times_2_off))
+debug_log("[DBG] on/off counts:",
+          "p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
+          "p1_off", 0 if pulse_times_1_off is None else len(pulse_times_1_off),
+          "| p2_on", 0 if pulse_times_2 is None else len(pulse_times_2),
+          "p2_off", 0 if pulse_times_2_off is None else len(pulse_times_2_off))
 
 if pulse_times_1 is not None and len(pulse_times_1):
-    print("[DBG] p1_on first/last:", float(pulse_times_1[0]), float(pulse_times_1[-1]))
+    debug_log("[DBG] p1_on first/last:", float(pulse_times_1[0]), float(pulse_times_1[-1]))
 if pulse_times_1_off is not None and len(pulse_times_1_off):
-    print("[DBG] p1_off first/last:", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
-print("[DBG] time_s range:", float(time_s[0]), "->", float(time_s[-1]))
+    debug_log("[DBG] p1_off first/last:", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
+debug_log("[DBG] time_s range:", float(time_s[0]), "->", float(time_s[-1]))
 
-print("[DBG] on/off counts:",
-      "p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
-      "p1_off", 0 if pulse_times_1_off is None else len(pulse_times_1_off),
-      "| p2_on", 0 if pulse_times_2 is None else len(pulse_times_2),
-      "p2_off", 0 if pulse_times_2_off is None else len(pulse_times_2_off))
+debug_log("[DBG] on/off counts:",
+          "p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
+          "p1_off", 0 if pulse_times_1_off is None else len(pulse_times_1_off),
+          "| p2_on", 0 if pulse_times_2 is None else len(pulse_times_2),
+          "p2_off", 0 if pulse_times_2_off is None else len(pulse_times_2_off))
 
 if pulse_times_1 is not None and len(pulse_times_1):
-    print("[DBG] p1_on first/last:", float(pulse_times_1[0]), float(pulse_times_1[-1]))
+    debug_log("[DBG] p1_on first/last:", float(pulse_times_1[0]), float(pulse_times_1[-1]))
 if pulse_times_1_off is not None and len(pulse_times_1_off):
-    print("[DBG] p1_off first/last:", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
-print("[DBG] time_s range:", float(time_s[0]), "->", float(time_s[-1]))
+    debug_log("[DBG] p1_off first/last:", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
+debug_log("[DBG] time_s range:", float(time_s[0]), "->", float(time_s[-1]))
 
-print("[HTML-DBG] pulse_times_1 on/off:",
-      0 if pulse_times_1 is None else len(pulse_times_1),
-      0 if pulse_times_1_off is None else len(pulse_times_1_off))
-print("[HTML-DBG] ttl1_intervals:", len(ttl1_intervals), "example:", ttl1_intervals[:3])
-print("[HTML-CHECK] time range:", float(time_s[0]), "->", float(time_s[-1]))
-print("[HTML-CHECK] p1_on first/last:", pulse_times_1[:1], pulse_times_1[-1:])
-print("[HTML-CHECK] p1_off first/last:", pulse_times_1_off[:1], pulse_times_1_off[-1:])
+debug_log("[HTML-DBG] pulse_times_1 on/off:",
+          0 if pulse_times_1 is None else len(pulse_times_1),
+          0 if pulse_times_1_off is None else len(pulse_times_1_off))
+debug_log("[HTML-DBG] ttl1_intervals:", len(ttl1_intervals), "example:", ttl1_intervals[:3])
+debug_log("[HTML-CHECK] time range:", float(time_s[0]), "->", float(time_s[-1]))
+debug_log("[HTML-CHECK] p1_on first/last:", pulse_times_1[:1], pulse_times_1[-1:])
+debug_log("[HTML-CHECK] p1_off first/last:", pulse_times_1_off[:1], pulse_times_1_off[-1:])
 
 # ---------- FINAL HTML PULSE CLIP (MUST MATCH time_s WINDOW) ----------
 tmin = float(time_s[0])
@@ -1553,15 +1550,15 @@ _check_peak_indices("Trig_Peaks", Trig_Peaks, LFP_array_good.shape[1])
 # 1) CSD-Grundstats
 _nan_stats("CSD_spont", CSD_spont)
 _nan_stats("CSD_trig",  CSD_trig)
-print(f"[DIAG] RMS CSD: spont={_rms(CSD_spont):.4g}, trig={_rms(CSD_trig):.4g}")
+debug_log(f"[DIAG] RMS CSD: spont={_rms(CSD_spont):.4g}, trig={_rms(CSD_trig):.4g}")
 
 
 # 3) Prüfen, ob Cropping Spontan-Events stark reduziert
-print(f"[DIAG] Cropped time_s: {time_s[0]:.3f}..{time_s[-1]:.3f} s, pulses p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
-print(f"[DIAG] Counts: sponUP={len(Spontaneous_UP)}, trigUP={len(Pulse_triggered_UP)}, assocUP={len(Pulse_associated_UP)}")
+debug_log(f"[DIAG] Cropped time_s: {time_s[0]:.3f}..{time_s[-1]:.3f} s, pulses p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
+debug_log(f"[DIAG] Counts: sponUP={len(Spontaneous_UP)}, trigUP={len(Pulse_triggered_UP)}, assocUP={len(Pulse_associated_UP)}")
 
 # 4) Gleiche Zeitfenster/Alignment sicher? (pre/post)
-print(f"[DIAG] align_pre={align_pre_s:.3f}s, align_post={align_post_s:.3f}s, dt={dt:.6f}s")
+debug_log(f"[DIAG] align_pre={align_pre_s:.3f}s, align_post={align_post_s:.3f}s, dt={dt:.6f}s")
 
 
 # nach compare_spectra
@@ -1576,22 +1573,22 @@ if freqs is not None and pulse_mean is not None:
 # 1) CSD-Grundstats
 _nan_stats("CSD_spont", CSD_spont)
 _nan_stats("CSD_trig",  CSD_trig)
-print(f"[DIAG] RMS CSD: spont={_rms(CSD_spont):.4g}, trig={_rms(CSD_trig):.4g}")
+debug_log(f"[DIAG] RMS CSD: spont={_rms(CSD_spont):.4g}, trig={_rms(CSD_trig):.4g}")
 
 
 
 # 3) Prüfen, ob Cropping Spontan-Events stark reduziert
-print(f"[DIAG] Cropped time_s: {time_s[0]:.3f}..{time_s[-1]:.3f} s, pulses p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
-print(f"[DIAG] Counts: sponUP={len(Spontaneous_UP)}, trigUP={len(Pulse_triggered_UP)}, assocUP={len(Pulse_associated_UP)}")
+debug_log(f"[DIAG] Cropped time_s: {time_s[0]:.3f}..{time_s[-1]:.3f} s, pulses p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
+debug_log(f"[DIAG] Counts: sponUP={len(Spontaneous_UP)}, trigUP={len(Pulse_triggered_UP)}, assocUP={len(Pulse_associated_UP)}")
 
-print(f"[DIAG] align_pre={align_pre_s:.3f}s, align_post={align_post_s:.3f}s, dt={dt:.6f}s")
+debug_log(f"[DIAG] align_pre={align_pre_s:.3f}s, align_post={align_post_s:.3f}s, dt={dt:.6f}s")
 
 
-print("[DEBUG] time range:", float(time_s[0]), "->", float(time_s[-1]))
+debug_log("[DEBUG] time range:", float(time_s[0]), "->", float(time_s[-1]))
 if len(pulse_times_1):
-    print("[DEBUG] p1 first/last:", float(pulse_times_1[0]), float(pulse_times_1[-1]), "count:", len(pulse_times_1))
+    debug_log("[DEBUG] p1 first/last:", float(pulse_times_1[0]), float(pulse_times_1[-1]), "count:", len(pulse_times_1))
 if len(pulse_times_2):
-    print("[DEBUG] p2 first/last:", float(pulse_times_2[0]), float(pulse_times_2[-1]), "count:", len(pulse_times_2))
+    debug_log("[DEBUG] p2 first/last:", float(pulse_times_2[0]), float(pulse_times_2[-1]), "count:", len(pulse_times_2))
 
 
 
@@ -2634,6 +2631,19 @@ pca_fit_sp = None
 if X_spont.shape[0] >= 3:
     pca_fit_sp = fit_pca_from_spont(X_spont, n_components=3)
 
+# Trigger-PCA separat (für Template/Overlay-Plots in layout_rows)
+pca_fit_tr = None
+if X_trig.shape[0] >= 3:
+    pca_fit_tr = fit_pca_from_spont(X_trig, n_components=3)
+
+# Falls pc1_ref oben noch nicht verfügbar war, jetzt aus spont-PCA ziehen.
+if pc1_ref is None and pca_fit_sp is not None:
+    comps_sp = np.asarray(pca_fit_sp.get("components", []), float)
+    if comps_sp.ndim >= 2 and comps_sp.shape[0] >= 1 and comps_sp.shape[1] > 0:
+        pc1_ref = comps_sp[0].copy()
+        if np.isfinite(pc1_ref).any() and np.nanmean(pc1_ref) < 0:
+            pc1_ref = -pc1_ref
+
 
 def corr_to_template(X, template):
     template = (template - template.mean()) / template.std()
@@ -3004,8 +3014,6 @@ def pca_pc1_overlay_corr_diff_ax(pca_fit_sp, pca_fit_tr, ax=None,
     ax.grid(alpha=0.12, linestyle=":")
     return fig
 
-from scipy.stats import mannwhitneyu
-
 # --- Robust guard: skip stats if correlations missing/empty ---
 corr_sp_arr = None if corr_sp is None else np.asarray(corr_sp, float)
 corr_tr_arr = None if corr_tr is None else np.asarray(corr_tr, float)
@@ -3016,11 +3024,9 @@ if (corr_sp_arr is None or corr_tr_arr is None or
     print("[PCA] Mann-Whitney skipped: corr_sp/corr_tr missing or too few valid samples")
     u, p = np.nan, np.nan
 else:
-    u, p = mannwhitneyu(corr_sp_arr, corr_tr_arr, alternative="two-sided")
+    u, p = stats.mannwhitneyu(corr_sp_arr, corr_tr_arr, alternative="two-sided")
 
 print(f"Mann–Whitney U: U={u:.1f}, p={p:.3e}")
-
-import numpy as np
 
 def cliffs_delta(a, b):
     a = np.asarray(a)
@@ -3130,29 +3136,50 @@ def compare_triggered_vs_spontaneous(
     def _empty_compare():
         return {
             "X": None, "Y": None,
+            "time": None,
+            "mean_trig": None,
+            "mean_spon": None,
+            "cohens_d": None,
             "t_obs": None,
             "p_pointwise": None,
+            "sliding_corr": None,
             "clusters": [],
             "n_trials": {"trig": 0, "spon": 0},
         }
 
-    def compare_triggered_vs_spontaneous(X, Y, *args, **kwargs):
-        if X is None or Y is None:
-            return _empty_compare()
-        X = np.asarray(X)
-        Y = np.asarray(Y)
-        if X.ndim != 2 or Y.ndim != 2:
-            return _empty_compare()
-        if X.shape[0] < 3 or Y.shape[0] < 3:
-            return _empty_compare()
-        # ... dann normal weiter ...
+    def _coerce_trials_2d(a):
+        if a is None:
+            return np.empty((0, 0), dtype=float)
+        arr = np.asarray(a, dtype=float)
+        if arr.ndim == 0:
+            return np.empty((0, 0), dtype=float)
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        elif arr.ndim > 2:
+            # Keep first axis as trials, flatten trailing dims into time.
+            arr = arr.reshape(arr.shape[0], -1)
+        if arr.size == 0:
+            return np.empty((0, 0), dtype=float)
+        return arr
 
-    X = np.asarray(trig_aligned, float)
-    Y = np.asarray(spon_aligned, float)
+    X = _coerce_trials_2d(trig_aligned)
+    Y = _coerce_trials_2d(spon_aligned)
 
     # safety: remove all-NaN trials
+    if X.ndim != 2 or Y.ndim != 2:
+        return _empty_compare()
+    if X.shape[1] == 0 or Y.shape[1] == 0:
+        return _empty_compare()
     X = X[~np.all(np.isnan(X), axis=1)]
     Y = Y[~np.all(np.isnan(Y), axis=1)]
+    if X.shape[0] < 3 or Y.shape[0] < 3:
+        return _empty_compare()
+    if X.shape[1] != Y.shape[1]:
+        n_min = min(X.shape[1], Y.shape[1])
+        if n_min <= 0:
+            return _empty_compare()
+        X = X[:, :n_min]
+        Y = Y[:, :n_min]
 
     n_time = X.shape[1]
     if up_time is None:
@@ -3180,15 +3207,19 @@ def compare_triggered_vs_spontaneous(
         "n_trials": {"trig": int(X.shape[0]), "spon": int(Y.shape[0])},
     }
 
-print("[DBG] Trig aligned:", None if Trig_UP_peak_aligned_array is None else Trig_UP_peak_aligned_array.shape,
-      "nan%=", np.isnan(Trig_UP_peak_aligned_array).mean() if Trig_UP_peak_aligned_array is not None else "na")
-print("[DBG] Spon aligned:", None if Spon_UP_peak_aligned_array is None else Spon_UP_peak_aligned_array.shape,
-      "nan%=", np.isnan(Spon_UP_peak_aligned_array).mean() if Spon_UP_peak_aligned_array is not None else "na")
+debug_log("[DBG] Trig aligned:", None if Trig_UP_peak_aligned_array is None else Trig_UP_peak_aligned_array.shape,
+          "nan%=", np.isnan(Trig_UP_peak_aligned_array).mean() if Trig_UP_peak_aligned_array is not None else "na")
+debug_log("[DBG] Spon aligned:", None if Spon_UP_peak_aligned_array is None else Spon_UP_peak_aligned_array.shape,
+          "nan%=", np.isnan(Spon_UP_peak_aligned_array).mean() if Spon_UP_peak_aligned_array is not None else "na")
 
 if Trig_UP_peak_aligned_array is not None:
-    print("[DBG] Trig all-NaN rows:", np.sum(np.all(np.isnan(Trig_UP_peak_aligned_array), axis=1)))
+    _tmp_tr = np.asarray(Trig_UP_peak_aligned_array, float)
+    if _tmp_tr.ndim == 2:
+        debug_log("[DBG] Trig all-NaN rows:", np.sum(np.all(np.isnan(_tmp_tr), axis=1)))
 if Spon_UP_peak_aligned_array is not None:
-    print("[DBG] Spon all-NaN rows:", np.sum(np.all(np.isnan(Spon_UP_peak_aligned_array), axis=1)))
+    _tmp_sp = np.asarray(Spon_UP_peak_aligned_array, float)
+    if _tmp_sp.ndim == 2:
+        debug_log("[DBG] Spon all-NaN rows:", np.sum(np.all(np.isnan(_tmp_sp), axis=1)))
 
 
 res = compare_triggered_vs_spontaneous(
@@ -3235,22 +3266,89 @@ def upstate_similarity_timecourse_ax(
     - Significant cluster bars (p < alpha)
     """
 
-    t = res["time"]
-    mean_trig = res["mean_trig"]
-    mean_spon = res["mean_spon"]
-    clusters = res["clusters"]
+    t = res.get("time") if isinstance(res, dict) else None
+    mean_trig = res.get("mean_trig") if isinstance(res, dict) else None
+    mean_spon = res.get("mean_spon") if isinstance(res, dict) else None
+    clusters = res.get("clusters", []) if isinstance(res, dict) else []
 
-    X = np.asarray(trig_aligned, float)
-    Y = np.asarray(spon_aligned, float)
-    X = X[~np.all(np.isnan(X), axis=1)]
-    Y = Y[~np.all(np.isnan(Y), axis=1)]
+    def _coerce_trials_2d(a):
+        if a is None:
+            return np.empty((0, 0), float)
+        arr = np.asarray(a, float)
+        if arr.ndim == 0:
+            return np.empty((0, 0), float)
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        elif arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+        return arr
+
+    X = _coerce_trials_2d(trig_aligned)
+    Y = _coerce_trials_2d(spon_aligned)
+    if X.size:
+        X = X[~np.all(np.isnan(X), axis=1)]
+    if Y.size:
+        Y = Y[~np.all(np.isnan(Y), axis=1)]
+
+    n = 0
+    if t is not None:
+        t = np.asarray(t, float).ravel()
+        n = max(n, t.size)
+    if mean_trig is not None:
+        mean_trig = np.asarray(mean_trig, float).ravel()
+        n = max(n, mean_trig.size)
+    if mean_spon is not None:
+        mean_spon = np.asarray(mean_spon, float).ravel()
+        n = max(n, mean_spon.size)
+    if X.ndim == 2 and X.shape[1] > 0:
+        n = max(n, X.shape[1])
+    if Y.ndim == 2 and Y.shape[1] > 0:
+        n = max(n, Y.shape[1])
+
+    if n == 0:
+        _blank_ax(ax, "no similarity timecourse")
+        return ax.figure
+
+    def _fit_len_1d(v):
+        if v is None:
+            return None
+        a = np.asarray(v, float).ravel()
+        if a.size == n:
+            return a
+        if a.size > n:
+            return a[:n]
+        return np.pad(a, (0, n - a.size), constant_values=np.nan)
+
+    def _fit_len_2d(a):
+        if a.size == 0:
+            return np.empty((0, n), float)
+        if a.shape[1] == n:
+            return a
+        if a.shape[1] > n:
+            return a[:, :n]
+        return np.pad(a, ((0, 0), (0, n - a.shape[1])), constant_values=np.nan)
+
+    X = _fit_len_2d(X)
+    Y = _fit_len_2d(Y)
+    t = _fit_len_1d(t)
+    mean_trig = _fit_len_1d(mean_trig)
+    mean_spon = _fit_len_1d(mean_spon)
+
+    if t is None:
+        dt_plot = float(globals().get("dt", 1.0))
+        t = (np.arange(n, dtype=float) - (n // 2)) * dt_plot
+
+    if mean_trig is None:
+        mean_trig = np.nanmean(X, axis=0) if X.size else np.full(n, np.nan)
+    if mean_spon is None:
+        mean_spon = np.nanmean(Y, axis=0) if Y.size else np.full(n, np.nan)
 
     def nansem(a, axis=0):
         n = np.sum(~np.isnan(a), axis=axis)
         return np.nanstd(a, axis=axis, ddof=1) / np.sqrt(np.maximum(n, 1))
 
-    sem_trig = nansem(X, axis=0)
-    sem_spon = nansem(Y, axis=0)
+    sem_trig = nansem(X, axis=0) if X.size else np.zeros_like(mean_trig)
+    sem_spon = nansem(Y, axis=0) if Y.size else np.zeros_like(mean_spon)
 
     # --- Mean ± SEM ---
     ax.plot(t, mean_trig, label=f"Triggered (n={X.shape[0]})")
@@ -3265,20 +3363,24 @@ def upstate_similarity_timecourse_ax(
     ax.legend(frameon=False)
 
     # --- Cluster significance bars ---
-    y_max = np.nanmax([
-        mean_trig + sem_trig,
-        mean_spon + sem_spon
-    ])
-    y_min = np.nanmin([
-        mean_trig - sem_trig,
-        mean_spon - sem_spon
-    ])
+    with np.errstate(invalid="ignore"):
+        y_max = np.nanmax([mean_trig + sem_trig, mean_spon + sem_spon])
+        y_min = np.nanmin([mean_trig - sem_trig, mean_spon - sem_spon])
+    if not np.isfinite(y_max) or not np.isfinite(y_min):
+        y_max, y_min = 1.0, -1.0
     y_bar = y_max + 0.08 * (y_max - y_min + 1e-12)
 
     for c in clusters:
-        if c["p_cluster"] < alpha:
-            s, e = c["start"], c["end"]
-            ax.plot([t[s], t[e]], [y_bar, y_bar], linewidth=4)
+        if not isinstance(c, dict):
+            continue
+        if c.get("p_cluster", 1.0) < alpha:
+            s, e = c.get("start"), c.get("end")
+            if s is None or e is None:
+                continue
+            s = int(max(0, min(n - 1, s)))
+            e = int(max(0, min(n - 1, e)))
+            if e >= s:
+                ax.plot([t[s], t[e]], [y_bar, y_bar], linewidth=4)
 
     ax.set_ylim(top=y_bar + 0.12 * (y_bar - y_min))
     ax.set_xlabel("Time (s)")
@@ -3347,17 +3449,17 @@ def upstate_rate_bar_ax(rates, ax=None, title="UP-state rate (total)"):
     return ax
 
 # Refraktärzeiten ab SPONT-UP-Off getrennt nach nächstem UP-Typ 
-print("[CHECK FINAL PULSES]",
-      "p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
-      "p1_off", 0 if pulse_times_1_off is None else len(pulse_times_1_off),
-      "| p2_on", 0 if pulse_times_2 is None else len(pulse_times_2),
-      "p2_off", 0 if pulse_times_2_off is None else len(pulse_times_2_off))
-print("[CHECK time range]", float(time_s[0]), "->", float(time_s[-1]))
+debug_log("[CHECK FINAL PULSES]",
+          "p1_on", 0 if pulse_times_1 is None else len(pulse_times_1),
+          "p1_off", 0 if pulse_times_1_off is None else len(pulse_times_1_off),
+          "| p2_on", 0 if pulse_times_2 is None else len(pulse_times_2),
+          "p2_off", 0 if pulse_times_2_off is None else len(pulse_times_2_off))
+debug_log("[CHECK time range]", float(time_s[0]), "->", float(time_s[-1]))
 if pulse_times_1 is not None and len(pulse_times_1):
-    print("[CHECK p1 first/last]", float(pulse_times_1[0]), float(pulse_times_1[-1]))
+    debug_log("[CHECK p1 first/last]", float(pulse_times_1[0]), float(pulse_times_1[-1]))
 if pulse_times_1_off is not None and len(pulse_times_1_off):
-    print("[CHECK p1_off first/last]", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
-print("[CHECK intervals] ttl1", len(ttl1_intervals), "ttl2", len(ttl2_intervals))
+    debug_log("[CHECK p1_off first/last]", float(pulse_times_1_off[0]), float(pulse_times_1_off[-1]))
+debug_log("[CHECK intervals] ttl1", len(ttl1_intervals), "ttl2", len(ttl2_intervals))
 
 
 
@@ -4096,40 +4198,38 @@ def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_sa
 
     print(f"[PDF] geschrieben: {out_pdf}")
 
+
+def main():
+    log("START")
+    log("Exporting layout PDF/SVG ...")
+
+    # Export aufrufen
+    export_with_layout(
+        BASE_TAG, SAVE_DIR, layout_rows,
+        rows_per_page=3,          # 3 Zeilen -> alles auf eine Seite
+        also_save_each_svg=True
+    )
+
+    log("Export finished")
+
+    if DEBUG_MAIN_SAFE:
+        print("[ORDER]", chan_cols)  # Originalnamen der LFP-Spalten
+        print("[GOOD_IDX]", good_idx)
+        print("[ORDER raw]", chan_cols_raw)
+        print("[ORDER sorted]", chan_cols)
+        print("[DEPTH flip?]", FLIP_DEPTH)
+        print("[CHAN-FILTER] kept:", good_idx)
+        print("[CHAN-FILTER] reasons:", reasons)
+
+    log("FERTIG ohne Fehler")
+
+
 if __name__ == "__main__":
     try:
-        log("START")
-        # ... dein Code ...
-        log("FERTIG ohne Fehler")
+        main()
     except Exception as e:
         import traceback
         err = traceback.format_exc()
         log(f"EXCEPTION: {e}")
-        with open(LOGFILE, "a", encoding="utf-8") as f:
-            f.write("\n[EXCEPTION]\n")
-            f.write(err)
+        log(err)
         raise
-
-
-
-log("Exporting layout PDF/SVG ...")
-
-# Export aufrufen 
-export_with_layout(
-    BASE_TAG, SAVE_DIR, layout_rows,
-    rows_per_page=3,          # 3 Zeilen -> alles auf eine Seite
-    also_save_each_svg=True
-)
-
-log("Export finished")
-
-print("[ORDER]", chan_cols)  # Originalnamen der LFP-Spalten
-print("[GOOD_IDX]", good_idx)
-
-print("[ORDER raw]", chan_cols_raw)
-print("[ORDER sorted]", chan_cols)
-print("[DEPTH flip?]", FLIP_DEPTH)
-
-print("[CHAN-FILTER] kept:", good_idx)
-print("[CHAN-FILTER] reasons:", reasons)
-
