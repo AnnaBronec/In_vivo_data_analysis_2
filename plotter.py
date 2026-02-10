@@ -204,6 +204,13 @@ def CSD_compare_side_by_side_ax(
     rasterize_csd=True,
     pcolor_shading="nearest",
     vmax_abs=None,
+    CSD_diff=None,
+    show_diff=False,
+    n_spont=None,
+    n_trig=None,
+    n_match=None,
+    sem_spont_med=None,
+    sem_trig_med=None,
     **_unused
 ):
     
@@ -231,11 +238,15 @@ def CSD_compare_side_by_side_ax(
     # sigma=(depth, time) – hier moderat, nicht zu stark
     CSD_sp_sm = gaussian_filter(CSD_sp, sigma=(2.0, 3.0))
     CSD_tr_sm = gaussian_filter(CSD_tr, sigma=(2.0, 3.0))
+    CSD_df_sm = None
+    if show_diff and ok(CSD_diff):
+        CSD_df_sm = gaussian_filter(np.asarray(CSD_diff, float), sigma=(2.0, 3.0))
 
     # --- 2) Optional: Tiefe invertieren (superficial oben) ---
     if flip_y:
         CSD_sp_plot = CSD_sp_sm[::-1, :]
         CSD_tr_plot = CSD_tr_sm[::-1, :]
+        CSD_df_plot = CSD_df_sm[::-1, :] if CSD_df_sm is not None else None
         if z_mm is not None:
             z_plot = np.asarray(z_mm)[::-1]
         else:
@@ -243,13 +254,17 @@ def CSD_compare_side_by_side_ax(
     else:
         CSD_sp_plot = CSD_sp_sm
         CSD_tr_plot = CSD_tr_sm
+        CSD_df_plot = CSD_df_sm
         z_plot = np.asarray(z_mm) if z_mm is not None else None
 
     # --- 3) Gemeinsame Skala (linear, zero-centered) ---
-    stack = np.concatenate([
+    stack_parts = [
         np.abs(CSD_sp_plot).ravel(),
         np.abs(CSD_tr_plot).ravel()
-    ])
+    ]
+    if CSD_df_plot is not None:
+        stack_parts.append(np.abs(CSD_df_plot).ravel())
+    stack = np.concatenate(stack_parts)
     stack = stack[np.isfinite(stack)]
     if stack.size == 0:
         vmax = 1.0
@@ -285,9 +300,17 @@ def CSD_compare_side_by_side_ax(
     t_edges = _edges_from_centers(t_centers)
 
     # --- 5) Subplots + Colorbar-Achse anlegen ---
-    ax_left  = ax.inset_axes([0.00, 0.0, 0.45, 1.0])
-    ax_right = ax.inset_axes([0.50, 0.0, 0.45, 1.0])
-    cax      = ax.inset_axes([0.955, 0.1, 0.02, 0.8])
+    use_diff_panel = CSD_df_plot is not None
+    if use_diff_panel:
+        ax_left  = ax.inset_axes([0.00, 0.0, 0.29, 1.0])
+        ax_right = ax.inset_axes([0.34, 0.0, 0.29, 1.0])
+        ax_diff  = ax.inset_axes([0.68, 0.0, 0.24, 1.0])
+        cax      = ax.inset_axes([0.94, 0.1, 0.02, 0.8])
+    else:
+        ax_left  = ax.inset_axes([0.00, 0.0, 0.45, 1.0])
+        ax_right = ax.inset_axes([0.50, 0.0, 0.45, 1.0])
+        ax_diff  = None
+        cax      = ax.inset_axes([0.955, 0.1, 0.02, 0.8])
     ax.set_axis_off()
 
     artists = []
@@ -322,12 +345,22 @@ def CSD_compare_side_by_side_ax(
             norm=norm,
             interpolation=interp,
         )
+        if use_diff_panel:
+            imD = ax_diff.imshow(
+                CSD_df_plot,
+                aspect="auto",
+                origin="upper",
+                extent=extent,
+                cmap=cmap,
+                norm=norm,
+                interpolation=interp,
+            )
 
-        for a in (ax_left, ax_right):
+        for a in (ax_left, ax_right) + ((ax_diff,) if use_diff_panel else ()):
             a.set_xlabel("Zeit (s)")
         ax_left.set_ylabel("Tiefe (mm)" if z_plot is not None else "Tiefe (arb.)")
 
-        artists.extend([imL, imR])
+        artists.extend([imL, imR] + ([imD] if use_diff_panel else []))
 
     else:
         if z_plot is None:
@@ -346,8 +379,15 @@ def CSD_compare_side_by_side_ax(
             cmap=cmap,
             norm=norm,
         )
+        if use_diff_panel:
+            imD = ax_diff.pcolormesh(
+                t_edges, z_edges, CSD_df_plot,
+                shading=pcolor_shading,
+                cmap=cmap,
+                norm=norm,
+            )
 
-        for im in (imL, imR):
+        for im in (imL, imR) + ((imD,) if use_diff_panel else ()):
             try:
                 im.set_antialiased(False)
                 im.set_edgecolor("face")
@@ -355,13 +395,13 @@ def CSD_compare_side_by_side_ax(
             except Exception:
                 pass
 
-        for a in (ax_left, ax_right):
+        for a in (ax_left, ax_right) + ((ax_diff,) if use_diff_panel else ()):
             a.set_xlim(t_edges[0], t_edges[-1])
             a.set_ylim(z_edges[0], z_edges[-1])
             a.set_xlabel("Zeit (s)")
         ax_left.set_ylabel("Tiefe (mm)")
 
-        artists.extend([imL, imR])
+        artists.extend([imL, imR] + ([imD] if use_diff_panel else []))
 
     # --- 7) Optional rasterisieren für hübsche PDFs ---
     if rasterize_csd:
@@ -374,10 +414,25 @@ def CSD_compare_side_by_side_ax(
     # --- 8) Titles & Colorbar ---
     ax_left.set_title("Spontaneous", fontsize=10)
     ax_right.set_title("Triggered", fontsize=10)
+    if use_diff_panel:
+        ax_diff.set_title("Diff (Trig-Spont)", fontsize=10)
     cb = fig.colorbar(artists[-1], cax=cax)
-    cb.set_label("CSD (a.u.)", rotation=90)
+    cb.set_label("CSD (a.u.)\nnegativ: sink | positiv: source", rotation=90)
 
     ax_left.set_title(title, fontsize=11, pad=22)
+    if n_spont is not None and n_trig is not None:
+        txt = f"n_sp={int(n_spont)}, n_tr={int(n_trig)}"
+        if n_match is not None:
+            txt += f", n_match={int(n_match)}"
+        if sem_spont_med is not None and np.isfinite(sem_spont_med):
+            txt += f"\nmed|SEM| sp={float(sem_spont_med):.2e}"
+        if sem_trig_med is not None and np.isfinite(sem_trig_med):
+            txt += f", tr={float(sem_trig_med):.2e}"
+        ax.text(
+            0.995, 0.995, txt, transform=ax.transAxes,
+            ha="right", va="top", fontsize=8,
+            bbox=dict(boxstyle="round", fc="white", alpha=0.7)
+        )
     return fig
 
 def _blank_ax(ax, msg=None):

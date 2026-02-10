@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
 from scipy import stats
+from matplotlib.colors import TwoSlopeNorm
 import gc
 from glob import glob
 from scipy.ndimage import gaussian_filter
@@ -79,6 +80,10 @@ LOW_CUTOFF  = 2
 ANALYSE_IN_AU = True
 HTML_IN_uV    = True
 DEFAULT_FS_XDAT = 32000.0   #ist das richtig?
+SPECTRA_BASELINE_MODE = None  # None | "pre_onset_db"
+SPECTRA_USE_FDR = False
+CSD_STYLE = "paper"  # "paper" | "diagnostic"
+CSD_PAPER_CMAP = "RdBu_r"
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
 
@@ -951,7 +956,7 @@ NUM_CHANNELS_GOOD = len(good_idx)
 # Tiefe aus den *behaltenen* Kanälen ableiten:
 DZ_UM = 100.0
 z_mm = (np.arange(NUM_CHANNELS_GOOD, dtype=float)) * (DZ_UM / 1000.0)
-z_mm_csd = z_mm[1:-1]
+z_mm_csd = z_mm.copy()
 
 if reasons:
     print("[CHAN-FILTER] excluded:", ", ".join([f"pri_{j}({r})" for j, r in reasons]))
@@ -1482,10 +1487,15 @@ export_interactive_lfp_html(
 # Extras für Plots
 pulse_windows = extract_upstate_windows(Pulse_triggered_UP, main_channel[None, :], dt, window_s=1.0)
 spont_windows = extract_upstate_windows(Spontaneous_UP, main_channel[None, :], dt, window_s=1.0)
-freqs = spont_mean = pulse_mean = p_vals = None
+freqs = spont_mean = pulse_mean = p_vals = p_vals_fdr = None
+spectra_meta = None
 try:
-    freqs, spont_mean, pulse_mean, p_vals = compare_spectra(
-        pulse_windows, spont_windows, dt, ignore_start_s=0.3
+    freqs, spont_mean, pulse_mean, p_vals, p_vals_fdr, spectra_meta = compare_spectra(
+        pulse_windows,
+        spont_windows,
+        dt,
+        ignore_start_s=0.3,
+        baseline_mode=SPECTRA_BASELINE_MODE,
     )
 except Exception as e:
     print("[WARN] spectra compare skipped:", e)
@@ -1503,31 +1513,144 @@ Spon_Onsets = Spon_Onsets[(Spon_Onsets >= 0) & (Spon_Onsets < LFP_array_good.sha
 Trig_Onsets = Trig_Onsets[(Trig_Onsets >= 0) & (Trig_Onsets < LFP_array_good.shape[1])]
 
 CSD_spont = CSD_trig = None
+CSD_DIFF = None
+CSD_SEM_SPONT = CSD_SEM_TRIG = None
+CSD_SEM_MED_SPONT = np.nan
+CSD_SEM_MED_TRIG = np.nan
+CSD_N_SPONT = CSD_N_TRIG = CSD_N_MATCH = 0
+CSD_spont_latcorr = CSD_trig_latcorr = None
+CSD_DIFF_LATCORR = None
+CSD_SEM_MED_SPONT_LATCORR = np.nan
+CSD_SEM_MED_TRIG_LATCORR = np.nan
+CSD_N_SPONT_LATCORR = CSD_N_TRIG_LATCORR = CSD_N_MATCH_LATCORR = 0
+CSD_TRIG_LAT_SHIFT_S = np.nan
 
 CSD_PRE_DESIRED  = 0.5   # 0.5 s vor Onset
 CSD_POST_DESIRED = 0.5   # 0.5 s nach Onset
+CSD_BASELINE_PRE_S = 0.2
+CSD_USE_CLIP_TO_DOWN = False
+CSD_MIN_KEEP_FRAC = 0.8
+ALIGN_TRIG_TO_PULSE_LATENCY = True
+LATENCY_ALIGN_MAX_WIN_S = 1.0
 
 if NUM_CHANNELS_GOOD >= 7 and (Spon_Onsets.size >= 3 or Trig_Onsets.size >= 3):
     try:
+        CSD_sp_stack = None
+        CSD_tr_stack = None
+        CSD_tr_stack_latcorr = None
+        Trig_Onsets_latcorr = None
+
+        if ALIGN_TRIG_TO_PULSE_LATENCY and Trig_Onsets.size:
+            lat_for_align = pulse_to_up_latencies(
+                pulse_times_1,
+                Pulse_triggered_UP,
+                time_s,
+                max_win_s=LATENCY_ALIGN_MAX_WIN_S,
+            )
+            lat_for_align = np.asarray(lat_for_align, float)
+            lat_for_align = lat_for_align[np.isfinite(lat_for_align)]
+            if lat_for_align.size:
+                CSD_TRIG_LAT_SHIFT_S = float(np.nanmedian(lat_for_align))
+                shift_n = int(round(CSD_TRIG_LAT_SHIFT_S / dt))
+                Trig_Onsets_latcorr = Trig_Onsets + shift_n
+                Trig_Onsets_latcorr = Trig_Onsets_latcorr[
+                    (Trig_Onsets_latcorr >= 0) & (Trig_Onsets_latcorr < LFP_array_good.shape[1])
+                ]
+                print(
+                    f"[CSD][LAT-ALIGN] shift={CSD_TRIG_LAT_SHIFT_S:.4f}s "
+                    f"({shift_n} samples), n={len(Trig_Onsets_latcorr)}"
+                )
+
         if Spon_Onsets.size >= 3:
-            CSD_spont = Generate_CSD_mean_from_onsets(
+            CSD_spont, CSD_sp_stack = Generate_CSD_mean_from_onsets(
                 Spon_Onsets,
                 LFP_array_good,
                 dt,
                 pre_s=CSD_PRE_DESIRED,
                 post_s=CSD_POST_DESIRED,
-                clip_to_down=Spontaneous_DOWN,   # optional
+                clip_to_down=(Spontaneous_DOWN if CSD_USE_CLIP_TO_DOWN else None),
+                baseline_pre_s=CSD_BASELINE_PRE_S,
+                min_keep_frac=CSD_MIN_KEEP_FRAC,
+                return_stack=True,
             )
 
         if Trig_Onsets.size >= 3:
-            CSD_trig = Generate_CSD_mean_from_onsets(
+            CSD_trig, CSD_tr_stack = Generate_CSD_mean_from_onsets(
                 Trig_Onsets,
                 LFP_array_good,
                 dt,
                 pre_s=CSD_PRE_DESIRED,
                 post_s=CSD_POST_DESIRED,
-                clip_to_down=Pulse_triggered_DOWN,
+                clip_to_down=(Pulse_triggered_DOWN if CSD_USE_CLIP_TO_DOWN else None),
+                baseline_pre_s=CSD_BASELINE_PRE_S,
+                min_keep_frac=CSD_MIN_KEEP_FRAC,
+                return_stack=True,
             )
+
+        if Trig_Onsets_latcorr is not None and Trig_Onsets_latcorr.size >= 3:
+            CSD_trig_latcorr, CSD_tr_stack_latcorr = Generate_CSD_mean_from_onsets(
+                Trig_Onsets_latcorr,
+                LFP_array_good,
+                dt,
+                pre_s=CSD_PRE_DESIRED,
+                post_s=CSD_POST_DESIRED,
+                clip_to_down=(Pulse_triggered_DOWN if CSD_USE_CLIP_TO_DOWN else None),
+                baseline_pre_s=CSD_BASELINE_PRE_S,
+                min_keep_frac=CSD_MIN_KEEP_FRAC,
+                return_stack=True,
+            )
+
+        # n-matched Vergleich (robuster bei ungleichen Trialzahlen)
+        def _csd_pair_summary(sp_stack, tr_stack):
+            n_sp = int(sp_stack.shape[0])
+            n_tr = int(tr_stack.shape[0])
+            n_match = int(min(n_sp, n_tr))
+            if n_match <= 0:
+                return None
+            tmin = int(min(sp_stack.shape[2], tr_stack.shape[2]))
+            sp_stack = sp_stack[:, :, :tmin]
+            tr_stack = tr_stack[:, :, :tmin]
+            rng = np.random.default_rng(0)
+            idx_sp = rng.choice(n_sp, size=n_match, replace=False)
+            idx_tr = rng.choice(n_tr, size=n_match, replace=False)
+            sp_m = sp_stack[idx_sp]
+            tr_m = tr_stack[idx_tr]
+            sem_sp = np.nanstd(sp_m, axis=0) / np.sqrt(max(1, n_match))
+            sem_tr = np.nanstd(tr_m, axis=0) / np.sqrt(max(1, n_match))
+            return {
+                "sp_mean": np.nanmean(sp_m, axis=0),
+                "tr_mean": np.nanmean(tr_m, axis=0),
+                "diff": np.nanmean(tr_m, axis=0) - np.nanmean(sp_m, axis=0),
+                "sem_sp_med": float(np.nanmedian(np.abs(sem_sp))),
+                "sem_tr_med": float(np.nanmedian(np.abs(sem_tr))),
+                "n_sp": n_sp,
+                "n_tr": n_tr,
+                "n_match": n_match,
+            }
+
+        if (CSD_sp_stack is not None) and (CSD_tr_stack is not None):
+            out_raw = _csd_pair_summary(CSD_sp_stack, CSD_tr_stack)
+            if out_raw is not None:
+                CSD_spont = out_raw["sp_mean"]
+                CSD_trig = out_raw["tr_mean"]
+                CSD_DIFF = out_raw["diff"]
+                CSD_SEM_MED_SPONT = out_raw["sem_sp_med"]
+                CSD_SEM_MED_TRIG = out_raw["sem_tr_med"]
+                CSD_N_SPONT = out_raw["n_sp"]
+                CSD_N_TRIG = out_raw["n_tr"]
+                CSD_N_MATCH = out_raw["n_match"]
+
+        if (CSD_sp_stack is not None) and (CSD_tr_stack_latcorr is not None):
+            out_corr = _csd_pair_summary(CSD_sp_stack, CSD_tr_stack_latcorr)
+            if out_corr is not None:
+                CSD_spont_latcorr = out_corr["sp_mean"]
+                CSD_trig_latcorr = out_corr["tr_mean"]
+                CSD_DIFF_LATCORR = out_corr["diff"]
+                CSD_SEM_MED_SPONT_LATCORR = out_corr["sem_sp_med"]
+                CSD_SEM_MED_TRIG_LATCORR = out_corr["sem_tr_med"]
+                CSD_N_SPONT_LATCORR = out_corr["n_sp"]
+                CSD_N_TRIG_LATCORR = out_corr["n_tr"]
+                CSD_N_MATCH_LATCORR = out_corr["n_match"]
 
         align_pre_s  = CSD_PRE_DESIRED
         align_post_s = CSD_POST_DESIRED
@@ -1535,6 +1658,9 @@ if NUM_CHANNELS_GOOD >= 7 and (Spon_Onsets.size >= 3 or Trig_Onsets.size >= 3):
     except Exception as e:
         print("[WARN] CSD generation failed:", e)
         CSD_spont = CSD_trig = None
+        CSD_DIFF = None
+        CSD_spont_latcorr = CSD_trig_latcorr = None
+        CSD_DIFF_LATCORR = None
         align_pre_s  = CSD_PRE_DESIRED
         align_post_s = CSD_POST_DESIRED
 else:
@@ -1696,6 +1822,61 @@ def plot_up_classification_ax(
     return fig
 
 
+def csd_delta_raw_vs_latcorr_ax(
+    csd_diff_raw,
+    csd_diff_latcorr,
+    dt,
+    *,
+    z_mm=None,
+    align_pre=0.5,
+    align_post=0.5,
+    ax=None,
+    title="ΔCSD (raw vs latency-corrected)",
+):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 3.4))
+    else:
+        fig = ax.figure
+
+    A = None if csd_diff_raw is None else np.asarray(csd_diff_raw, float)
+    B = None if csd_diff_latcorr is None else np.asarray(csd_diff_latcorr, float)
+    if A is None or B is None or A.ndim != 2 or B.ndim != 2 or A.size == 0 or B.size == 0:
+        _blank_ax(ax, "no raw-vs-corrected CSD delta")
+        return fig
+
+    tmin = int(min(A.shape[1], B.shape[1]))
+    cmin = int(min(A.shape[0], B.shape[0]))
+    A = A[:cmin, :tmin]
+    B = B[:cmin, :tmin]
+    D = B - A
+
+    vmax = float(np.nanpercentile(np.abs(D[np.isfinite(D)]), 95)) if np.isfinite(D).any() else 1.0
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+
+    t = np.linspace(-float(align_pre), float(align_post), tmin)
+    if z_mm is not None:
+        z = np.asarray(z_mm, float)[:cmin]
+        extent = [float(t[0]), float(t[-1]), float(z[0]), float(z[-1])]
+        ylab = "Tiefe (mm)"
+    else:
+        extent = [float(t[0]), float(t[-1]), 0.0, float(cmin - 1)]
+        ylab = "Tiefe (arb.)"
+
+    im = ax.imshow(
+        D, aspect="auto", origin="upper",
+        extent=extent, cmap="Spectral_r", norm=norm, interpolation="bilinear"
+    )
+    cb = fig.colorbar(im, ax=ax, shrink=0.9)
+    cb.set_label("ΔCSD corrected-raw (a.u.)")
+    ax.set_xlabel("Zeit (s)")
+    ax.set_ylabel(ylab)
+    ax.set_title(title)
+    ax.axvline(0.0, color="k", lw=0.8, alpha=0.4, ls="--")
+    return fig
+
+
 # def _blank_ax(ax, msg=None):
 #     ax.axis("off")
 #     if msg:
@@ -1704,7 +1885,7 @@ def plot_up_classification_ax(
 
 
 
-def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=0.05, ax=None):
+def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, p_vals_fdr=None, meta=None, alpha=0.05, ax=None):
     if ax is None:
         fig, ax = plt.subplots(figsize=(8,3))
     else:
@@ -1712,21 +1893,96 @@ def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, alpha=
     if freqs is None or spont_mean is None or pulse_mean is None or len(freqs)==0:
         ax.text(0.5,0.5,"no spectra", ha="center", va="center", transform=ax.transAxes)
         return fig
-    ax.plot(freqs, spont_mean, label="Spontan", lw=2)
-    ax.plot(freqs, pulse_mean, label="Getriggert", lw=2)
-    if p_vals is not None and np.size(p_vals)==np.size(freqs):
-        sig = (p_vals < alpha)
+    f = np.asarray(freqs, float).ravel()
+    y_sp = np.asarray(spont_mean, float).ravel()
+    y_tr = np.asarray(pulse_mean, float).ravel()
+    m = min(f.size, y_sp.size, y_tr.size)
+    if m == 0:
+        ax.text(0.5, 0.5, "no spectra", ha="center", va="center", transform=ax.transAxes)
+        return fig
+    f = f[:m]
+    y_sp = y_sp[:m]
+    y_tr = y_tr[:m]
+
+    # Optisch bis 150 Hz verlängern (falls Spektrum vorher endet).
+    if np.isfinite(f[-1]) and f[-1] < 150:
+        f_plot = np.append(f, 150.0)
+        y_sp_plot = np.append(y_sp, y_sp[-1])
+        y_tr_plot = np.append(y_tr, y_tr[-1])
+    else:
+        f_plot, y_sp_plot, y_tr_plot = f, y_sp, y_tr
+
+    ax.plot(f_plot, y_sp_plot, label="Spontan (mean)", lw=2)
+    ax.plot(f_plot, y_tr_plot, label="Getriggert (mean)", lw=2)
+
+    # Sanity: Median-Kurven
+    if isinstance(meta, dict):
+        sp_med = np.asarray(meta.get("spont_median", []), float).ravel()
+        tr_med = np.asarray(meta.get("trig_median", []), float).ravel()
+        if sp_med.size and tr_med.size:
+            m2 = min(m, sp_med.size, tr_med.size)
+            f2 = f[:m2]
+            spm = sp_med[:m2]
+            trm = tr_med[:m2]
+            if np.isfinite(f2[-1]) and f2[-1] < 150:
+                f2p = np.append(f2, 150.0)
+                spm = np.append(spm, spm[-1])
+                trm = np.append(trm, trm[-1])
+            else:
+                f2p = f2
+            ax.plot(f2p, spm, lw=1.2, ls="--", alpha=0.9, label="Spontan (median)")
+            ax.plot(f2p, trm, lw=1.2, ls="--", alpha=0.9, label="Getriggert (median)")
+
+        # Sanity: n-gematchte Mittelwerte
+        sp_mm = np.asarray(meta.get("spont_mean_matched", []), float).ravel()
+        tr_mm = np.asarray(meta.get("trig_mean_matched", []), float).ravel()
+        if sp_mm.size and tr_mm.size:
+            m3 = min(m, sp_mm.size, tr_mm.size)
+            f3 = f[:m3]
+            sp3 = sp_mm[:m3]
+            tr3 = tr_mm[:m3]
+            if np.isfinite(f3[-1]) and f3[-1] < 150:
+                f3p = np.append(f3, 150.0)
+                sp3 = np.append(sp3, sp3[-1])
+                tr3 = np.append(tr3, tr3[-1])
+            else:
+                f3p = f3
+            ax.plot(f3p, sp3, lw=1.0, ls=":", alpha=0.9, label="Spontan (matched mean)")
+            ax.plot(f3p, tr3, lw=1.0, ls=":", alpha=0.9, label="Getriggert (matched mean)")
+    if SPECTRA_USE_FDR and (p_vals_fdr is not None and np.size(p_vals_fdr) == np.size(freqs)):
+        p_sig = p_vals_fdr
+    else:
+        p_sig = p_vals
+    if p_sig is not None and np.size(p_sig) == np.size(f):
+        sig = (p_sig < alpha)
         if np.any(sig):
             idx = np.where(sig)[0]
             # zusammenhängende Bereiche füllen
             start = idx[0]
             for i in range(1,len(idx)+1):
                 if i==len(idx) or idx[i] != idx[i-1]+1:
-                    ax.axvspan(freqs[start], freqs[idx[i-1]], alpha=0.12)
+                    ax.axvspan(f[start], f[idx[i-1]], alpha=0.12)
                     if i < len(idx): start = idx[i]
-    plt.xlim(0,150)
-    ax.set_xlabel("Hz"); ax.set_ylabel(PSD_UNIT_LABEL) 
-    ax.set_title("Power (Spontan vs. Getriggert)"); ax.legend()
+    ax.set_xlim(0, 150)
+    ax.set_xlabel("Hz")
+    if SPECTRA_BASELINE_MODE == "pre_onset_db":
+        ax.set_ylabel("ΔPower vs. pre-onset (dB)")
+        ax.set_title("Power (Spontan vs. Getriggert, pre-onset normalized)")
+    else:
+        ax.set_ylabel(PSD_UNIT_LABEL)
+        ax.set_title("Power (Spontan vs. Getriggert)")
+
+    if isinstance(meta, dict):
+        n_sp = int(meta.get("n_spont", 0))
+        n_tr = int(meta.get("n_trig", 0))
+        n_m = int(meta.get("n_match", 0))
+        ax.text(
+            0.98, 0.95,
+            f"n_sp={n_sp}, n_tr={n_tr}\nmatched n={n_m}",
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
+        )
+    ax.legend()
     return fig
 
 
@@ -3767,7 +4023,7 @@ layout_rows = [
         Spontaneous_UP, Spontaneous_DOWN, dt, ax=ax
     ),
      lambda ax: Power_spectrum_compare_ax(
-        freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax
+        freqs, spont_mean, pulse_mean, p_vals=p_vals, p_vals_fdr=p_vals_fdr, meta=spectra_meta, ax=ax
     )],
 
     # ========================================================
@@ -3784,14 +4040,72 @@ layout_rows = [
     # ========================================================
     [lambda ax: CSD_compare_side_by_side_ax(
         CSD_spont, CSD_trig, dt,
-        z_mm=z_mm,
+        z_mm=z_mm_csd,
         align_pre=align_pre_s, align_post=align_post_s,
-        cmap="Spectral_r",
-        sat_pct=95,
+        cmap=(CSD_PAPER_CMAP if CSD_STYLE == "paper" else "Spectral_r"),
+        sat_pct=(98 if CSD_STYLE == "paper" else 95),
         norm_mode="linear",
         linthresh_frac=0.03,
+        CSD_diff=CSD_DIFF,
+        show_diff=(CSD_STYLE == "diagnostic"),
+        interp=("bicubic" if CSD_STYLE == "paper" else "bilinear"),
+        prefer_imshow=True,
+        n_spont=(None if CSD_STYLE == "paper" else CSD_N_SPONT),
+        n_trig=(None if CSD_STYLE == "paper" else CSD_N_TRIG),
+        n_match=(None if CSD_STYLE == "paper" else CSD_N_MATCH),
+        sem_spont_med=(None if CSD_STYLE == "paper" else CSD_SEM_MED_SPONT),
+        sem_trig_med=(None if CSD_STYLE == "paper" else CSD_SEM_MED_TRIG),
         ax=ax,
         title="CSD (Spont vs. Trig; UP-Onset = 0 s)"
+    )],
+
+    # ========================================================
+    # REIHE 4b: CSD Vergleich (latency-corrected Trig) – (volle Breite)
+    # ========================================================
+    [lambda ax: (
+        _blank_ax(ax, "no latency-corrected CSD")
+        if (CSD_spont_latcorr is None or CSD_trig_latcorr is None)
+        else CSD_compare_side_by_side_ax(
+            CSD_spont_latcorr, CSD_trig_latcorr, dt,
+            z_mm=z_mm_csd,
+            align_pre=align_pre_s, align_post=align_post_s,
+            cmap=(CSD_PAPER_CMAP if CSD_STYLE == "paper" else "Spectral_r"),
+            sat_pct=(98 if CSD_STYLE == "paper" else 95),
+            norm_mode="linear",
+            linthresh_frac=0.03,
+            CSD_diff=CSD_DIFF_LATCORR,
+            show_diff=(CSD_STYLE == "diagnostic"),
+            interp=("bicubic" if CSD_STYLE == "paper" else "bilinear"),
+            prefer_imshow=True,
+            n_spont=(None if CSD_STYLE == "paper" else CSD_N_SPONT_LATCORR),
+            n_trig=(None if CSD_STYLE == "paper" else CSD_N_TRIG_LATCORR),
+            n_match=(None if CSD_STYLE == "paper" else CSD_N_MATCH_LATCORR),
+            sem_spont_med=(None if CSD_STYLE == "paper" else CSD_SEM_MED_SPONT_LATCORR),
+            sem_trig_med=(None if CSD_STYLE == "paper" else CSD_SEM_MED_TRIG_LATCORR),
+            ax=ax,
+            title=(
+                "CSD (Trig latency-corrected; "
+                f"shift={0.0 if not np.isfinite(CSD_TRIG_LAT_SHIFT_S) else CSD_TRIG_LAT_SHIFT_S:.3f}s)"
+            )
+        )
+    )],
+
+    # ========================================================
+    # REIHE 4c: ΔCSD (raw vs latency-corrected) – (volle Breite)
+    # ========================================================
+    [lambda ax: (
+        _blank_ax(ax, "delta panel hidden in paper mode")
+        if CSD_STYLE == "paper"
+        else csd_delta_raw_vs_latcorr_ax(
+            CSD_DIFF,
+            CSD_DIFF_LATCORR,
+            dt,
+            z_mm=z_mm_csd,
+            align_pre=align_pre_s,
+            align_post=align_post_s,
+            ax=ax,
+            title="ΔCSD (Trig-Spont): corrected minus raw"
+        )
     )],
 
     # ========================================================

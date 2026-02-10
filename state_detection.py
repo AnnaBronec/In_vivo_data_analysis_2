@@ -699,6 +699,9 @@ def Generate_CSD_mean_from_onsets(
     pre_s=0.3,
     post_s=0.3,
     clip_to_down=None,   # optional: DOWN-Indices, um das Fenster innerhalb des UP zu halten
+    baseline_pre_s=0.2,  # baseline vor Onset (Sekunden), pro Event/Kanal abziehen
+    min_keep_frac=0.8,   # verwerfe stark verkuerzte Events (z.B. durch clip_to_down)
+    return_stack=False,
 ):
     """
     Erzeugt ein mittleres CSD rund um UP-Onsets.
@@ -722,6 +725,8 @@ def Generate_CSD_mean_from_onsets(
     post = int(round(post_s / dt))
 
     csd_segments = []   # hier sammeln wir CSDs aller Events
+    target_T = int(pre + post)
+    min_keep_T = int(max(1, round(float(min_keep_frac) * target_T)))
 
     for i, o in enumerate(onsets):
         if np.isnan(o):
@@ -749,28 +754,36 @@ def Generate_CSD_mean_from_onsets(
             print(f"[CSD] CSD_calc Fehler bei Onset {o}: {e}")
             continue
 
-        if csd is not None and np.isfinite(csd).any():
-            csd_segments.append(csd)
+        if csd is None or getattr(csd, "ndim", 0) != 2 or (not np.isfinite(csd).any()):
+            continue
+
+        tlen = int(csd.shape[1])
+        if tlen < min_keep_T:
+            continue
+
+        # Baseline-Korrektur (pro Kanal): Mittel aus Pre-Onset-Teil abziehen.
+        if baseline_pre_s is not None and baseline_pre_s > 0 and tlen > 0:
+            n_pre = int(round(float(baseline_pre_s) / float(dt)))
+            n_pre = max(1, min(n_pre, tlen))
+            base = np.nanmean(csd[:, :n_pre], axis=1, keepdims=True)
+            csd = csd - base
+
+        # Auf Ziellaenge bringen: vorne ist stets korrekt ausgerichtet, tail ggf. NaN.
+        csd_pad = np.full((csd.shape[0], target_T), np.nan, dtype=float)
+        copy_T = min(target_T, tlen)
+        csd_pad[:, :copy_T] = csd[:, :copy_T]
+        csd_segments.append(csd_pad)
 
     if not csd_segments:
         print("[CSD] kein gültiges Event -> gebe None zurück")
         return None
 
-    # alle CSDs auf gleiche Zeitlänge bringen ---
-    try:
-        min_T = min(c.shape[1] for c in csd_segments)
-    except Exception:
-        print("[CSD] ungültige CSD-Segmente -> None")
-        return None
-
-    if min_T <= 0:
-        print("[CSD] min_T <= 0 -> None")
-        return None
-
-    csd_stack = np.stack([c[:, :min_T] for c in csd_segments], axis=0)  # (n_events, n_ch_csd, min_T)
+    csd_stack = np.stack(csd_segments, axis=0)  # (n_events, n_ch_csd, target_T)
     csd_mean = np.nanmean(csd_stack, axis=0)                            # (n_ch_csd, min_T)
 
     print(f"[CSD] {len(csd_segments)} Events, mean CSD shape={csd_mean.shape}")
+    if return_stack:
+        return csd_mean, csd_stack
     return csd_mean
 
 
@@ -838,15 +851,117 @@ def compute_spectra(windows, dt, ignore_start_s=0.0):
 
 
 
+def _fdr_bh(p_vals):
+    """Benjamini-Hochberg FDR-Korrektur (returns q-values)."""
+    p = np.asarray(p_vals, float).ravel()
+    q = np.full_like(p, np.nan, dtype=float)
+    m = p.size
+    if m == 0:
+        return q
+    finite = np.isfinite(p)
+    if not np.any(finite):
+        return q
+    pv = p[finite]
+    n = pv.size
+    order = np.argsort(pv)
+    p_sorted = pv[order]
+    ranks = np.arange(1, n + 1, dtype=float)
+    q_sorted = p_sorted * n / ranks
+    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
+    q_sorted = np.clip(q_sorted, 0.0, 1.0)
+    qv = np.empty_like(pv)
+    qv[order] = q_sorted
+    q[finite] = qv
+    return q.reshape(np.asarray(p_vals).shape)
 
-def compare_spectra(pulse_windows, spont_windows, dt, ignore_start_s=0.0):
-    pulse_spec, freqs = compute_spectra(pulse_windows, dt, ignore_start_s)
-    spont_spec, _     = compute_spectra(spont_windows, dt, ignore_start_s)
+
+def compare_spectra(
+    pulse_windows,
+    spont_windows,
+    dt,
+    ignore_start_s=0.0,
+    baseline_mode=None,  # None | "pre_onset_db"
+):
+    def _spectra_from_windows(windows):
+        specs = []
+        freqs_ref = None
+        for trial in windows:
+            x = np.asarray(trial, float)
+            if x.size < 8 or not np.isfinite(x).any():
+                continue
+
+            if baseline_mode == "pre_onset_db":
+                mid = int(x.size // 2)
+                pre = x[:mid]
+                post = x[mid:]
+                if ignore_start_s > 0:
+                    post = post[int(ignore_start_s / dt):]
+                if pre.size < 8 or post.size < 8:
+                    continue
+                nps = int(min(256, pre.size, post.size))
+                f, p_post = welch(post, fs=1 / dt, nperseg=nps)
+                _, p_pre = welch(pre, fs=1 / dt, nperseg=nps)
+                spec = 10.0 * np.log10((p_post + 1e-20) / (p_pre + 1e-20))
+            else:
+                if ignore_start_s > 0:
+                    x = x[int(ignore_start_s / dt):]
+                if x.size < 8:
+                    continue
+                nps = int(min(256, x.size))
+                f, spec = welch(x, fs=1 / dt, nperseg=nps)
+
+            if freqs_ref is None:
+                freqs_ref = f
+            else:
+                m = min(freqs_ref.size, f.size, spec.size)
+                freqs_ref = freqs_ref[:m]
+                spec = spec[:m]
+                specs = [s[:m] for s in specs]
+            specs.append(spec)
+
+        if freqs_ref is None or len(specs) == 0:
+            raise ValueError("no valid spectra windows")
+        return np.asarray(specs, float), freqs_ref
+
+    pulse_spec, freqs = _spectra_from_windows(pulse_windows)
+    spont_spec, _ = _spectra_from_windows(spont_windows)
+
+    m = min(pulse_spec.shape[1], spont_spec.shape[1], freqs.size)
+    pulse_spec = pulse_spec[:, :m]
+    spont_spec = spont_spec[:, :m]
+    freqs = freqs[:m]
 
     pulse_mean = np.mean(pulse_spec, axis=0)
     spont_mean = np.mean(spont_spec, axis=0)
-    t_vals, p_vals = ttest_ind(spont_spec, pulse_spec, axis=0, equal_var=False, nan_policy='omit')
-    return freqs, spont_mean, pulse_mean, p_vals
+    pulse_median = np.median(pulse_spec, axis=0)
+    spont_median = np.median(spont_spec, axis=0)
+
+    # n-gematchte Mittelwerte (Subsampling aus der größeren Gruppe)
+    n_tr = pulse_spec.shape[0]
+    n_sp = spont_spec.shape[0]
+    n_match = int(min(n_tr, n_sp))
+    rng = np.random.default_rng(0)
+    if n_match >= 1:
+        idx_tr = rng.choice(n_tr, size=n_match, replace=False)
+        idx_sp = rng.choice(n_sp, size=n_match, replace=False)
+        pulse_mean_matched = np.mean(pulse_spec[idx_tr, :], axis=0)
+        spont_mean_matched = np.mean(spont_spec[idx_sp, :], axis=0)
+    else:
+        pulse_mean_matched = np.full(m, np.nan, float)
+        spont_mean_matched = np.full(m, np.nan, float)
+
+    _, p_vals = ttest_ind(spont_spec, pulse_spec, axis=0, equal_var=False, nan_policy='omit')
+    p_vals_fdr = _fdr_bh(p_vals)
+    meta = {
+        "n_spont": int(n_sp),
+        "n_trig": int(n_tr),
+        "n_match": int(n_match),
+        "spont_median": spont_median,
+        "trig_median": pulse_median,
+        "spont_mean_matched": spont_mean_matched,
+        "trig_mean_matched": pulse_mean_matched,
+    }
+    return freqs, spont_mean, pulse_mean, p_vals, p_vals_fdr, meta
 
 def plot_contrast_heatmap(pulse_windows, spont_windows, dt):
     pulse_spec, freqs = compute_spectra(pulse_windows, dt)
