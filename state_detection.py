@@ -438,55 +438,59 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         print("[STATES] no reliable UP states -> return empty dict")
         return _empty_states(Total_power, time_s, dt, align_pre, align_len)
 
-    # 7) Puls-Logik 
-    Pulse_times_array = np.sort(np.concatenate([pulse_times_1, pulse_times_2])) if (len(pulse_times_1) or len(pulse_times_2)) else np.array([])
+    # 7) Puls-Logik (paarbasiert, pro UP genau ein Label)
+    # Gewuenschte Prioritaet:
+    #   triggered  : Pulse nahe UP-Onset (±trig_win_s), auch wenn sie frueh im UP liegen
+    #   associated : nur "spaete" Pulse im UP (ab t_up + assoc_min_delay_s)
+    #   spontaneous: keine Pulse in den obigen Fenstern
+    p1 = np.asarray(pulse_times_1 if pulse_times_1 is not None else [], float)
+    p2 = np.asarray(pulse_times_2 if pulse_times_2 is not None else [], float)
+    Pulse_times_array = np.sort(np.concatenate([p1, p2])) if (p1.size or p2.size) else np.array([], float)
+    Pulse_times_array = Pulse_times_array[np.isfinite(Pulse_times_array)]
 
-    Pulse_triggered_array = [[1, 0]]
-    for i in range(len(UP_start_i) - 1):
-        t_up = t_feat[UP_start_i[i]]
-        if Pulse_times_array.size == 0:
-            continue
-        triggered = np.where((Pulse_times_array >= t_up - 0.35) & (Pulse_times_array <= t_up + 0.35))[0]
-        if len(triggered) > 0:
-            Pulse_triggered_array = np.concatenate((Pulse_triggered_array, [[UP_start_i[i], DOWN_start_i[i]]]), axis=0)
+    trig_win_s = 0.35
+    assoc_min_delay_s = 0.20
+    n_up = int(min(len(UP_start_i), len(DOWN_start_i)))
+    mask_assoc = np.zeros(n_up, dtype=bool)
+    mask_trig = np.zeros(n_up, dtype=bool)
 
-    Pulse_associated_array = [[1, 0]]
-    for j in range(len(UP_start_i) - 1):
-        t_up, t_down = t_feat[UP_start_i[j]], t_feat[DOWN_start_i[j]]
-        if Pulse_times_array.size == 0:
-            continue
-        associated = np.where((Pulse_times_array >= t_up) & (Pulse_times_array <= t_down))[0]
-        if len(associated) > 0:
-            Pulse_associated_array = np.concatenate((Pulse_associated_array, [[UP_start_i[j], DOWN_start_i[j]]]), axis=0)
+    if Pulse_times_array.size and n_up:
+        for i in range(n_up):
+            u = int(UP_start_i[i])
+            d = int(DOWN_start_i[i])
+            t_up = float(t_feat[u])
+            t_dn = float(t_feat[d])
 
-    Pulse_triggered_array = np.array(Pulse_triggered_array)
-    Pulse_associated_array = np.array(Pulse_associated_array)
+            has_near = np.any(
+                (Pulse_times_array >= (t_up - trig_win_s)) &
+                (Pulse_times_array <= (t_up + trig_win_s))
+            )
+            has_assoc_late = np.any(
+                (Pulse_times_array >= (t_up + assoc_min_delay_s)) &
+                (Pulse_times_array <= t_dn)
+            )
 
-    Pulse_triggered_UP = Pulse_triggered_array[1:, 0] if Pulse_triggered_array.shape[0] > 1 else np.array([], dtype=int)
-    Pulse_triggered_DOWN = Pulse_triggered_array[1:, 1] if Pulse_triggered_array.shape[0] > 1 else np.array([], dtype=int)
+            if has_near:
+                mask_trig[i] = True
+            elif has_assoc_late:
+                mask_assoc[i] = True
 
-    Pulse_associated_up = Pulse_associated_array[1:, 0] if Pulse_associated_array.shape[0] > 1 else np.array([], dtype=int)
-    Pulse_associated_down = Pulse_associated_array[1:, 1] if Pulse_associated_array.shape[0] > 1 else np.array([], dtype=int)
+    # paar-konsistente Klassen
+    Pulse_associated_UP = UP_start_i[:n_up][mask_assoc]
+    Pulse_associated_DOWN = DOWN_start_i[:n_up][mask_assoc]
 
-    # Overlaps entfernen
-    Pulse_associated_UP_idx = [k for k, x in enumerate(~np.isin(Pulse_associated_up, Pulse_triggered_UP)) if x]
-    Pulse_associated_DOWN_idx = [l for l, x in enumerate(~np.isin(Pulse_associated_down, Pulse_triggered_DOWN)) if x]
+    Pulse_triggered_UP = UP_start_i[:n_up][mask_trig]
+    Pulse_triggered_DOWN = DOWN_start_i[:n_up][mask_trig]
 
-    Pulse_associated_UP = Pulse_associated_up[Pulse_associated_UP_idx] if len(Pulse_associated_UP_idx) else np.array([], dtype=int)
-    Pulse_associated_DOWN = Pulse_associated_down[Pulse_associated_DOWN_idx] if len(Pulse_associated_DOWN_idx) else np.array([], dtype=int)
+    mask_sp = ~(mask_assoc | mask_trig)
+    Spontaneous_UP = UP_start_i[:n_up][mask_sp]
+    Spontaneous_DOWN = DOWN_start_i[:n_up][mask_sp]
 
-    Pulse_coincident_UP = np.append(Pulse_triggered_UP, Pulse_associated_UP)
-    Pulse_coincident_DOWN = np.append(Pulse_triggered_DOWN, Pulse_associated_DOWN)
-
-    # Priorität umkehren
-    Pulse_triggered_UP = np.setdiff1d(Pulse_triggered_UP, Pulse_associated_UP)
-
-    # Spontan
-    Spontaneous_UP = UP_start_i[~np.isin(UP_start_i, Pulse_coincident_UP)]
-    Spontaneous_DOWN = DOWN_start_i[~np.isin(DOWN_start_i, Pulse_coincident_DOWN)]
-    if Spontaneous_UP.size:
-        Spontaneous_UP = Spontaneous_UP[:-1]
-        Spontaneous_DOWN = Spontaneous_DOWN[:len(Spontaneous_UP)]
+    print(
+        f"[CLASSIFY] total={n_up} spont={len(Spontaneous_UP)} "
+        f"trig={len(Pulse_triggered_UP)} assoc={len(Pulse_associated_UP)} "
+        f"(trig_win={trig_win_s:.2f}s, assoc_delay={assoc_min_delay_s:.2f}s)"
+    )
 
     # 8) Dauer/Stats
     if len(Spontaneous_UP) > 1 and len(Pulse_triggered_UP) > 1:

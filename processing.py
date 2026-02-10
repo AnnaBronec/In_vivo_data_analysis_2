@@ -529,8 +529,8 @@ def pulse_to_up_latency_hist_ax(latencies, ax=None, bins=30):
 
 
 def upstate_duration_compare_ax(
-    Trig_UP_crop, Trig_DOWN_crop,
-    Spon_UP_crop, Spon_DOWN_crop,
+    Trig_UP, Trig_DOWN,
+    Spon_UP, Spon_DOWN,
     dt, ax=None
 ):
 
@@ -540,10 +540,10 @@ def upstate_duration_compare_ax(
     else:
         fig = ax.figure
 
-    Trig_UP   = np.asarray(Trig_UP_crop,   int)
-    Trig_DOWN = np.asarray(Trig_DOWN_crop, int)
-    Spon_UP   = np.asarray(Spon_UP_crop,   int)
-    Spon_DOWN = np.asarray(Spon_DOWN_crop, int)
+    Trig_UP   = np.asarray(Trig_UP,   int)
+    Trig_DOWN = np.asarray(Trig_DOWN, int)
+    Spon_UP   = np.asarray(Spon_UP,   int)
+    Spon_DOWN = np.asarray(Spon_DOWN, int)
 
     m_trig = min(len(Trig_UP), len(Trig_DOWN))
     m_spon = min(len(Spon_UP), len(Spon_DOWN))
@@ -564,8 +564,41 @@ def upstate_duration_compare_ax(
 
     ax.boxplot(data, labels=labels, whis=[5, 95], showfliers=False)
     ax.set_ylabel("Dauer (s)")
-    ax.set_title("UP-Dauern (cropped 0.3–1.0 s)")
+    ax.set_title("UP-Dauern (Onset→Offset, uncropped)")
     ax.grid(alpha=0.15, linestyle=":")
+
+    # Statistik (robust, non-parametrisch) + Effektgröße
+    spon_valid = spon_dur[np.isfinite(spon_dur)]
+    trig_valid = trig_dur[np.isfinite(trig_dur)]
+    p_val = np.nan
+    delta = np.nan
+    if spon_valid.size >= 2 and trig_valid.size >= 2:
+        try:
+            from scipy.stats import mannwhitneyu
+            _, p_val = mannwhitneyu(spon_valid, trig_valid, alternative="two-sided")
+        except Exception:
+            p_val = np.nan
+
+        # Cliff's delta: >0 => spontan tendenziell länger, <0 => trig länger
+        try:
+            gt = np.sum(spon_valid[:, None] > trig_valid[None, :])
+            lt = np.sum(spon_valid[:, None] < trig_valid[None, :])
+            delta = (gt - lt) / float(spon_valid.size * trig_valid.size)
+        except Exception:
+            delta = np.nan
+
+    txt = (
+        f"n_sp={spon_valid.size}, n_tr={trig_valid.size}\n"
+        f"MWU p={p_val:.2e}" if np.isfinite(p_val) else
+        f"n_sp={spon_valid.size}, n_tr={trig_valid.size}\nMWU p=na"
+    )
+    if np.isfinite(delta):
+        txt += f"\nCliff's d={delta:.2f}"
+    ax.text(
+        0.98, 0.95, txt,
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
+    )
     return fig
 
 def refractory_compare_ax(refrac_spont, refrac_trig, ax=None, title="Refraktärzeit bis zum nächsten UP"):
@@ -786,4 +819,3 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         print(f"[SUMMARY][ROLLUP For David] {out_fd}  (Quellen: {len(files_all)})")
     else:
         print("[SUMMARY][ROLLUP For David] keine Quellen gefunden")
-

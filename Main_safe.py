@@ -3763,8 +3763,8 @@ layout_rows = [
     # REIHE 2: UP-Dauern (links) + Power Spectrum (rechts)
     # ========================================================
     [lambda ax: upstate_duration_compare_ax(
-        Trig_UP_crop, Trig_DOWN_crop,
-        Spon_UP_crop, Spon_DOWN_crop, dt, ax=ax
+        Pulse_triggered_UP, Pulse_triggered_DOWN,
+        Spontaneous_UP, Spontaneous_DOWN, dt, ax=ax
     ),
      lambda ax: Power_spectrum_compare_ax(
         freqs, spont_mean, pulse_mean, p_vals=p_vals, ax=ax
