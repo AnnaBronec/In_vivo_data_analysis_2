@@ -25,6 +25,7 @@ def export_interactive_lfp_html(
     up_spont=None,       # Tuple (UP_idx, DOWN_idx) in SAMPLE-INDIZES
     up_trig=None,        # Tuple (UP_idx, DOWN_idx)
     up_assoc=None,       # Tuple (UP_idx, DOWN_idx)
+    spindle_intervals=None,  # list[(t0, t1)] in Sekunden
     max_points=300_000,
     title="LFP (interaktiv)",
     limit_to_last_pulse=False,
@@ -101,6 +102,21 @@ def export_interactive_lfp_html(
                 xref="x", yref="paper",
                 line=dict(width=0),
                 fillcolor=fill
+            ))
+    if spindle_intervals:
+        for (t0, t1) in spindle_intervals:
+            t0 = float(t0); t1 = float(t1)
+            if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+                continue
+            if len(t) and (t1 < t[0] or t0 > t[-1]):
+                continue
+            shapes.append(dict(
+                type="rect",
+                x0=t0, x1=t1,
+                y0=0, y1=1,
+                xref="x", yref="paper",
+                line=dict(width=0),
+                fillcolor="rgba(138, 43, 226, 0.30)"
             ))
         # --- Pulse-Intervalle (Onset->Offset) als rote Fläche, bewusst NACH den UP-Flächen
     def _add_pulse_intervals(intervals, fill):
@@ -209,6 +225,14 @@ def export_interactive_lfp_html(
                 name=label,
                 showlegend=True
             ))
+    if spindle_intervals:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="lines",
+            line=dict(width=12, color="rgba(138, 43, 226, 0.30)"),
+            name="Spindles 10-15 Hz",
+            showlegend=True
+        ))
     # if pulse_times_1 is not None and len(pulse_times_1):
     #     fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
     #                              line=dict(width=1, dash="dot", color="red"),

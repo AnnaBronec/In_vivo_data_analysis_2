@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
 from scipy import stats
+from scipy import signal
 from matplotlib.colors import TwoSlopeNorm
 import gc
 from glob import glob
@@ -1452,6 +1453,102 @@ plt.close(fig_amp)
 print("[SVG] amplitude compare:", amp_svg_path)
 del fig_amp
 
+
+def _pair_up_down_indices(up_idx, down_idx, n_time):
+    up = np.asarray(up_idx, dtype=int)
+    dn = np.asarray(down_idx, dtype=int)
+    m = min(len(up), len(dn))
+    if m == 0:
+        return []
+    up = up[:m]
+    dn = dn[:m]
+    out = []
+    for u, d in zip(up, dn):
+        if 0 <= u < n_time and 0 < d <= n_time and d > u:
+            out.append((int(u), int(d)))
+    return out
+
+
+def detect_spindle_intervals_in_upstates(
+    signal_1d,
+    time_s,
+    dt,
+    up_pairs,
+    *,
+    f_lo=10.0,
+    f_hi=15.0,
+    thr_k=2.5,
+    min_dur_s=0.08,
+    max_dur_s=1.0,
+    max_gap_s=0.05,
+):
+    x = np.asarray(signal_1d, float).reshape(-1)
+    t = np.asarray(time_s, float).reshape(-1)
+    if x.size < 10 or t.size != x.size or dt <= 0:
+        return []
+
+    fs = 1.0 / dt
+    nyq = 0.5 * fs
+    lo = max(0.5, float(f_lo))
+    hi = min(float(f_hi), 0.95 * nyq)
+    if lo >= hi:
+        return []
+
+    x0 = np.nan_to_num(x, nan=float(np.nanmedian(x)))
+    try:
+        b, a = signal.butter(3, [lo / nyq, hi / nyq], btype="bandpass")
+        xb = signal.filtfilt(b, a, x0)
+        env = np.abs(signal.hilbert(xb))
+    except Exception:
+        return []
+
+    up_mask = np.zeros_like(x, dtype=bool)
+    for u, d in up_pairs:
+        up_mask[u:d] = True
+    if not np.any(up_mask):
+        return []
+
+    e_up = env[up_mask]
+    med = float(np.nanmedian(e_up))
+    mad = float(np.nanmedian(np.abs(e_up - med)))
+    robust_sigma = 1.4826 * mad
+    thr = med + float(thr_k) * max(robust_sigma, 1e-12)
+
+    det = (env >= thr) & up_mask
+    if not np.any(det):
+        return []
+
+    max_gap = max(0, int(round(max_gap_s / dt)))
+    if max_gap > 0:
+        idx = np.flatnonzero(det)
+        if idx.size > 1:
+            for a_i, b_i in zip(idx[:-1], idx[1:]):
+                if 1 < (b_i - a_i) <= (max_gap + 1):
+                    det[a_i:b_i + 1] = True
+
+    min_len = max(1, int(round(min_dur_s / dt)))
+    max_len = max(min_len, int(round(max_dur_s / dt)))
+    starts = np.flatnonzero(det & ~np.r_[False, det[:-1]])
+    ends = np.flatnonzero(det & ~np.r_[det[1:], False]) + 1
+
+    out = []
+    for s, e in zip(starts, ends):
+        L = e - s
+        if L < min_len or L > max_len:
+            continue
+        out.append((float(t[s]), float(t[e - 1])))
+    return out
+
+
+all_up_pairs = []
+all_up_pairs += _pair_up_down_indices(Spontaneous_UP, Spontaneous_DOWN, len(time_s))
+all_up_pairs += _pair_up_down_indices(Pulse_triggered_UP, Pulse_triggered_DOWN, len(time_s))
+all_up_pairs += _pair_up_down_indices(Pulse_associated_UP, Pulse_associated_DOWN, len(time_s))
+spindle_intervals_s = detect_spindle_intervals_in_upstates(
+    main_channel, time_s, dt, all_up_pairs
+)
+print(f"[SPINDLE] 10-15 Hz intervals in UPs: n={len(spindle_intervals_s)}")
+
 debug_log("[DBG before pair] p1_on/off:",
           0 if pulse_times_1 is None else len(pulse_times_1),
           0 if pulse_times_1_off is None else len(pulse_times_1_off))
@@ -1587,6 +1684,7 @@ export_interactive_lfp_html(
     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
+    spindle_intervals=spindle_intervals_s,
     limit_to_last_pulse=False,
     title=f"{BASE_TAG} — Main LFP (interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})")
@@ -1834,6 +1932,7 @@ def plot_up_classification_ax(
     Pulse_associated_UP, Pulse_associated_DOWN,
     *,  # ab hier nur noch keyword-args
     pulse_times_1=None, pulse_times_2=None,
+    spindle_intervals=None,
     Spon_Peaks=None, Trig_Peaks=None,
     ax=None, title="Main channel with UP classification"
 ):
@@ -1879,6 +1978,14 @@ def plot_up_classification_ax(
     _shade(Spontaneous_UP,      Spontaneous_DOWN,      "green",  "UP spontaneous")
     _shade(Pulse_triggered_UP,  Pulse_triggered_DOWN,  "blue",   "UP triggered")
     _shade(Pulse_associated_UP, Pulse_associated_DOWN, "orange", "UP associated")
+    if spindle_intervals:
+        first = True
+        for t0, t1 in spindle_intervals:
+            if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+                continue
+                ax.axvspan(float(t0), float(t1), color="#8a2be2", alpha=0.30, lw=0,
+                       label=("Spindles 10-15 Hz" if first else None))
+            first = False
 
     # 4) y-Limits nach Schattierung holen
     y0, y1 = ax.get_ylim()
@@ -4136,6 +4243,7 @@ layout_rows = [
         Pulse_associated_UP, Pulse_associated_DOWN,
         pulse_times_1=pulse_times_1,
         pulse_times_2=pulse_times_2,
+        spindle_intervals=spindle_intervals_s,
         ax=ax
     )],
 
