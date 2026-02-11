@@ -43,7 +43,7 @@ def _save_svg(fig, hint, out_dir=None, dpi=200):
 
 
 def compute_peak_aligned_segments(
-    up_indices, time_s, LFP_array, dt,
+    up_indices, time_s, signal_data, dt,
     b_lp, a_lp, b_hp, a_hp,
     align_pre, align_post, align_len,
     *,
@@ -56,6 +56,12 @@ def compute_peak_aligned_segments(
     # minimaler Peak-Abstand in Sekunden 
     min_peak_spacing_s=0.15
 ):
+    signal_data = np.asarray(signal_data, dtype=float)
+    if signal_data.ndim == 2:
+        signal_1d = signal_data[0]
+    else:
+        signal_1d = signal_data
+
     peak_segments = np.full((len(up_indices), align_len), np.nan)
     peak_indices = []
 
@@ -67,10 +73,10 @@ def compute_peak_aligned_segments(
         start_idx = int((t_up + offset_start) / dt)
         end_idx   = int((t_up + offset_end) / dt)
 
-        if start_idx < 0 or end_idx <= start_idx or end_idx > LFP_array.shape[1]:
+        if start_idx < 0 or end_idx <= start_idx or end_idx > signal_1d.shape[0]:
             continue
 
-        current_data = np.asarray(LFP_array[0, start_idx:end_idx], dtype=float)
+        current_data = np.asarray(signal_1d[start_idx:end_idx], dtype=float)
 
         # Filtern (LP dann HP)
         try:
@@ -110,6 +116,10 @@ def compute_peak_aligned_segments(
 def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                     LFP_array, b_lp, a_lp, b_hp, a_hp,
                     align_pre, align_post, align_len):
+    main_trace = np.asarray(V1_1, dtype=float).reshape(-1)
+    if main_trace.size < 2:
+        main_trace = np.asarray(LFP_array[0], dtype=float)
+    n_main = int(main_trace.size)
 
 
     # helpers 
@@ -548,11 +558,11 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         start_idx = int(start_idx)
         end_idx = int(end_idx)
 
-        if start_idx < 0 or end_idx > LFP_array.shape[1] or end_idx <= start_idx:
+        if start_idx < 0 or end_idx > n_main or end_idx <= start_idx:
             Spon_Peaks.append(np.nan)
             continue
 
-        current_data = LFP_array[0, start_idx:end_idx]
+        current_data = main_trace[start_idx:end_idx]
 
         try:
             V_filt = signal.filtfilt(b_lp, a_lp, current_data)
@@ -582,8 +592,8 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                     "start_idx", int(start_idx),
                     "peak_rel", int(peaks[0]),
                     "peak_global", int(peak_global),
-                    "n_time", int(LFP_array.shape[1]),
-                    "in_bounds", 0 <= peak_global < LFP_array.shape[1])
+                    "n_time", int(n_main),
+                    "in_bounds", 0 <= peak_global < n_main)
 
             Spon_Peaks.append(float(peak_global))
 
@@ -604,7 +614,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     # Trigger peaks via helper
     Trig_Peaks, Trig_UP_peak_aligned_array = compute_peak_aligned_segments(
-        Pulse_triggered_UP, time_s, LFP_array, dt,
+        Pulse_triggered_UP, time_s, main_trace, dt,
         b_lp, a_lp, b_hp, a_hp,
         align_pre_samp, align_post_samp, align_len,
         offset_start=0.2, offset_end=2.0,

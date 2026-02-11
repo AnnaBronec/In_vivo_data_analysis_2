@@ -84,6 +84,9 @@ SPECTRA_BASELINE_MODE = None  # None | "pre_onset_db"
 SPECTRA_USE_FDR = False
 CSD_STYLE = "paper"  # "paper" | "diagnostic"
 CSD_PAPER_CMAP = "RdBu_r"
+CHANNEL_FILTER_MODE = "strict"  # "balanced" | "strict"
+CLUSTER_N_PERM = int(os.environ.get("CLUSTER_N_PERM", "800"))
+CLUSTER_ENABLE = os.environ.get("CLUSTER_ENABLE", "0") == "1"
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
 
@@ -851,26 +854,6 @@ pulse_times_2_off = _clip_events_to_bounds(pulse_times_2_off, time_s, 0.0, 0.0)
 
 log(f"Crop done: time={time_s[0]:.3f}->{time_s[-1]:.3f}, shape={LFP_array.shape}, p1={len(pulse_times_1) if pulse_times_1 is not None else 0}, p2={len(pulse_times_2) if pulse_times_2 is not None else 0}")
 
-# main_channel robust auswählen 
-main_channel, ch_idx_used = _ensure_main_channel(LFP_array, preferred_idx=9)
-
-# --- Für HTML: Main-Channel in µV 
-main_channel_uV = None
-if HTML_IN_uV:
-    # welches Gain für diesen physikalischen Kanal?
-    orig_name = chan_cols[ch_idx_used] if (0 <= ch_idx_used < len(chan_cols)) else None
-    gain_used = PER_CH_GAIN.get(orig_name, PREAMP_GAIN)
-
-    if CALIB_MODE == "counts":
-        main_channel_uV = _counts_to_uV(main_channel, ADC_BITS, ADC_VPP, gain_used)
-    elif CALIB_MODE == "volts":
-        main_channel_uV = _volts_to_uV(main_channel)
-    elif CALIB_MODE == "uV":
-        main_channel_uV = main_channel.copy()
-    else:
-        # Fallback: zeige eben a.u., falls unbekannter Modus
-        main_channel_uV = main_channel.copy()
-
 
 # XDAT-Erkennung (heuristisch) 
 def _is_xdat_format():
@@ -901,53 +884,154 @@ def _is_xdat_format():
     return (len(cols) >= 8 and hits / max(1, len(cols)) >= 0.6)
 
 
-# Feste Kanalwahl für .xdat
-if _is_xdat_format():
-    fixed_idx = [i for i in range(1, 15) if i < LFP_array.shape[0]]  # pri_1..
-    good_idx = fixed_idx[:]  # überschreibe Fallback
-    print(f"[XDAT] GOOD_IDX override -> {good_idx} (n={len(good_idx)})")
-else:
-    # ===== Kanalqualitäts-Filter =====
-    bad_idx, reasons = set(), []
-    fs = 1.0 / dt
+# ===== Kanalqualitäts-Filter =====
+reasons = []
+bad_idx = set()
+fs = 1.0 / dt
 
-    def _is_quasi_binary_trace(x):
-        x = np.asarray(x, float); x = x[np.isfinite(x)]
-        if x.size < 10: return False
-        vals = np.unique(np.round(x, 3))
-        if len(vals) <= 4: return True
-        p01 = (np.isclose(x,0).sum() + np.isclose(x,1).sum()) / x.size
-        return p01 >= 0.95
+# Kein positionsbasierter Zuschnitt: alle Kanäle in den Qualitätsfilter.
+candidate_idx = list(range(NUM_CHANNELS))
 
-    def _line_noise_ratio(x, fs):
-        f, Pxx = welch(np.nan_to_num(x, nan=0.0), fs=fs, nperseg=min(len(x), 4096))
-        def bp(f1,f2):
-            m = (f>=f1) & (f<=f2)
-            return float(np.trapezoid(Pxx[m], f[m])) if m.any() else 0.0
-        total = bp(0.5, 120.0)
-        line  = bp(49.0, 51.0)
-        return line / (total + 1e-12)
+mode = str(CHANNEL_FILTER_MODE).strip().lower()
+if mode not in {"balanced", "strict"}:
+    print(f"[CHAN-FILTER][WARN] unbekannter CHANNEL_FILTER_MODE='{CHANNEL_FILTER_MODE}' -> nutze 'balanced'")
+    mode = "balanced"
 
-    for i in range(NUM_CHANNELS):
-        x = LFP_array[i]
-        finite = np.isfinite(x)
-        if finite.mean() < 0.95:
-            bad_idx.add(i); reasons.append((i, "zu viele NaNs")); continue
-        std = np.nanstd(x)
-        if not np.isfinite(std) or std == 0:
-            bad_idx.add(i); reasons.append((i, "konstant/0-Std")); continue
-        if _is_quasi_binary_trace(x):
-            bad_idx.add(i); reasons.append((i, "quasi-binär")); continue
-        z = (x - np.nanmedian(x)) / (std if std else 1.0)
-        if np.mean(np.abs(z) > 8) > 0.02:
-            bad_idx.add(i); reasons.append((i, "Artefakte (>2% |z|>8)")); continue
-        if _line_noise_ratio(x, fs) > 0.3:
-            bad_idx.add(i); reasons.append((i, "50Hz-dominant")); continue
+cfg = {
+    "balanced": {
+        "min_finite_frac": 0.95,
+        "artifact_z": 8.0,
+        "artifact_frac": 0.02,
+        "line_ratio_max": 0.30,
+        "hf_ratio_max": 0.55,
+        "std_rel_min": 0.12,
+        "std_rel_max": 8.0,
+        "corr_min": -0.05,
+        "jump_ratio_max": 1.20,
+    },
+    "strict": {
+        "min_finite_frac": 0.98,
+        "artifact_z": 8.1,
+        "artifact_frac": 0.022,
+        "line_ratio_max": 0.28,
+        "hf_ratio_max": 0.56,
+        "std_rel_min": 0.13,
+        "std_rel_max": 8.5,
+        "corr_min": -0.10,
+        "jump_ratio_max": 1.35,
+    },
+}[mode]
+print(f"[CHAN-FILTER] mode={mode}")
 
-    good_idx = [j for j in range(NUM_CHANNELS) if j not in bad_idx]
-    if len(good_idx) < 2:
-        print("[CHAN-FILTER][WARN] zu wenige 'gute' Kanäle – benutze alle.")
-        good_idx = list(range(NUM_CHANNELS))
+def _is_quasi_binary_trace(x):
+    x = np.asarray(x, float); x = x[np.isfinite(x)]
+    if x.size < 10:
+        return False
+    vals = np.unique(np.round(x, 3))
+    if len(vals) <= 4:
+        return True
+    p01 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
+    return p01 >= 0.95
+
+def _line_noise_ratio(x, fs):
+    f, Pxx = welch(np.nan_to_num(x, nan=0.0), fs=fs, nperseg=min(len(x), 4096))
+    def bp(f1, f2):
+        m = (f >= f1) & (f <= f2)
+        return float(np.trapezoid(Pxx[m], f[m])) if m.any() else 0.0
+    total = bp(0.5, 120.0)
+    line = bp(49.0, 51.0)
+    return line / (total + 1e-12)
+
+def _hf_noise_ratio(x, fs):
+    nyq = 0.5 * fs
+    f_hi = min(120.0, 0.95 * nyq)
+    if f_hi <= 5.0:
+        return 0.0
+    f, Pxx = welch(np.nan_to_num(x, nan=0.0), fs=fs, nperseg=min(len(x), 4096))
+    def bp(f1, f2):
+        m = (f >= f1) & (f <= f2)
+        return float(np.trapezoid(Pxx[m], f[m])) if m.any() else 0.0
+    total = bp(0.5, f_hi)
+    hf_lo = min(80.0, 0.65 * f_hi)
+    hf = bp(hf_lo, f_hi)
+    return hf / (total + 1e-12)
+
+def _corr_to_template(x, templ):
+    m = np.isfinite(x) & np.isfinite(templ)
+    if m.sum() < 100:
+        return np.nan
+    xx = x[m]
+    tt = templ[m]
+    sx = np.nanstd(xx)
+    st = np.nanstd(tt)
+    if not np.isfinite(sx) or not np.isfinite(st) or sx == 0 or st == 0:
+        return np.nan
+    return float(np.corrcoef(xx, tt)[0, 1])
+
+def _jump_ratio(x):
+    xx = np.asarray(x, float)
+    m = np.isfinite(xx)
+    xx = xx[m]
+    if xx.size < 10:
+        return np.nan
+    s = float(np.nanstd(xx))
+    if not np.isfinite(s) or s == 0:
+        return np.nan
+    dx = np.diff(xx)
+    if dx.size == 0:
+        return np.nan
+    return float(np.nanmedian(np.abs(dx)) / (s + 1e-12))
+
+std_list = []
+for i in candidate_idx:
+    xi = np.asarray(LFP_array[i], float)
+    si = float(np.nanstd(xi))
+    if np.isfinite(si) and si > 0:
+        std_list.append(si)
+std_med = float(np.nanmedian(std_list)) if std_list else np.nan
+template = np.nanmedian(np.asarray(LFP_array[candidate_idx], float), axis=0)
+
+for i in candidate_idx:
+    x = LFP_array[i]
+    finite = np.isfinite(x)
+    finite_frac = float(finite.mean())
+    if finite_frac < cfg["min_finite_frac"]:
+        bad_idx.add(i); reasons.append((i, "zu viele NaNs")); continue
+    std = np.nanstd(x)
+    if not np.isfinite(std) or std == 0:
+        bad_idx.add(i); reasons.append((i, "konstant/0-Std")); continue
+    if np.isfinite(std_med) and std_med > 0:
+        rel_std = float(std / std_med)
+        if rel_std < cfg["std_rel_min"]:
+            bad_idx.add(i); reasons.append((i, f"sehr niedriges Sigma(rel={rel_std:.2f})")); continue
+        if rel_std > cfg["std_rel_max"]:
+            bad_idx.add(i); reasons.append((i, f"sehr hohes Sigma(rel={rel_std:.2f})")); continue
+    if _is_quasi_binary_trace(x):
+        bad_idx.add(i); reasons.append((i, "quasi-binär")); continue
+    z = (x - np.nanmedian(x)) / (std if std else 1.0)
+    art_frac = float(np.mean(np.abs(z) > cfg["artifact_z"]))
+    if art_frac > cfg["artifact_frac"]:
+        bad_idx.add(i); reasons.append((i, f"Artefakte ({art_frac*100:.1f}% |z|>{cfg['artifact_z']:.1f})")); continue
+    line_ratio = _line_noise_ratio(x, fs)
+    if line_ratio > cfg["line_ratio_max"]:
+        bad_idx.add(i); reasons.append((i, f"50Hz-dominant(r={line_ratio:.2f})")); continue
+    hf_ratio = _hf_noise_ratio(x, fs)
+    if hf_ratio > cfg["hf_ratio_max"]:
+        bad_idx.add(i); reasons.append((i, f"HF-rauschig(r={hf_ratio:.2f})")); continue
+    jr = _jump_ratio(x)
+    if np.isfinite(jr) and jr > cfg["jump_ratio_max"]:
+        bad_idx.add(i); reasons.append((i, f"zappelig(diff/std={jr:.2f})")); continue
+    c = _corr_to_template(np.asarray(x, float), template)
+    if np.isfinite(c) and c < cfg["corr_min"]:
+        bad_idx.add(i); reasons.append((i, f"schwache Mehrkanal-Korrelation(r={c:.2f})")); continue
+
+good_idx = [j for j in candidate_idx if j not in bad_idx]
+if len(good_idx) < 2:
+    print("[CHAN-FILTER][WARN] zu wenige 'gute' Kanäle im Kandidatenbereich – benutze Kandidaten ungefiltert.")
+    good_idx = candidate_idx[:]
+if len(good_idx) < 2:
+    print("[CHAN-FILTER][WARN] fallback auf alle Kanäle.")
+    good_idx = list(range(NUM_CHANNELS))
 
 LFP_array_good    = LFP_array[good_idx, :]
 ch_names_good     = [f"pri_{j}" for j in good_idx]
@@ -964,8 +1048,33 @@ print(f"[CHAN-FILTER] kept {NUM_CHANNELS_GOOD}/{NUM_CHANNELS} Kanäle:", ch_name
 
 log(f"Channel filter: kept={NUM_CHANNELS_GOOD}/{NUM_CHANNELS}, good_idx={good_idx}")
 
+# Main channel neu wählen: nur aus den gefilterten "good" Kanälen
+main_channel_local, good_local_idx = _ensure_main_channel(
+    LFP_array_good, preferred_idx=min(9, max(0, NUM_CHANNELS_GOOD - 1))
+)
+ch_idx_used = int(good_idx[int(good_local_idx)])  # globaler Kanalindex im Original-Array
+main_channel = np.asarray(LFP_array[ch_idx_used], dtype=float)
 
-b_lp, a_lp, b_hp, a_hp = filtering(LOW_CUTOFF, HIGH_CUTOFF, dt)  # 2, 10
+# Für HTML: Main-Channel in µV (mit passendem Gain des globalen Kanals)
+main_channel_uV = None
+if HTML_IN_uV:
+    orig_name = chan_cols[ch_idx_used] if (0 <= ch_idx_used < len(chan_cols)) else None
+    gain_used = PER_CH_GAIN.get(orig_name, PREAMP_GAIN)
+    if CALIB_MODE == "counts":
+        main_channel_uV = _counts_to_uV(main_channel, ADC_BITS, ADC_VPP, gain_used)
+    elif CALIB_MODE == "volts":
+        main_channel_uV = _volts_to_uV(main_channel)
+    elif CALIB_MODE == "uV":
+        main_channel_uV = main_channel.copy()
+    else:
+        main_channel_uV = main_channel.copy()
+
+print(f"[MAIN-CH] using filtered main channel: pri_{ch_idx_used}")
+
+
+if HIGH_CUTOFF <= LOW_CUTOFF:
+    raise ValueError(f"Invalid filter band: LOW_CUTOFF={LOW_CUTOFF} must be < HIGH_CUTOFF={HIGH_CUTOFF}")
+b_lp, a_lp, b_hp, a_hp = filtering(HIGH_CUTOFF, LOW_CUTOFF, dt)  # Bandpass via LP(10 Hz) + HP(2 Hz)
 
 
 
@@ -1986,7 +2095,7 @@ def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, p_vals
     return fig
 
 
-def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *, max_points=20000):
+def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *, max_points=20000, title=None):
     """
     Alternative, falls schon das downsampled Array hast:
     LFP_array: shape (n_chan, n_time)
@@ -2017,7 +2126,9 @@ def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *
     labels = chan_labels if chan_labels and len(chan_labels) == n_ch else [f"ch{i:02d}" for i in range(n_ch)]
     ax.set_yticks(offsets)
     ax.set_yticklabels(labels, fontsize=8)
-    ax.set_title("Alle Kanäle (gestapelt, robust skaliert) — downsampled")
+    if title is None:
+        title = "Alle Kanäle (gestapelt, robust skaliert) — downsampled"
+    ax.set_title(title)
     ax.grid(True, alpha=0.15, linestyle=":")
 
     fig.tight_layout()
@@ -2029,12 +2140,28 @@ def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *
 
 try:
     _save_all_channels_svg_from_array(
-        time_s, LFP_array, [f"pri_{i}" for i in range(NUM_CHANNELS)],
-        os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_DS.svg"),
-        max_points=40000
+        time_s, LFP_array_good, ch_names_good,
+        os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_GOOD.svg"),
+        max_points=40000,
+        title=f"Gefilterte Kanäle (n={NUM_CHANNELS_GOOD}/{NUM_CHANNELS})"
     )
 except Exception as e:
     print("[ALL-CH][DS] skip:", e)
+
+try:
+    excluded_idx = [i for i in range(NUM_CHANNELS) if i not in set(good_idx)]
+    if excluded_idx:
+        _save_all_channels_svg_from_array(
+            time_s,
+            LFP_array[excluded_idx, :],
+            [f"pri_{i}" for i in excluded_idx],
+            os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_EXCLUDED.svg"),
+            max_points=40000
+        )
+    else:
+        print("[ALL-CH][EXCLUDED] keine ausgeschlossenen Kanäle")
+except Exception as e:
+    print("[ALL-CH][EXCLUDED] skip:", e)
 
 
 def up_onset_mean_ax(main_channel, dt, onsets, ax=None, title="UPs – onset-aligned mean"):
@@ -3311,17 +3438,6 @@ try:
 except ModuleNotFoundError:
     HAVE_MNE = False
 
-X = Trig_UP_peak_aligned_array  # shape: trials x time
-Y = Spon_UP_peak_aligned_array
-
-t_obs, p_point, clusters = permutation_cluster_test_time(
-    X, Y,
-    n_perm=2000,
-    alpha=0.05,
-    tail="two-sided",
-    seed=1
-)
-
 
 
 def _nanmean(a, axis=0):
@@ -3374,6 +3490,7 @@ def compare_triggered_vs_spontaneous(
     dt,
     up_time=None,          # optional time axis (n_time,)
     n_perm=2000,
+    do_cluster=True,
     alpha=0.05,
     tail="two-sided",
     seed=0,
@@ -3445,9 +3562,15 @@ def compare_triggered_vs_spontaneous(
     mean_spon = np.nanmean(Y, axis=0)
 
     d_t = cohens_d_time(X, Y)
-    t_obs, p_point, clusters = permutation_cluster_test_time(
-        X, Y, n_perm=n_perm, alpha=alpha, tail=tail, seed=seed
-    )
+    if do_cluster and int(n_perm) > 0:
+        print(f"[CLUSTER] start permutation test (n_perm={int(n_perm)})")
+        t_obs, p_point, clusters = permutation_cluster_test_time(
+            X, Y, n_perm=n_perm, alpha=alpha, tail=tail, seed=seed
+        )
+        print("[CLUSTER] done")
+    else:
+        print("[CLUSTER] skipped by config")
+        t_obs, p_point, clusters = None, None, []
     r_t = sliding_window_corr(mean_trig, mean_spon, win_s=corr_win_s, dt=dt)
 
     return {
@@ -3483,7 +3606,8 @@ res = compare_triggered_vs_spontaneous(
     Spon_UP_peak_aligned_array,
     dt=dt,
     up_time=UP_Time,
-    n_perm=2000,
+    n_perm=CLUSTER_N_PERM,
+    do_cluster=CLUSTER_ENABLE,
     alpha=0.05,
     seed=1
 ) or {}
