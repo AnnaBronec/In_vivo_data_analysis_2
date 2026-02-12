@@ -29,7 +29,8 @@ def export_interactive_lfp_html(
     max_points=300_000,
     title="LFP (interaktiv)",
     limit_to_last_pulse=False,
-    y_label="LFP (µV)"
+    y_label="LFP (µV)",
+    show_pulse_intervals=True,
 ):
 
 
@@ -141,8 +142,9 @@ def export_interactive_lfp_html(
             ))
 
     # deutlich sichtbarer als vorher
-    _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.28)")
-    _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.28)")
+    if show_pulse_intervals:
+        _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.28)")
+        _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.28)")
 
     # --- Pulse-Linien
     def _add_pulses(ts, dash):
@@ -208,8 +210,9 @@ def export_interactive_lfp_html(
                 fillcolor=fill
             ))
 
-    _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.12)")   # rot transparent
-    _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.12)")   # optional: 2. Spur etwas schwächer
+    if show_pulse_intervals:
+        _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.12)")   # rot transparent
+        _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.12)")   # optional: 2. Spur etwas schwächer
 
 
     
@@ -245,7 +248,7 @@ def export_interactive_lfp_html(
     #     fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
     #                              line=dict(width=1, dash="dash", color="red"),
     #                              name="Pulse 2"))
-    if pulse_intervals_1 is not None and len(pulse_intervals_1):
+    if show_pulse_intervals and pulse_intervals_1 is not None and len(pulse_intervals_1):
         fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
                                  line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
                                  name="Pulse 1 duration"))

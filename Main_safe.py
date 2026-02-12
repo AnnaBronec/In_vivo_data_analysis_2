@@ -88,6 +88,8 @@ CSD_PAPER_CMAP = "RdBu_r"
 CHANNEL_FILTER_MODE = "strict"  # "balanced" | "strict"
 CLUSTER_N_PERM = int(os.environ.get("CLUSTER_N_PERM", "800"))
 CLUSTER_ENABLE = os.environ.get("CLUSTER_ENABLE", "0") == "1"
+AUTO_PULSE_EDGE_SHIFT = os.environ.get("AUTO_PULSE_EDGE_SHIFT", "0") == "1"
+AUTO_CLEAR_TINY_OFFSETS = os.environ.get("AUTO_CLEAR_TINY_OFFSETS", "0") == "1"
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
 
@@ -413,8 +415,55 @@ def snap_times_to_timebase(times, time_s):
     if t.size == 0:
         return np.array([], float)
     idx = np.searchsorted(time_s, t)
-    idx = np.clip(idx, 0, len(time_s)-1)
+    idx = np.clip(idx, 1, len(time_s)-1)
+    left = time_s[idx - 1]
+    right = time_s[idx]
+    take_left = (t - left) <= (right - t)
+    idx = np.where(take_left, idx - 1, idx)
     return time_s[idx]
+
+
+def _debug_event_snap_report(tag, raw_times, snapped_times, time_s, n_show=8):
+    """
+    Debug helper: compare raw event times to snapped timeline events.
+    Emits compact stats + a few examples when DEBUG_MAIN_SAFE=1.
+    """
+    try:
+        raw = np.asarray(raw_times, float) if raw_times is not None else np.array([], float)
+        raw = raw[np.isfinite(raw)]
+    except Exception:
+        raw = np.array([], float)
+    try:
+        snp = np.asarray(snapped_times, float) if snapped_times is not None else np.array([], float)
+        snp = snp[np.isfinite(snp)]
+    except Exception:
+        snp = np.array([], float)
+
+    debug_log(f"[{tag}] raw_n={len(raw)} snapped_n={len(snp)} "
+              f"time_range={float(time_s[0]):.3f}->{float(time_s[-1]):.3f}s")
+    if raw.size == 0 or len(time_s) < 2:
+        return
+
+    exp = snap_times_to_timebase(raw, time_s)
+    err_exp_ms = (exp - raw) * 1e3
+    debug_log(f"[{tag}] raw->nearest-sample error ms | "
+              f"median={float(np.median(np.abs(err_exp_ms))):.3f} "
+              f"p90={float(np.percentile(np.abs(err_exp_ms), 90)):.3f} "
+              f"max={float(np.max(np.abs(err_exp_ms))):.3f}")
+
+    m = min(len(exp), len(snp))
+    if m > 0:
+        err_impl_ms = (snp[:m] - exp[:m]) * 1e3
+        debug_log(f"[{tag}] impl-vs-expected snap error ms | "
+                  f"median={float(np.median(np.abs(err_impl_ms))):.6f} "
+                  f"max={float(np.max(np.abs(err_impl_ms))):.6f}")
+
+        show = min(n_show, m)
+        for i in range(show):
+            debug_log(
+                f"[{tag}] i={i:02d} raw={raw[i]:.6f}s expected={exp[i]:.6f}s "
+                f"snapped={snp[i]:.6f}s raw->snap={(snp[i]-raw[i])*1e3:.3f}ms"
+            )
 
 
 parts_dir = Path(BASE_PATH) / "_csv_parts"
@@ -457,28 +506,139 @@ if "pulse_times_2_off_full" not in globals() or pulse_times_2_off_full is None:
 HAVE_NEV = False  # wird ggf. nach NEV-read True
 
 
+def _try_load_nlx_events_from_raw(base_path, time_s):
+    """
+    Fallback for NCS sessions without Events.nev:
+    read event timestamps (and if available durations) directly from Neuralynx raw files.
+    Returns (on_s, off_s), both relative to the analysis time axis in seconds.
+    """
+    try:
+        from neo.rawio import NeuralynxRawIO
+    except Exception:
+        return np.array([], float), np.array([], float)
+
+    p = Path(base_path)
+    if not p.exists():
+        return np.array([], float), np.array([], float)
+
+    try:
+        skip_suffixes = {".nse", ".ntt", ".nst"}
+        exclude_list = [f.name for f in p.iterdir()
+                        if f.is_file() and f.suffix.lower() in skip_suffixes]
+        rr = NeuralynxRawIO(
+            dirname=str(p),
+            exclude_filename=exclude_list,
+            keep_original_times=False
+        )
+        rr.parse_header()
+        try:
+            ts, dur, _labels = rr.get_event_timestamps(block_index=0, seg_index=0)
+        except TypeError:
+            ts, dur, _labels = rr.get_event_timestamps()
+        if ts is None or len(ts) == 0:
+            return np.array([], float), np.array([], float)
+
+        on = rr.rescale_event_timestamp(ts, dtype="float64")
+        on = np.asarray(on, float)
+        on = on[np.isfinite(on)]
+        if on.size == 0:
+            return np.array([], float), np.array([], float)
+
+        # Try direct overlap with analysis timeline; if no overlap, anchor first event to t0.
+        t0, t1 = float(time_s[0]), float(time_s[-1])
+        if not ((np.nanmax(on) >= t0) and (np.nanmin(on) <= t1)):
+            on = on - float(on[0]) + t0
+
+        off = np.array([], float)
+        if dur is not None and len(dur) == len(ts):
+            try:
+                dur_s = rr.rescale_event_timestamp(dur, dtype="float64")
+            except Exception:
+                dur_s = np.asarray(dur, float) / 1e6
+            dur_s = np.asarray(dur_s, float)
+            m = np.isfinite(dur_s) & (dur_s > 0)
+            if np.any(m):
+                on2 = on[:len(dur_s)][m]
+                off = on2 + dur_s[m]
+                on = on2
+
+        on = on[(on >= t0) & (on <= t1)]
+        if off.size:
+            off = off[(off >= t0) & (off <= t1 + 1.0)]
+        return np.asarray(on, float), np.asarray(off, float)
+    except Exception:
+        return np.array([], float), np.array([], float)
 
 
-nev_path = os.path.join(BASE_PATH, "Events.nev")
-if os.path.exists(nev_path):
+
+
+nev_candidates = sorted(Path(BASE_PATH).glob("*.nev")) + sorted(Path(BASE_PATH).glob("*.Nev")) + sorted(Path(BASE_PATH).glob("*.NEV"))
+nev_path = None
+for c in nev_candidates:
+    if c.name.lower() == "events.nev":
+        nev_path = str(c)
+        break
+if nev_path is None and nev_candidates:
+    nev_path = str(nev_candidates[0])
+
+if nev_path is not None and os.path.exists(nev_path):
     try:
         ts_us, ttl_words, _ = read_nev_timestamps_and_ttl(nev_path)
 
-        # TTL bit wählen (0 ist Start; wenn 0 nix liefert: 1..15 testen)
-        on_us, off_us = ttl_to_on_off(ts_us, ttl_words, bit=0)
+        # TTL bit automatisch wählen: möglichst viele gepaarte ON/OFF-Edges.
+        cand = []
+        max_pairs = 0
+        for bit in range(16):
+            _on, _off = ttl_to_on_off(ts_us, ttl_words, bit=bit)
+            n_pair = min(len(_on), len(_off))
+            max_pairs = max(max_pairs, n_pair)
+            med_w_s = np.nan
+            if n_pair > 0:
+                w_s = (np.asarray(_off[:n_pair], float) - np.asarray(_on[:n_pair], float)) / 1e6
+                w_s = w_s[np.isfinite(w_s) & (w_s > 0)]
+                if w_s.size:
+                    med_w_s = float(np.median(w_s))
+            cand.append((bit, _on, _off, n_pair, med_w_s))
+
+        best = None
+        if cand:
+            best = max(cand, key=lambda c: (c[3], len(c[1]), -c[0]))
+
+        if best is None:
+            on_us, off_us, best_bit = np.array([], float), np.array([], float), None
+        else:
+            best_bit, on_us, off_us, n_pair_best, med_w_best_s = best
+
+        if best_bit is not None:
+            if np.isfinite(med_w_best_s):
+                print(f"[NEV] selected TTL bit={best_bit} on={len(on_us)} off={len(off_us)} "
+                      f"median_width={med_w_best_s*1000:.2f} ms")
+            else:
+                print(f"[NEV] selected TTL bit={best_bit} on={len(on_us)} off={len(off_us)}")
+        else:
+            print("[NEV] selected TTL bit=None (no valid TTL edges)")
+        debug_log("[NEV][bits] "
+                  + " | ".join(
+                      f"b{b}:pairs={npair},med_ms="
+                      f"{(mw*1000.0 if np.isfinite(mw) else np.nan):.3f}"
+                      for (b, _on, _off, npair, mw) in cand
+                  ))
 
         t0_us = None
         if isinstance(lfp_meta, dict):
-            # typische Keys (je nach Loader)
             for k in ["csc_t0_us", "t0_us", "first_ts_us", "start_ts_us", "first_timestamp_us"]:
                 if k in lfp_meta and lfp_meta[k] is not None:
                     t0_us = int(lfp_meta[k])
                     break
 
         if t0_us is None:
-            # Fallback: setze NEV so, dass ts_us[0] -> time_s[0]
-            # (funktioniert, wenn time_s in Sekunden relativ zu Start ist oder konstant verschoben)
-            t0_us = int(ts_us[0] - float(time_s[0]) * 1e6)
+            # Fallback: verankere NEV an der **vollen** LFP-Zeitbasis (vor Crop/DS),
+            # nicht an time_s (bereits beschnitten). So vermeiden wir späte Pulse.
+            try:
+                t_ref = float(time_full[0]) if 'time_full' in locals() else float(time_s[0])
+            except Exception:
+                t_ref = float(time_s[0])
+            t0_us = int(ts_us[0] - t_ref * 1e6)
 
         pulse_times_1_full     = (on_us  - t0_us) / 1e6
         pulse_times_1_off_full = (off_us - t0_us) / 1e6
@@ -493,6 +653,16 @@ if os.path.exists(nev_path):
         print("[NEV][WARN] reading/parsing failed:", e)
 else:
     print("[NEV] Events.nev not found -> fallback to CSV stim/din edges")
+    if not FROM_STREAM:
+        on_raw, off_raw = _try_load_nlx_events_from_raw(BASE_PATH, time_s)
+        if on_raw.size:
+            pulse_times_1_full = on_raw
+            pulse_times_1_off_full = off_raw
+            HAVE_NEV = True
+            print(f"[NCS-EVENT] raw events loaded: on={len(on_raw)} off={len(off_raw)}")
+            debug_log("[NCS-EVENT][RAW] first onsets (s):", np.asarray(on_raw[:10], float))
+            if off_raw is not None and len(off_raw):
+                debug_log("[NCS-EVENT][RAW] first offsets (s):", np.asarray(off_raw[:10], float))
 
 
 if not FROM_STREAM:
@@ -541,10 +711,9 @@ if FROM_STREAM:
     print(f"[INFO] pulses(from streaming): p1={len(pulse_times_1_full)}, p2={len(pulse_times_2_full)}")
 else:
     # -------------------------------------------------------
-    # CSV edge detect only if NO NEV pulses were loaded
+    # CSV edge detect only if no event-derived pulses were loaded.
     # -------------------------------------------------------
     HAVE_NEV = (pulse_times_1_full is not None) and (len(pulse_times_1_full) > 0)
-
     if not HAVE_NEV:
         # Pulse direkt aus dem DataFrame ziehen (Fallback)
         pulse_times_1_full = np.array([], dtype=float)
@@ -669,8 +838,17 @@ if (pulse_times_1_full is not None and len(pulse_times_1_full) > 0):
     if stim_col_used is not None and ('LFP_df' in globals()) and (LFP_df is not None) and (stim_col_used in LFP_df.columns):
         t_on, t_off = _rising_falling_from_col(stim_col_used, thr=None)
         if (pulse_times_1_off_full is None) or (len(pulse_times_1_off_full) == 0):
-            pulse_times_1_off_full = t_off
-        print(f"[FORCE-OFF] from '{stim_col_used}': on={len(t_on)} off={len(t_off)}")
+            # Do not re-introduce pseudo widths for onset-only impulse stim tracks.
+            ww = np.array([], float)
+            if len(t_on) and len(t_off):
+                m = min(len(t_on), len(t_off))
+                ww = np.asarray(t_off[:m], float) - np.asarray(t_on[:m], float)
+                ww = ww[np.isfinite(ww) & (ww > 0)]
+            if ww.size and (float(np.median(ww)) <= 0.02):
+                print(f"[FORCE-OFF] skip tiny-width OFF from '{stim_col_used}' (median={float(np.median(ww))*1000:.2f} ms)")
+            else:
+                pulse_times_1_off_full = t_off
+                print(f"[FORCE-OFF] from '{stim_col_used}': on={len(t_on)} off={len(t_off)}")
 
 
 if not FROM_STREAM:
@@ -763,7 +941,11 @@ def _snap_event_times_to_timebase(event_times, time_s):
     if t.size == 0:
         return t
     idx = np.searchsorted(time_s, t)
-    idx = np.clip(idx, 0, len(time_s)-1)
+    idx = np.clip(idx, 1, len(time_s)-1)
+    left = time_s[idx - 1]
+    right = time_s[idx]
+    take_left = (t - left) <= (right - t)
+    idx = np.where(take_left, idx - 1, idx)
     return time_s[idx]
 
 
@@ -797,6 +979,15 @@ if len(pulse_times_1_full) and len(pulse_times_1_off_full):
              pulse_times_1_full[:min(len(pulse_times_1_full), len(pulse_times_1_off_full))]
     debug_log("[TTL][DBG] median width (s) =", float(np.median(widths[np.isfinite(widths)])))
     debug_log("[TTL][DBG] example widths (s) =", widths[:10])
+    wv = widths[np.isfinite(widths) & (widths > 0)]
+    if wv.size:
+        print(f"[PULSE-WIDTH][full] median={float(np.median(wv))*1000:.2f} ms | p10/p90={float(np.percentile(wv,10))*1000:.2f}/{float(np.percentile(wv,90))*1000:.2f} ms")
+        # Optional safeguard: only clear tiny offsets when explicitly enabled.
+        if AUTO_CLEAR_TINY_OFFSETS and float(np.median(wv)) <= max(2.0 * float(dt), 0.015):
+            pulse_times_1_off_full = np.array([], dtype=float)
+            print("[PULSE-WIDTH] offsets cleared (onset-only events detected)")
+        elif (not AUTO_CLEAR_TINY_OFFSETS) and float(np.median(wv)) <= max(2.0 * float(dt), 0.015):
+            print("[PULSE-WIDTH] tiny offsets detected but kept (AUTO_CLEAR_TINY_OFFSETS=0)")
 
 
 # ebenfalls auf Sekunden bringen:
@@ -834,6 +1025,11 @@ pulse_times_2 = _ensure_seconds(pulse_times_2, time_s, DEFAULT_FS_XDAT)
 pulse_times_1_off = _ensure_seconds(pulse_times_1_off, time_s, DEFAULT_FS_XDAT)
 pulse_times_2_off = _ensure_seconds(pulse_times_2_off, time_s, DEFAULT_FS_XDAT)
 
+if pulse_times_1_full is not None and len(pulse_times_1_full):
+    _debug_event_snap_report("P1-ONSET-SNAP", pulse_times_1_full, pulse_times_1, time_s)
+if pulse_times_1_off_full is not None and len(pulse_times_1_off_full):
+    _debug_event_snap_report("P1-OFFSET-SNAP", pulse_times_1_off_full, pulse_times_1_off, time_s)
+
 if ((pulse_times_1 is None or len(pulse_times_1)==0) and
     (pulse_times_2 is None or len(pulse_times_2)==0)):
     print("[CROP] skip: no pulses -> keep full time range")
@@ -848,6 +1044,13 @@ else:
 # clamp OFF inside crop
 pulse_times_1_off = _clip_events_to_bounds(pulse_times_1_off, time_s, 0.0, 0.0)
 pulse_times_2_off = _clip_events_to_bounds(pulse_times_2_off, time_s, 0.0, 0.0)
+if (pulse_times_1 is not None and pulse_times_1_off is not None and
+    len(pulse_times_1) and len(pulse_times_1_off)):
+    m = min(len(pulse_times_1), len(pulse_times_1_off))
+    ws = np.asarray(pulse_times_1_off[:m], float) - np.asarray(pulse_times_1[:m], float)
+    ws = ws[np.isfinite(ws) & (ws > 0)]
+    if ws.size:
+        print(f"[PULSE-WIDTH][snapped] median={float(np.median(ws))*1000:.2f} ms | p10/p90={float(np.percentile(ws,10))*1000:.2f}/{float(np.percentile(ws,90))*1000:.2f} ms")
 
 
 
@@ -1135,6 +1338,30 @@ debug_log("[CHECK] max|time_s - t_feat| over first m:",
 freqs = spont_mean = pulse_mean = p_vals = None
 
 
+def _count_pulse_hit_windows(pulse_t, up_idx, time_s, trig_win_s=0.35):
+    p = np.asarray(pulse_t if pulse_t is not None else [], float)
+    up_idx = np.asarray(up_idx if up_idx is not None else [], int)
+    if p.size == 0 or up_idx.size == 0:
+        return 0
+    up_idx = up_idx[(up_idx >= 0) & (up_idx < len(time_s))]
+    if up_idx.size == 0:
+        return 0
+    up_t = np.asarray(time_s[up_idx], float)
+    up_t.sort()
+    n = 0
+    for pt in p:
+        j = np.searchsorted(up_t, pt, side="left")
+        if j < up_t.size and up_t[j] <= (pt + trig_win_s):
+            n += 1
+    return int(n)
+
+
+def _shift_times(ts, shift_s):
+    if ts is None:
+        return None
+    return np.asarray(ts, float) - float(shift_s)
+
+
 
 pulse_times_1 = _clip_events_to_bounds(pulse_times_1, time_s, align_pre_s, align_post_s)
 pulse_times_2 = _clip_events_to_bounds(pulse_times_2, time_s, align_pre_s, align_post_s)
@@ -1150,8 +1377,107 @@ try:
     Up = classify_states(
         Spect_dat, time_s, pulse_times_1, pulse_times_2, dt,
         main_channel, LFP_array, b_lp, a_lp, b_hp, a_hp,
-        align_pre, align_post, align_len
+        align_pre, align_post, align_len,
+        pulse_times_1_off=pulse_times_1_off,
+        pulse_times_2_off=pulse_times_2_off
     )
+
+    # If pulse width collapses to ~1 sample and classification is mostly "associated",
+    # check whether event markers likely represent a later edge and need a small back-shift.
+    try:
+        w_small = False
+        if (pulse_times_1 is not None and pulse_times_1_off is not None and
+            len(pulse_times_1) and len(pulse_times_1_off)):
+            m_w = min(len(pulse_times_1), len(pulse_times_1_off))
+            ww = np.asarray(pulse_times_1_off[:m_w], float) - np.asarray(pulse_times_1[:m_w], float)
+            ww = ww[np.isfinite(ww) & (ww > 0)]
+            if ww.size:
+                med_w = float(np.median(ww))
+                w_small = med_w <= max(2.0 * float(dt), 0.015)
+
+        up_all_idx = np.asarray(Up.get("UP_start_i", []), int)
+        n_assoc = int(len(np.asarray(Up.get("Pulse_associated_UP", []), int)))
+        n_trig = int(len(np.asarray(Up.get("Pulse_triggered_UP", []), int)))
+        edge_unknown = (pulse_times_1_full is not None and len(pulse_times_1_full) > 0 and
+                        ((pulse_times_1_off_full is None) or (len(pulse_times_1_off_full) == 0)))
+
+        if (AUTO_PULSE_EDGE_SHIFT and
+            pulse_times_1 is not None and len(pulse_times_1) >= 5 and up_all_idx.size >= 5 and
+            (w_small or edge_unknown) and n_assoc >= max(8, n_trig + 6)):
+            base_trig = int(len(np.asarray(Up.get("Pulse_triggered_UP", []), int)))
+            base_assoc = int(len(np.asarray(Up.get("Pulse_associated_UP", []), int)))
+            base_score = float(base_trig) - 0.25 * float(base_assoc)
+            best_shift = 0.0
+            best_score = base_score
+            best_up = Up
+            for sh in (0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.75, 1.00):
+                p_try = _clip_events_to_bounds(_shift_times(pulse_times_1, sh), time_s, align_pre_s, align_post_s)
+                po_try = _clip_events_to_bounds(_shift_times(pulse_times_1_off, sh), time_s, align_pre_s, align_post_s)
+                up_try = classify_states(
+                    Spect_dat, time_s, p_try, pulse_times_2, dt,
+                    main_channel, LFP_array, b_lp, a_lp, b_hp, a_hp,
+                    align_pre, align_post, align_len,
+                    pulse_times_1_off=po_try,
+                    pulse_times_2_off=pulse_times_2_off
+                )
+                trig_try = int(len(np.asarray(up_try.get("Pulse_triggered_UP", []), int)))
+                assoc_try = int(len(np.asarray(up_try.get("Pulse_associated_UP", []), int)))
+                score_try = float(trig_try) - 0.25 * float(assoc_try)
+                print(f"[PULSE-EDGE][test] shift={sh:.3f}s -> trig={trig_try}, assoc={assoc_try}, score={score_try:.2f}")
+                if score_try > best_score:
+                    best_score = score_try
+                    best_shift = float(sh)
+                    best_up = up_try
+
+            if best_shift > 0 and best_score > base_score + 1.0:
+                print(f"[PULSE-EDGE] auto-shift events earlier by {best_shift:.3f}s (score {base_score:.2f}->{best_score:.2f})")
+                pulse_times_1 = _clip_events_to_bounds(_shift_times(pulse_times_1, best_shift), time_s, align_pre_s, align_post_s)
+                pulse_times_1_off = _clip_events_to_bounds(_shift_times(pulse_times_1_off, best_shift), time_s, align_pre_s, align_post_s)
+                pulse_times_1_full = _shift_times(pulse_times_1_full, best_shift)
+                pulse_times_1_off_full = _shift_times(pulse_times_1_off_full, best_shift)
+                pulse_times_1_html = _shift_times(pulse_times_1_html, best_shift)
+                pulse_times_1_off_html = _shift_times(pulse_times_1_off_html, best_shift)
+                Up = best_up
+
+        # Always-on lightweight sanity check:
+        # if many associated but almost no triggered, try one earlier shift by median pulse width.
+        # This addresses sessions where event edges are systematically late.
+        if (pulse_times_1 is not None and pulse_times_1_off is not None and
+            len(pulse_times_1) >= 5 and len(pulse_times_1_off) >= 5):
+            m_w = min(len(pulse_times_1), len(pulse_times_1_off))
+            ww = np.asarray(pulse_times_1_off[:m_w], float) - np.asarray(pulse_times_1[:m_w], float)
+            ww = ww[np.isfinite(ww) & (ww > 0)]
+            if ww.size:
+                med_w = float(np.median(ww))
+                n_assoc_now = int(len(np.asarray(Up.get("Pulse_associated_UP", []), int)))
+                n_trig_now = int(len(np.asarray(Up.get("Pulse_triggered_UP", []), int)))
+                if (med_w >= 0.03 and med_w <= 2.0 and n_assoc_now >= max(8, n_trig_now + 6)):
+                    sh = float(np.clip(med_w, 0.03, 0.8))
+                    p_try = _clip_events_to_bounds(_shift_times(pulse_times_1, -sh), time_s, align_pre_s, align_post_s)
+                    po_try = _clip_events_to_bounds(_shift_times(pulse_times_1_off, -sh), time_s, align_pre_s, align_post_s)
+                    up_try = classify_states(
+                        Spect_dat, time_s, p_try, pulse_times_2, dt,
+                        main_channel, LFP_array, b_lp, a_lp, b_hp, a_hp,
+                        align_pre, align_post, align_len,
+                        pulse_times_1_off=po_try,
+                        pulse_times_2_off=pulse_times_2_off
+                    )
+                    trig_try = int(len(np.asarray(up_try.get("Pulse_triggered_UP", []), int)))
+                    assoc_try = int(len(np.asarray(up_try.get("Pulse_associated_UP", []), int)))
+                    score_now = float(n_trig_now) - 0.25 * float(n_assoc_now)
+                    score_try = float(trig_try) - 0.25 * float(assoc_try)
+                    print(f"[PULSE-EDGE][sanity] shift=-{sh:.3f}s (med_width): trig={n_trig_now}->{trig_try}, assoc={n_assoc_now}->{assoc_try}, score={score_now:.2f}->{score_try:.2f}")
+                    if score_try >= score_now + 2.0:
+                        print(f"[PULSE-EDGE] apply sanity shift -{sh:.3f}s")
+                        pulse_times_1 = p_try
+                        pulse_times_1_off = po_try
+                        pulse_times_1_full = _shift_times(pulse_times_1_full, -sh)
+                        pulse_times_1_off_full = _shift_times(pulse_times_1_off_full, -sh)
+                        pulse_times_1_html = _shift_times(pulse_times_1_html, -sh)
+                        pulse_times_1_off_html = _shift_times(pulse_times_1_off_html, -sh)
+                        Up = up_try
+    except Exception as _e_shift:
+        print(f"[PULSE-EDGE][WARN] auto-shift skipped: {_e_shift}")
 
     # --- ab hier: Peaks sauber machen (nach classify_states) ---
     Spontaneous_UP      = np.asarray(Up.get("Spontaneous_UP", []), dtype=int)
@@ -1477,10 +1803,18 @@ def detect_spindle_intervals_in_upstates(
     *,
     f_lo=10.0,
     f_hi=15.0,
-    thr_k=2.5,
-    min_dur_s=0.08,
-    max_dur_s=1.0,
-    max_gap_s=0.05,
+    thr_k_on=2.5,
+    thr_k_off=1.5,
+    min_dur_s=0.5,
+    max_dur_s=2.0,
+    max_gap_s=0.02,
+    min_cycles=2,
+    min_spindle_band_power_ratio=1.2,
+    min_spindle_power_fraction=0.12,
+    min_env_peak_quantile=0.50,
+    min_env_peak_sigma=2.5,
+    only_in_upstates=False,
+    use_psd_check=False,
 ):
     x = np.asarray(signal_1d, float).reshape(-1)
     t = np.asarray(time_s, float).reshape(-1)
@@ -1502,41 +1836,117 @@ def detect_spindle_intervals_in_upstates(
     except Exception:
         return []
 
-    up_mask = np.zeros_like(x, dtype=bool)
-    for u, d in up_pairs:
-        up_mask[u:d] = True
-    if not np.any(up_mask):
-        return []
+    if only_in_upstates:
+        up_mask = np.zeros_like(x, dtype=bool)
+        for u, d in up_pairs:
+            up_mask[u:d] = True
+        if not np.any(up_mask):
+            return []
+    else:
+        up_mask = np.ones_like(x, dtype=bool)
 
     e_up = env[up_mask]
     med = float(np.nanmedian(e_up))
     mad = float(np.nanmedian(np.abs(e_up - med)))
     robust_sigma = 1.4826 * mad
-    thr = med + float(thr_k) * max(robust_sigma, 1e-12)
+    sig = max(robust_sigma, 1e-12)
+    thr_on = med + float(thr_k_on) * sig
+    thr_off = med + float(thr_k_off) * sig
+    if thr_off > thr_on:
+        thr_off = thr_on
+    env_peak_floor = max(
+        float(np.nanquantile(e_up, float(min_env_peak_quantile))),
+        med + float(min_env_peak_sigma) * sig,
+    )
 
-    det = (env >= thr) & up_mask
-    if not np.any(det):
+    # Hysteresis: start only above high threshold, end below lower threshold.
+    segs = []
+    in_seg = False
+    s = 0
+    for i in range(x.size):
+        if not up_mask[i]:
+            if in_seg:
+                segs.append((s, i))
+                in_seg = False
+            continue
+        if not in_seg:
+            if env[i] >= thr_on:
+                s = i
+                in_seg = True
+        else:
+            if env[i] < thr_off:
+                segs.append((s, i))
+                in_seg = False
+    if in_seg:
+        segs.append((s, x.size))
+
+    if not segs:
         return []
 
     max_gap = max(0, int(round(max_gap_s / dt)))
-    if max_gap > 0:
-        idx = np.flatnonzero(det)
-        if idx.size > 1:
-            for a_i, b_i in zip(idx[:-1], idx[1:]):
-                if 1 < (b_i - a_i) <= (max_gap + 1):
-                    det[a_i:b_i + 1] = True
+    if max_gap > 0 and len(segs) > 1:
+        merged = [segs[0]]
+        for s2, e2 in segs[1:]:
+            s1, e1 = merged[-1]
+            if (s2 - e1) <= max_gap:
+                merged[-1] = (s1, e2)
+            else:
+                merged.append((s2, e2))
+        segs = merged
 
     min_len = max(1, int(round(min_dur_s / dt)))
     max_len = max(min_len, int(round(max_dur_s / dt)))
-    starts = np.flatnonzero(det & ~np.r_[False, det[:-1]])
-    ends = np.flatnonzero(det & ~np.r_[det[1:], False]) + 1
 
     out = []
-    for s, e in zip(starts, ends):
+    n_after_duration = 0
+    n_after_env = 0
+    n_after_cycles = 0
+    n_after_psd = 0
+    min_peak_distance = max(1, int(round(fs / max(f_hi, 1.0) * 0.8)))
+    for s, e in segs:
         L = e - s
         if L < min_len or L > max_len:
             continue
+        n_after_duration += 1
+        if float(np.nanmax(env[s:e])) < env_peak_floor:
+            continue
+        n_after_env += 1
+        # Require a minimum number of oscillatory cycles in spindle band.
+        peaks, _ = signal.find_peaks(xb[s:e], distance=min_peak_distance)
+        if peaks.size < int(min_cycles):
+            continue
+        n_after_cycles += 1
+        # Optional spectral sanity check against broadband/noisy fragments.
+        psd_ok = True
+        if use_psd_check:
+            nper = min(256, L)
+            if nper >= 32:
+                freqs, pxx = signal.welch(x0[s:e], fs=fs, nperseg=nper)
+                if pxx.size and np.any(np.isfinite(pxx)):
+                    pxx = np.nan_to_num(pxx, nan=0.0, posinf=0.0, neginf=0.0)
+                    f = freqs
+                    p_sp = float(np.trapezoid(pxx[(f >= f_lo) & (f <= f_hi)], f[(f >= f_lo) & (f <= f_hi)]))
+                    p_lo = float(np.trapezoid(pxx[(f >= 6.0) & (f < f_lo)], f[(f >= 6.0) & (f < f_lo)]))
+                    p_hi = float(np.trapezoid(pxx[(f > f_hi) & (f <= 25.0)], f[(f > f_hi) & (f <= 25.0)]))
+                    p_bg = max(p_lo, p_hi, 1e-12)
+                    p_tot = float(np.trapezoid(pxx[(f >= 4.0) & (f <= 30.0)], f[(f >= 4.0) & (f <= 30.0)]))
+                    if p_sp / p_bg < float(min_spindle_band_power_ratio):
+                        psd_ok = False
+                    if p_tot > 0 and (p_sp / p_tot) < float(min_spindle_power_fraction):
+                        psd_ok = False
+        if not psd_ok:
+            continue
+        n_after_psd += 1
         out.append((float(t[s]), float(t[e - 1])))
+    if DEBUG_MAIN_SAFE:
+        print(
+            "[SPINDLE-DBG] segs=", len(segs),
+            "after_dur=", n_after_duration,
+            "after_env=", n_after_env,
+            "after_cycles=", n_after_cycles,
+            "after_psd=", n_after_psd,
+            "accepted=", len(out),
+        )
     return out
 
 
@@ -1547,7 +1957,7 @@ all_up_pairs += _pair_up_down_indices(Pulse_associated_UP, Pulse_associated_DOWN
 spindle_intervals_s = detect_spindle_intervals_in_upstates(
     main_channel, time_s, dt, all_up_pairs
 )
-print(f"[SPINDLE] 10-15 Hz intervals in UPs: n={len(spindle_intervals_s)}")
+print(f"[SPINDLE] 10-15 Hz intervals (global): n={len(spindle_intervals_s)}")
 
 debug_log("[DBG before pair] p1_on/off:",
           0 if pulse_times_1 is None else len(pulse_times_1),
@@ -1665,6 +2075,23 @@ print("[HTML FINAL] p1_on/off:", len(pulse_times_1_html), len(pulse_times_1_off_
       "| ttl1_intervals:", len(ttl1_intervals))
 print("[HTML FINAL] time window:", tmin, "->", tmax)
 
+# If OFF edges are missing/unreliable, show only onset lines (no pulse-duration areas).
+PULSE_ONSET_ONLY = False
+if pulse_times_1_html is not None and len(pulse_times_1_html):
+    if pulse_times_1_off_html is None or len(pulse_times_1_off_html) == 0:
+        PULSE_ONSET_ONLY = True
+    else:
+        m_pw = min(len(pulse_times_1_html), len(pulse_times_1_off_html))
+        if m_pw > 0:
+            ww = np.asarray(pulse_times_1_off_html[:m_pw], float) - np.asarray(pulse_times_1_html[:m_pw], float)
+            ww = ww[np.isfinite(ww) & (ww > 0)]
+            if ww.size and float(np.median(ww)) <= max(2.0 * float(dt), 0.015):
+                PULSE_ONSET_ONLY = True
+if PULSE_ONSET_ONLY:
+    ttl1_intervals = []
+    ttl2_intervals = []
+    print("[PULSE-PLOT] onset-only mode: pulse durations hidden in plots")
+
 
 
 
@@ -1687,7 +2114,8 @@ export_interactive_lfp_html(
     spindle_intervals=spindle_intervals_s,
     limit_to_last_pulse=False,
     title=f"{BASE_TAG} — Main LFP (interaktiv)",
-    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})")
+    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
+    show_pulse_intervals=(not PULSE_ONSET_ONLY),
 )
 
 
@@ -2424,7 +2852,7 @@ def pulse_triggered_up_overlay_ax(
     ax.plot(t_rel, mean_trace, lw=2.0, label="Mean LFP")
 
     # vertikale Linie beim Pulse (0 s)
-    ax.axvline(0.0, color="k", lw=1.0, ls="--", label="Pulse")
+    ax.axvline(0.0, color="red", lw=1.0, ls="--", label="Pulse")
 
     # mittlere UP-Latenz
     up_rel_times = np.asarray(up_rel_times, float)

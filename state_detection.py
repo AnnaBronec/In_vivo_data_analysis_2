@@ -115,7 +115,8 @@ def compute_peak_aligned_segments(
 
 def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                     LFP_array, b_lp, a_lp, b_hp, a_hp,
-                    align_pre, align_post, align_len):
+                    align_pre, align_post, align_len,
+                    pulse_times_1_off=None, pulse_times_2_off=None):
     main_trace = np.asarray(V1_1, dtype=float).reshape(-1)
     if main_trace.size < 2:
         main_trace = np.asarray(LFP_array[0], dtype=float)
@@ -455,35 +456,98 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     #   spontaneous: keine Pulse in den obigen Fenstern
     p1 = np.asarray(pulse_times_1 if pulse_times_1 is not None else [], float)
     p2 = np.asarray(pulse_times_2 if pulse_times_2 is not None else [], float)
+    po1 = np.asarray(pulse_times_1_off if pulse_times_1_off is not None else [], float)
+    po2 = np.asarray(pulse_times_2_off if pulse_times_2_off is not None else [], float)
+
     Pulse_times_array = np.sort(np.concatenate([p1, p2])) if (p1.size or p2.size) else np.array([], float)
     Pulse_times_array = Pulse_times_array[np.isfinite(Pulse_times_array)]
+    Pulse_off_array = np.sort(np.concatenate([po1, po2])) if (po1.size or po2.size) else np.array([], float)
+    Pulse_off_array = Pulse_off_array[np.isfinite(Pulse_off_array)]
+
+    def _pair_intervals(on_arr, off_arr):
+        on_arr = np.asarray(on_arr, float)
+        off_arr = np.asarray(off_arr, float)
+        if on_arr.size == 0 or off_arr.size == 0:
+            return np.empty((0, 2), dtype=float)
+        m = int(min(on_arr.size, off_arr.size))
+        onv = on_arr[:m]
+        offv = off_arr[:m]
+        ok = np.isfinite(onv) & np.isfinite(offv) & (offv >= onv)
+        if not np.any(ok):
+            return np.empty((0, 2), dtype=float)
+        return np.column_stack((onv[ok], offv[ok]))
+
+    iv1 = _pair_intervals(p1, po1)
+    iv2 = _pair_intervals(p2, po2)
+    Pulse_intervals = np.vstack([iv1, iv2]) if (iv1.size or iv2.size) else np.empty((0, 2), dtype=float)
+    if Pulse_intervals.size:
+        Pulse_intervals = Pulse_intervals[np.argsort(Pulse_intervals[:, 0])]
 
     trig_win_s = 0.35
+    trig_win_off_s = 0.35
+    trig_interval_pre_s = 0.05
+    trig_interval_post_s = 0.15
+    assoc_tail_s = 0.20
     assoc_min_delay_s = 0.20
     n_up = int(min(len(UP_start_i), len(DOWN_start_i)))
     mask_assoc = np.zeros(n_up, dtype=bool)
     mask_trig = np.zeros(n_up, dtype=bool)
 
-    if Pulse_times_array.size and n_up:
-        for i in range(n_up):
-            u = int(UP_start_i[i])
-            d = int(DOWN_start_i[i])
-            t_up = float(t_feat[u])
-            t_dn = float(t_feat[d])
+    if n_up:
+        up_times = np.asarray(t_feat[UP_start_i[:n_up]], float)
+        dn_times = np.asarray(t_feat[DOWN_start_i[:n_up]], float)
 
-            has_near = np.any(
-                (Pulse_times_array >= (t_up - trig_win_s)) &
-                (Pulse_times_array <= (t_up + trig_win_s))
-            )
-            has_assoc_late = np.any(
-                (Pulse_times_array >= (t_up + assoc_min_delay_s)) &
-                (Pulse_times_array <= t_dn)
-            )
+        # Pulse-zentrierte Zuordnung:
+        # Pro Puls max. ein triggered-UP (erstes UP im Pulsfenster),
+        # weitere UPs im Pulsfenster -> associated.
+        if Pulse_intervals.size:
+            for on_t, off_t in Pulse_intervals:
+                trig_lo = float(on_t) - trig_interval_pre_s
+                trig_hi = float(off_t) + trig_interval_post_s
+                trig_cand = np.where(
+                    (~mask_trig) & (~mask_assoc) &
+                    (up_times >= trig_lo) & (up_times <= trig_hi)
+                )[0]
+                trig_idx = None
+                if trig_cand.size:
+                    trig_idx = int(trig_cand[0])
+                    mask_trig[trig_idx] = True
 
-            if has_near:
-                mask_trig[i] = True
-            elif has_assoc_late:
-                mask_assoc[i] = True
+                assoc_lo = float(on_t) + assoc_min_delay_s
+                assoc_hi = float(off_t) + assoc_tail_s
+                assoc_cand = np.where(
+                    (~mask_trig) &
+                    (up_times >= assoc_lo) & (up_times <= assoc_hi)
+                )[0]
+                if assoc_cand.size:
+                    mask_assoc[assoc_cand] = True
+                if trig_idx is not None:
+                    mask_assoc[trig_idx] = False
+
+        # Fallback fuer verbleibende UPs (z. B. wenn keine gueltigen Intervalle vorliegen)
+        if Pulse_times_array.size:
+            open_idx = np.where(~(mask_trig | mask_assoc))[0]
+            for i in open_idx:
+                t_up = float(up_times[i])
+                t_dn = float(dn_times[i])
+
+                has_near_on = np.any(
+                    (Pulse_times_array >= (t_up - trig_win_s)) &
+                    (Pulse_times_array <= (t_up + trig_win_s))
+                )
+                has_near_off = np.any(
+                    (Pulse_off_array >= (t_up - trig_win_off_s)) &
+                    (Pulse_off_array <= (t_up + trig_win_off_s))
+                )
+                has_assoc_late = np.any(
+                    (Pulse_times_array >= (t_up + assoc_min_delay_s)) &
+                    (Pulse_times_array <= t_dn)
+                )
+
+                if has_near_on or has_near_off:
+                    mask_trig[i] = True
+                elif has_assoc_late:
+                    mask_assoc[i] = True
 
     # paar-konsistente Klassen
     Pulse_associated_UP = UP_start_i[:n_up][mask_assoc]
@@ -499,7 +563,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     print(
         f"[CLASSIFY] total={n_up} spont={len(Spontaneous_UP)} "
         f"trig={len(Pulse_triggered_UP)} assoc={len(Pulse_associated_UP)} "
-        f"(trig_win={trig_win_s:.2f}s, assoc_delay={assoc_min_delay_s:.2f}s)"
+        f"(trig_win={trig_win_s:.2f}s, assoc_delay={assoc_min_delay_s:.2f}s, intervals={len(Pulse_intervals)})"
     )
 
     # 8) Dauer/Stats
