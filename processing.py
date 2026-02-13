@@ -457,7 +457,7 @@ def pulse_to_up_latencies(pulse_times, up_indices, time_s, max_win_s=1.0):
 def upstate_amplitude_compare_ax(
     spont_amp, trig_amp,
     ax=None,
-    title="UP Amplitude (max-min): Spontan vs. Getriggert"
+    title="UP Amplitude (max-min, mean): Spontan vs. Getriggert"
 ):
 
     spont_amp = np.asarray(spont_amp, float)
@@ -479,7 +479,19 @@ def upstate_amplitude_compare_ax(
         ax.set_axis_off()
         return fig
 
-    ax.boxplot(data, labels=labels, whis=[5, 95], showfliers=False)
+    means = [float(np.nanmean(d)) for d in data]
+    x = np.arange(1, len(data) + 1, dtype=float)
+    bars = ax.bar(x, means, width=0.55, color=["#4C78A8", "#F58518"][:len(data)], alpha=0.85)
+    for i, d in enumerate(data):
+        ax.text(
+            x[i],
+            means[i],
+            f"  n={len(d)}\n  mean={means[i]:.2f}",
+            va="bottom",
+            ha="left",
+            fontsize=8,
+        )
+    ax.set_xticks(x, labels)
     ax.set_ylabel(f"Amplitude ({UNIT_LABEL})")
     ax.set_title(title)
     ax.grid(alpha=0.15, linestyle=":")

@@ -165,7 +165,7 @@ def export_interactive_lfp_html(
 
     _add_pulses(pulse_times_1, "dot")
     _add_pulses(pulse_times_2, "dash")
-        # --- Pulse-OFF-Linien (Offsets) in dunklerem Rot
+        # --- Pulse-OFF-Linien (Offsets) in Rot
 
     def _add_pulse_offs(ts, dash):
         if ts is None or len(ts) == 0:
@@ -180,7 +180,7 @@ def export_interactive_lfp_html(
                 y0=0, y1=1,
                 xref="x", yref="paper",
                 opacity=0.55,
-                line=dict(width=1, dash=dash, color="darkred")
+                line=dict(width=1, dash=dash, color="red")
             ))
 
     _add_pulse_offs(pulse_times_1_off, "dot")
@@ -242,7 +242,7 @@ def export_interactive_lfp_html(
     #                              name="Pulse 1"))
     if pulse_times_1_off is not None and len(pulse_times_1_off):
         fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-                                 line=dict(width=1, dash="dot", color="darkred"),
+                                 line=dict(width=1, dash="dot", color="red"),
                                  name="Pulse 1 OFF"))
     # if pulse_times_2 is not None and len(pulse_times_2):
     #     fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
@@ -267,11 +267,11 @@ def export_interactive_lfp_html(
             # RICHTIG: nimm den Parameter pulse_times_1
     if pulse_times_1 is not None and len(pulse_times_1):
         for x in pulse_times_1:
-            fig.add_vline(x=float(x), line_width=3, line_dash="solid")
+            fig.add_vline(x=float(x), line_width=3, line_dash="solid", line_color="red")
 
     if pulse_times_1_off is not None and len(pulse_times_1_off):
         for x in pulse_times_1_off:
-            fig.add_vline(x=float(x), line_width=2, line_dash="dot")
+            fig.add_vline(x=float(x), line_width=2, line_dash="dot", line_color="red")
 
 
     out_html = os.path.join(save_dir, f"{base_tag}__lfp_interactive.html")

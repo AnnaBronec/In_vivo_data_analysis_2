@@ -416,23 +416,30 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     if up_transitions.size > down_transitions.size:
         up_transitions = up_transitions[:-1]
 
-    min_up_len_s = 0.7
+    min_up_len_s = 1.0
     if not up_transitions.size or not down_transitions.size:
         UP_start_i = np.array([], dtype=int)
         DOWN_start_i = np.array([], dtype=int)
     else:
         filtered_UP = []
         filtered_DOWN = []
+        rejected_short = 0
         for u, d in zip(up_transitions, down_transitions):
-            # duration = time_s[d] - time_s[u]
             duration = t_feat[d] - t_feat[u]
+            if duration < min_up_len_s:
+                rejected_short += 1
+                continue
 
-            if duration >= min_up_len_s:
-                filtered_UP.append(u)
-                filtered_DOWN.append(d)
+            filtered_UP.append(u)
+            filtered_DOWN.append(d)
 
         UP_start_i = np.array(filtered_UP, dtype=int)
         DOWN_start_i = np.array(filtered_DOWN, dtype=int)
+        print(
+            f"[UP-FILTER] kept={len(UP_start_i)} "
+            f"drop_short={rejected_short} "
+            f"(min_len={min_up_len_s:.2f}s)"
+        )
 
     # 6) NO-UP Gate
     min_up_fraction = 0.03

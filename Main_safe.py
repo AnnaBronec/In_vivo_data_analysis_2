@@ -1771,7 +1771,7 @@ amp_svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_amplitude_compare.sv
 fig_amp, ax_amp = plt.subplots(figsize=(6.5, 3.4))
 upstate_amplitude_compare_ax(
     spont_amp, trig_amp, ax=ax_amp,
-    title="UP Amplitude (max-min): Spontan vs. Getriggert"
+    title="UP Amplitude (max-min, mean): Spontan vs. Getriggert"
 )
 fig_amp.tight_layout()
 fig_amp.savefig(amp_svg_path, format="svg", bbox_inches="tight")
@@ -2438,7 +2438,7 @@ def plot_up_classification_ax(
         )
 
     _vlines(pulse_times_1, ":", "Pulse 1", color="red")
-    _vlines(pulse_times_2, ":", "Pulse 2", color="blue")
+    _vlines(pulse_times_2, ":", "Pulse 2", color="red")
 
 
     # 6) optionale Peaks
@@ -4691,7 +4691,7 @@ layout_rows = [
     # ========================================================
     [lambda ax: upstate_amplitude_compare_ax(
         spont_amp, trig_amp, ax=ax,
-        title="UP Amplitude (max-min): Spontan vs. Getriggert"
+        title="UP Amplitude (max-min, mean): Spontan vs. Getriggert"
     )],
 
     # ========================================================
