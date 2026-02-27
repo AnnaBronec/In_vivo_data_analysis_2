@@ -416,7 +416,8 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     if up_transitions.size > down_transitions.size:
         up_transitions = up_transitions[:-1]
 
-    min_up_len_s = 1.0
+    # Keep short but valid UP states; 1.0 s was too strict for many sessions.
+    min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", "0.30"))
     if not up_transitions.size or not down_transitions.size:
         UP_start_i = np.array([], dtype=int)
         DOWN_start_i = np.array([], dtype=int)
@@ -490,12 +491,35 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     if Pulse_intervals.size:
         Pulse_intervals = Pulse_intervals[np.argsort(Pulse_intervals[:, 0])]
 
-    trig_win_s = 0.35
-    trig_win_off_s = 0.35
-    trig_interval_pre_s = 0.05
-    trig_interval_post_s = 0.15
-    assoc_tail_s = 0.20
-    assoc_min_delay_s = 0.20
+    trig_win_s = float(os.environ.get("TRIG_WIN_S", "0.35"))
+    trig_win_off_s = float(os.environ.get("TRIG_WIN_OFF_S", "0.35"))
+    # Causal default: no pre-onset allowance for "triggered" UP states.
+    trig_interval_pre_s = float(os.environ.get("TRIG_INTERVAL_PRE_S", "0.00"))
+    trig_interval_post_s = float(os.environ.get("TRIG_INTERVAL_POST_S", "0.15"))
+    assoc_tail_s = float(os.environ.get("ASSOC_TAIL_S", "0.20"))
+    assoc_min_delay_s = float(os.environ.get("ASSOC_MIN_DELAY_S", "0.20"))
+    assoc_enable = os.environ.get("ASSOC_ENABLE", "1") == "1"
+    assoc_onset_max_s = float(os.environ.get("ASSOC_ONSET_MAX_S", "0.80"))
+    assoc_interval_max_width_s = float(os.environ.get("ASSOC_INTERVAL_MAX_WIDTH_S", "1.50"))
+    assoc_interval_min_count = int(os.environ.get("ASSOC_INTERVAL_MIN_COUNT", "5"))
+
+    interval_widths = np.array([], dtype=float)
+    if Pulse_intervals.size:
+        interval_widths = np.asarray(Pulse_intervals[:, 1] - Pulse_intervals[:, 0], float)
+        interval_widths = interval_widths[np.isfinite(interval_widths) & (interval_widths > 0)]
+    med_int_w = float(np.median(interval_widths)) if interval_widths.size else np.nan
+    intervals_reliable = (
+        interval_widths.size >= assoc_interval_min_count and
+        np.isfinite(med_int_w) and
+        (med_int_w <= assoc_interval_max_width_s)
+    )
+
+    if Pulse_intervals.size and not intervals_reliable:
+        print(
+            "[CLASSIFY] interval-based association disabled: "
+            f"n_widths={interval_widths.size}, med_width={med_int_w if np.isfinite(med_int_w) else np.nan:.3f}s"
+        )
+
     n_up = int(min(len(UP_start_i), len(DOWN_start_i)))
     mask_assoc = np.zeros(n_up, dtype=bool)
     mask_trig = np.zeros(n_up, dtype=bool)
@@ -507,7 +531,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         # Pulse-zentrierte Zuordnung:
         # Pro Puls max. ein triggered-UP (erstes UP im Pulsfenster),
         # weitere UPs im Pulsfenster -> associated.
-        if Pulse_intervals.size:
+        if assoc_enable and Pulse_intervals.size and intervals_reliable:
             for on_t, off_t in Pulse_intervals:
                 trig_lo = float(on_t) - trig_interval_pre_s
                 trig_hi = float(off_t) + trig_interval_post_s
@@ -546,9 +570,10 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                     (Pulse_off_array >= (t_up - trig_win_off_s)) &
                     (Pulse_off_array <= (t_up + trig_win_off_s))
                 )
-                has_assoc_late = np.any(
+                assoc_hi = min(t_dn, t_up + assoc_onset_max_s)
+                has_assoc_late = assoc_enable and np.any(
                     (Pulse_times_array >= (t_up + assoc_min_delay_s)) &
-                    (Pulse_times_array <= t_dn)
+                    (Pulse_times_array <= assoc_hi)
                 )
 
                 if has_near_on or has_near_off:
@@ -570,7 +595,9 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     print(
         f"[CLASSIFY] total={n_up} spont={len(Spontaneous_UP)} "
         f"trig={len(Pulse_triggered_UP)} assoc={len(Pulse_associated_UP)} "
-        f"(trig_win={trig_win_s:.2f}s, assoc_delay={assoc_min_delay_s:.2f}s, intervals={len(Pulse_intervals)})"
+        f"(trig_win={trig_win_s:.2f}s, assoc_delay={assoc_min_delay_s:.2f}s, "
+        f"assoc_enable={assoc_enable}, intervals={len(Pulse_intervals)}, "
+        f"intervals_reliable={intervals_reliable})"
     )
 
     # 8) Dauer/Stats

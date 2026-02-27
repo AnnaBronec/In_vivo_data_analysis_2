@@ -1,4 +1,3 @@
-import csv
 import os
 import numpy as np
 import matplotlib
@@ -11,24 +10,7 @@ except Exception:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm, SymLogNorm
-from matplotlib.gridspec import GridSpec
-from tempfile import TemporaryFile
-import pandas as pd
-from scipy import signal
-#from scipy.optimize import curve_fit
-from TimeFreq_plot import Run_spectrogram
-from CSD import CSD_calc
-import seaborn as sns
-from scipy.signal import find_peaks
-import scipy.stats as stats
 from scipy.ndimage import gaussian_filter
-import random
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from preprocessing import downsampling, filtering
-from state_detection import classify_states
-from loader import load_lightpulses
 
 def plot_all_channels(num_channels: int, time_s, LFP_array):
     fig, axs = plt.subplots(num_channels, 1, figsize=(12, 2 * num_channels), sharex=True)
@@ -99,37 +81,44 @@ def Total_power_plot(Spect_dat):
 
 
 def plot_upstate_amplitudes(main_channel, UP_start_i, DOWN_start_i, start_idx, end_idx):
-    assert 1 <= start_idx <= end_idx <= len(UP_start_i), "Ungültiger Indexbereich."
+    if not (1 <= start_idx <= end_idx <= len(UP_start_i)):
+        raise ValueError(
+            f"Ungültiger Indexbereich: start_idx={start_idx}, end_idx={end_idx}, n_up={len(UP_start_i)}"
+        )
     indices = list(range(start_idx, end_idx + 1))
     amplitudes = []
     for i in range(start_idx - 1, end_idx):
         up = UP_start_i[i]; down = DOWN_start_i[i]
         if down > up and down < len(main_channel):
             segment = main_channel[up:down]
-            amplitudes.append(np.mean(np.abs(segment)))
+            amplitudes.append(float(np.nanmax(segment) - np.nanmin(segment)))
         else:
             amplitudes.append(np.nan)
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.bar(indices, amplitudes, color='mediumseagreen')
-    ax.set_xlabel("UP-State Index"); ax.set_ylabel("Ø Amplitude")
-    ax.set_title(f"Mittlere Amplituden der UP-Zustände {start_idx}–{end_idx}")
+    ax.set_xlabel("UP-State Index"); ax.set_ylabel("Amplitude (max-min)")
+    ax.set_title(f"UP-Amplituden (max-min) {start_idx}–{end_idx}")
     ax.set_xticks(indices); ax.grid(axis='y', linestyle='--', alpha=0.5)
     fig.tight_layout()
     return fig
 
 def plot_upstate_amplitude_mean(main_channel, UP_start_i, DOWN_start_i, start_idx, end_idx):
-    assert 1 <= start_idx <= end_idx <= len(UP_start_i), "Ungültiger Indexbereich."
+    if not (1 <= start_idx <= end_idx <= len(UP_start_i)):
+        raise ValueError(
+            f"Ungültiger Indexbereich: start_idx={start_idx}, end_idx={end_idx}, n_up={len(UP_start_i)}"
+        )
     amplitudes = []
     for i in range(start_idx - 1, end_idx):
         up = UP_start_i[i]; down = DOWN_start_i[i]
         if down > up and down < len(main_channel):
-            amplitudes.append(np.mean(np.abs(main_channel[up:down])))
+            seg = main_channel[up:down]
+            amplitudes.append(float(np.nanmax(seg) - np.nanmin(seg)))
     fig = None
     if amplitudes:
         avg_amp = np.mean(amplitudes)
         fig, ax = plt.subplots(figsize=(4, 5))
         ax.bar([f"UPs {start_idx}-{end_idx}"], [avg_amp], color='mediumslateblue')
-        ax.set_ylabel("Ø Amplitude"); ax.set_title("Durchschnittliche Amplitude")
+        ax.set_ylabel("Amplitude (max-min)"); ax.set_title("Durchschnittliche UP-Amplitude (max-min)")
         fig.tight_layout()
         print(f"✅ Durchschnittliche Amplitude von UPs {start_idx}–{end_idx}: {avg_amp:.4f}")
     else:
@@ -139,12 +128,16 @@ def plot_upstate_amplitude_mean(main_channel, UP_start_i, DOWN_start_i, start_id
 def plot_upstate_amplitude_blocks_colored(main_channel, UP_start_i, DOWN_start_i, index_blocks, filename):
     block_labels, block_means, block_colors, block_legend_labels = [], [], [], []
     for idx, (start_idx, end_idx) in enumerate(index_blocks):
-        assert 1 <= start_idx <= end_idx <= len(UP_start_i), f"Ungültiger Bereich: {start_idx}-{end_idx}"
+        if not (1 <= start_idx <= end_idx <= len(UP_start_i)):
+            raise ValueError(
+                f"Ungültiger Bereich: start_idx={start_idx}, end_idx={end_idx}, n_up={len(UP_start_i)}"
+            )
         amps = []
         for i in range(start_idx - 1, end_idx):
             up = UP_start_i[i]; down = DOWN_start_i[i]
             if down > up and down < len(main_channel):
-                amps.append(np.mean(np.abs(main_channel[up:down])))
+                seg = main_channel[up:down]
+                amps.append(float(np.nanmax(seg) - np.nanmin(seg)))
         mean_amp = np.mean(amps) if amps else np.nan
         block_means.append(mean_amp)
         block_labels.append(f"{start_idx}-{end_idx}")
@@ -160,8 +153,8 @@ def plot_upstate_amplitude_blocks_colored(main_channel, UP_start_i, DOWN_start_i
         if label not in seen:
             bar.set_label(label); seen.add(label)
     ax.set_xlabel("UP-Bereich (Index)")
-    ax.set_ylabel("Ø Amplitude")
-    ax.set_title("Vergleich mittlerer Amplituden: violet vs. orange light")
+    ax.set_ylabel("Amplitude (max-min)")
+    ax.set_title("Vergleich mittlerer UP-Amplituden (max-min): violet vs. orange light")
     if filename: fig.suptitle(f"Datei: {filename}", fontsize=10, y=0.98)
     ax.legend(); ax.grid(axis='y', linestyle='--', alpha=0.4)
     fig.tight_layout()

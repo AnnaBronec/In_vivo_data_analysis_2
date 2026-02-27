@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import json
 import numpy as np
 import numpy as _np 
 import re
@@ -14,10 +15,7 @@ from scipy import signal
 from matplotlib.colors import TwoSlopeNorm
 import gc
 from glob import glob
-from scipy.ndimage import gaussian_filter
-from sklearn.decomposition import PCA
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.patches import Patch
 from loader_old import load_LFP_new, read_nev_timestamps_and_ttl, ttl_to_on_off
 from matplotlib import gridspec
 from scipy.signal import welch
@@ -25,7 +23,7 @@ try:
     from preprocessing import downsampling_old as _ds_fun
 except ImportError:
     from preprocessing import downsampling as _ds_fun
-from preprocessing import filtering, get_main_channel, pre_post_condition
+from preprocessing import filtering, pre_post_condition
 from TimeFreq_plot import Run_spectrogram
 from state_detection import (
     classify_states, extract_upstate_windows,
@@ -33,10 +31,6 @@ from state_detection import (
 )
 from pathlib import Path
 from plotter import (
-    plot_all_channels,
-    plot_spont_up_mean,
-    plot_upstate_duration_comparison,
-    plot_upstate_amplitude_blocks_colored,
     CSD_compare_side_by_side_ax,
     _blank_ax,
     compute_refrac_from_spont_to_spon_and_trig,
@@ -50,7 +44,6 @@ from Exports import (
 )
 from processing import (
     _counts_to_uV, _volts_to_uV, 
-    convert_df_to_uV, _decimate_xy, 
     _ensure_main_channel,
     _ensure_seconds, 
     _safe_crop_to_pulses,
@@ -58,8 +51,6 @@ from processing import (
     _clip_pairs,
     _clip_events_to_bounds,
     _upstate_amplitudes,
-    _sem,
-    _even_subsample,
     _check_peak_indices,
     crop_up_intervals,
     compute_refractory_period,
@@ -69,7 +60,6 @@ from processing import (
     pulse_to_up_latency_hist_ax,
     upstate_duration_compare_ax,
     refractory_compare_ax,
-    CSD_single_panel_ax,
     _as_valid_idx,
     _build_rollups,
     )
@@ -90,6 +80,8 @@ CLUSTER_N_PERM = int(os.environ.get("CLUSTER_N_PERM", "800"))
 CLUSTER_ENABLE = os.environ.get("CLUSTER_ENABLE", "0") == "1"
 AUTO_PULSE_EDGE_SHIFT = os.environ.get("AUTO_PULSE_EDGE_SHIFT", "0") == "1"
 AUTO_CLEAR_TINY_OFFSETS = os.environ.get("AUTO_CLEAR_TINY_OFFSETS", "0") == "1"
+AUTO_PULSE_ARTIFACT_ALIGN = os.environ.get("AUTO_PULSE_ARTIFACT_ALIGN", "0") == "1"
+FORCE_ONSET_ONLY_PLOTS = os.environ.get("FORCE_ONSET_ONLY_PLOTS", "1") == "1"
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
 
@@ -1361,6 +1353,48 @@ def _shift_times(ts, shift_s):
         return None
     return np.asarray(ts, float) - float(shift_s)
 
+def _apply_time_shift(ts, shift_s):
+    if ts is None:
+        return None
+    return np.asarray(ts, float) + float(shift_s)
+
+def _estimate_pulse_artifact_shift(main_channel, time_s, pulse_times, dt, search_s=0.6, min_pulses=5):
+    x = np.asarray(main_channel, float).reshape(-1)
+    t = np.asarray(time_s, float).reshape(-1)
+    p = np.asarray(pulse_times if pulse_times is not None else [], float)
+    p = p[np.isfinite(p)]
+    if x.size != t.size or t.size < 10 or p.size < int(min_pulses) or dt <= 0:
+        return np.nan, np.nan, 0
+
+    n = int(round(float(search_s) / float(dt)))
+    if n < 5:
+        return np.nan, np.nan, 0
+
+    profs = []
+    for pt in p:
+        c = int(np.searchsorted(t, float(pt), side="left"))
+        s = c - n
+        e = c + n + 1
+        if s < 0 or e > x.size:
+            continue
+        seg = x[s:e]
+        if seg.size != (2 * n + 1) or not np.isfinite(seg).any():
+            continue
+        d = np.abs(np.gradient(np.nan_to_num(seg, nan=float(np.nanmedian(seg)))))
+        scale = float(np.nanpercentile(d, 95)) if np.isfinite(d).any() else np.nan
+        if not np.isfinite(scale) or scale <= 1e-12:
+            continue
+        profs.append(d / scale)
+
+    if len(profs) < int(min_pulses):
+        return np.nan, np.nan, len(profs)
+
+    prof = np.nanmedian(np.vstack(profs), axis=0)
+    i_peak = int(np.nanargmax(prof))
+    lag_s = float((i_peak - n) * dt)
+    conf = float(prof[i_peak] / max(float(np.nanmedian(prof)), 1e-12))
+    return lag_s, conf, len(profs)
+
 
 
 pulse_times_1 = _clip_events_to_bounds(pulse_times_1, time_s, align_pre_s, align_post_s)
@@ -1368,6 +1402,33 @@ pulse_times_2 = _clip_events_to_bounds(pulse_times_2, time_s, align_pre_s, align
 
 pulse_times_1_off = _clip_events_to_bounds(pulse_times_1_off, time_s, align_pre_s, align_post_s)
 pulse_times_2_off = _clip_events_to_bounds(pulse_times_2_off, time_s, align_pre_s, align_post_s)
+
+# Optional: align pulse times to LFP artifact if a consistent global lag exists.
+if AUTO_PULSE_ARTIFACT_ALIGN and pulse_times_1 is not None and len(pulse_times_1) >= 5:
+    lag_s, conf, n_used = _estimate_pulse_artifact_shift(
+        main_channel, time_s, pulse_times_1, dt, search_s=0.6, min_pulses=5
+    )
+    if np.isfinite(lag_s) and np.isfinite(conf):
+        # Apply only if lag is meaningful and profile has a clear dominant peak.
+        if abs(float(lag_s)) >= 0.03 and abs(float(lag_s)) <= 0.8 and float(conf) >= 1.4:
+            pulse_times_1 = _apply_time_shift(pulse_times_1, lag_s)
+            pulse_times_2 = _apply_time_shift(pulse_times_2, lag_s)
+            pulse_times_1_off = _apply_time_shift(pulse_times_1_off, lag_s)
+            pulse_times_2_off = _apply_time_shift(pulse_times_2_off, lag_s)
+            pulse_times_1_full = _apply_time_shift(pulse_times_1_full, lag_s)
+            pulse_times_2_full = _apply_time_shift(pulse_times_2_full, lag_s)
+            pulse_times_1_off_full = _apply_time_shift(pulse_times_1_off_full, lag_s)
+            pulse_times_2_off_full = _apply_time_shift(pulse_times_2_off_full, lag_s)
+
+            pulse_times_1 = _clip_events_to_bounds(pulse_times_1, time_s, align_pre_s, align_post_s)
+            pulse_times_2 = _clip_events_to_bounds(pulse_times_2, time_s, align_pre_s, align_post_s)
+            pulse_times_1_off = _clip_events_to_bounds(pulse_times_1_off, time_s, align_pre_s, align_post_s)
+            pulse_times_2_off = _clip_events_to_bounds(pulse_times_2_off, time_s, align_pre_s, align_post_s)
+            print(f"[PULSE-ALIGN] applied global shift={lag_s:+.4f}s (conf={conf:.2f}, n={n_used})")
+        else:
+            print(f"[PULSE-ALIGN] skip shift={lag_s:+.4f}s (conf={conf:.2f}, n={n_used})")
+    else:
+        print("[PULSE-ALIGN] skipped: could not estimate robust lag")
 
 
 log(f"Calling classify_states: len(time_s)={len(time_s)}, main_len={len(main_channel)}, dt={dt}, p1={len(pulse_times_1) if pulse_times_1 is not None else 0}, p2={len(pulse_times_2) if pulse_times_2 is not None else 0}")
@@ -1803,18 +1864,19 @@ def detect_spindle_intervals_in_upstates(
     *,
     f_lo=10.0,
     f_hi=15.0,
-    thr_k_on=2.5,
-    thr_k_off=1.5,
-    min_dur_s=0.5,
-    max_dur_s=2.0,
-    max_gap_s=0.02,
-    min_cycles=2,
+    thr_k_on=1.4,
+    thr_k_off=0.7,
+    min_dur_s=0.35,
+    max_dur_s=3.0,
+    max_gap_s=0.12,
+    min_cycles=1,
     min_spindle_band_power_ratio=1.2,
     min_spindle_power_fraction=0.12,
-    min_env_peak_quantile=0.50,
-    min_env_peak_sigma=2.5,
+    min_env_peak_quantile=0.10,
+    min_env_peak_sigma=1.2,
     only_in_upstates=False,
     use_psd_check=False,
+    causal_filter=True,
 ):
     x = np.asarray(signal_1d, float).reshape(-1)
     t = np.asarray(time_s, float).reshape(-1)
@@ -1830,8 +1892,12 @@ def detect_spindle_intervals_in_upstates(
 
     x0 = np.nan_to_num(x, nan=float(np.nanmedian(x)))
     try:
-        b, a = signal.butter(3, [lo / nyq, hi / nyq], btype="bandpass")
-        xb = signal.filtfilt(b, a, x0)
+        if causal_filter:
+            sos = signal.butter(3, [lo / nyq, hi / nyq], btype="bandpass", output="sos")
+            xb = signal.sosfilt(sos, x0)
+        else:
+            b, a = signal.butter(3, [lo / nyq, hi / nyq], btype="bandpass")
+            xb = signal.filtfilt(b, a, x0)
         env = np.abs(signal.hilbert(xb))
     except Exception:
         return []
@@ -1950,14 +2016,257 @@ def detect_spindle_intervals_in_upstates(
     return out
 
 
+def _bandpass_1d(signal_1d, dt, f_lo=10.0, f_hi=15.0, order=3, causal=True):
+    x = np.asarray(signal_1d, float).reshape(-1)
+    if x.size < 10 or dt <= 0:
+        return x.copy()
+    fs = 1.0 / float(dt)
+    nyq = 0.5 * fs
+    lo = max(0.5, float(f_lo))
+    hi = min(float(f_hi), 0.95 * nyq)
+    if lo >= hi:
+        return x.copy()
+    x0 = np.nan_to_num(x, nan=float(np.nanmedian(x)))
+    try:
+        if causal:
+            sos = signal.butter(int(order), [lo / nyq, hi / nyq], btype="bandpass", output="sos")
+            return signal.sosfilt(sos, x0)
+        b, a = signal.butter(int(order), [lo / nyq, hi / nyq], btype="bandpass")
+        return signal.filtfilt(b, a, x0)
+    except Exception as e:
+        print(f"[WARN] bandpass {f_lo}-{f_hi} Hz failed: {e}")
+        return x.copy()
+
+
+def _pair_idx_to_time_intervals(idx_pairs, time_s):
+    t = np.asarray(time_s, float)
+    out = []
+    for u, d in idx_pairs:
+        if 0 <= u < t.size and 0 < d <= t.size and d > u:
+            out.append((float(t[u]), float(t[d - 1])))
+    return out
+
+
+def _time_intervals_to_idx_pairs(intervals_s, time_s):
+    t = np.asarray(time_s, float)
+    up_idx = []
+    down_idx = []
+    if t.size < 2:
+        return np.array([], int), np.array([], int)
+    for t0, t1 in intervals_s:
+        if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+            continue
+        s = int(np.searchsorted(t, float(t0), side="left"))
+        e = int(np.searchsorted(t, float(t1), side="right"))
+        s = max(0, min(s, t.size - 1))
+        e = max(s + 1, min(e, t.size))
+        # Ensure at least 2 samples so shaded spans are visible in index-based plotting.
+        if (e - s) < 2:
+            e = min(t.size, s + 2)
+        if (e - s) >= 2:
+            up_idx.append(s)
+            down_idx.append(e)
+    return np.asarray(up_idx, int), np.asarray(down_idx, int)
+
+
+def _intervals_overlap(a0, a1, b0, b1):
+    return (a0 < b1) and (a1 > b0)
+
+
+def _classify_spindles_by_pulse_latency(
+    spindle_intervals_s,
+    pulse_times_s,
+    *,
+    trig_win_s=1.0,
+    min_lat_s=0.0,
+):
+    pulses = np.asarray(pulse_times_s, float) if pulse_times_s is not None else np.array([], float)
+    pulses = pulses[np.isfinite(pulses)]
+    pulses.sort()
+
+    spont = []
+    trig = []
+    trig_latencies = []
+
+    for t0, t1 in spindle_intervals_s:
+        if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+            continue
+
+        # Pulse-orientiert: Klassifikation über Latenz des Spindle-Onsets zum letzten Puls.
+        if pulses.size == 0:
+            spont.append((float(t0), float(t1)))
+            continue
+
+        j = int(np.searchsorted(pulses, float(t0), side="right")) - 1
+        if j < 0:
+            spont.append((float(t0), float(t1)))
+            continue
+
+        lat = float(t0 - pulses[j])
+        if float(min_lat_s) <= lat <= float(trig_win_s):
+            trig.append((float(t0), float(t1)))
+            trig_latencies.append(lat)
+        else:
+            spont.append((float(t0), float(t1)))
+
+    return spont, trig, np.asarray(trig_latencies, float)
+
+
+def _classify_spindles_by_pulse_peak_latency(
+    spindle_intervals_s,
+    pulse_times_s,
+    spindle_signal,
+    time_s,
+    *,
+    trig_win_s=0.7,
+    min_lat_s=0.10,
+):
+    pulses = np.asarray(pulse_times_s, float) if pulse_times_s is not None else np.array([], float)
+    pulses = pulses[np.isfinite(pulses)]
+    pulses.sort()
+
+    sig = np.asarray(spindle_signal, float).reshape(-1)
+    t = np.asarray(time_s, float).reshape(-1)
+    if sig.size != t.size or t.size == 0:
+        return [], [], np.array([], float), np.array([], float)
+
+    spont = []
+    trig = []
+    trig_latencies = []
+    peak_times = []
+
+    for t0, t1 in spindle_intervals_s:
+        if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+            continue
+
+        s = int(np.searchsorted(t, float(t0), side="left"))
+        e = int(np.searchsorted(t, float(t1), side="right"))
+        s = max(0, min(s, t.size - 1))
+        e = max(s + 1, min(e, t.size))
+
+        seg = sig[s:e]
+        if seg.size == 0 or not np.isfinite(seg).any():
+            t_peak = float(0.5 * (t0 + t1))
+        else:
+            i_peak_rel = int(np.nanargmax(np.abs(seg)))
+            t_peak = float(t[s + i_peak_rel])
+        peak_times.append(t_peak)
+
+        if pulses.size == 0:
+            spont.append((float(t0), float(t1)))
+            continue
+
+        j = int(np.searchsorted(pulses, t_peak, side="right")) - 1
+        if j < 0:
+            spont.append((float(t0), float(t1)))
+            continue
+
+        lat = float(t_peak - pulses[j])
+        if float(min_lat_s) <= lat <= float(trig_win_s):
+            # Enforce causal onset for triggered class in plots/metrics:
+            # triggered spindle intervals are clipped to start no earlier than pulse reference + min_lat.
+            t0_trig = max(float(t0), float(pulses[j]) + float(min_lat_s))
+            if t1 > t0_trig:
+                trig.append((t0_trig, float(t1)))
+            else:
+                # Degenerate after clipping -> keep as spontaneous.
+                spont.append((float(t0), float(t1)))
+            trig_latencies.append(lat)
+        else:
+            spont.append((float(t0), float(t1)))
+
+    return spont, trig, np.asarray(trig_latencies, float), np.asarray(peak_times, float)
+
+
+def _classify_spindles_by_up_type(spindle_intervals_s, spont_up_s, trig_up_s, assoc_up_s):
+    spont = []
+    trig = []
+    assoc = []
+    other = []
+    for t0, t1 in spindle_intervals_s:
+        if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+            continue
+        hit_assoc = any(_intervals_overlap(t0, t1, a0, a1) for a0, a1 in assoc_up_s)
+        hit_trig = any(_intervals_overlap(t0, t1, a0, a1) for a0, a1 in trig_up_s)
+        hit_sp = any(_intervals_overlap(t0, t1, a0, a1) for a0, a1 in spont_up_s)
+        if hit_assoc:
+            assoc.append((float(t0), float(t1)))
+        elif hit_trig:
+            trig.append((float(t0), float(t1)))
+        elif hit_sp:
+            spont.append((float(t0), float(t1)))
+        else:
+            other.append((float(t0), float(t1)))
+    return spont, trig, assoc, other
+
+
+def _interval_peak_to_peak(signal_1d, intervals_s, time_s):
+    sig = np.asarray(signal_1d, float).reshape(-1)
+    t = np.asarray(time_s, float).reshape(-1)
+    amps = []
+    for t0, t1 in intervals_s:
+        s = int(np.searchsorted(t, float(t0), side="left"))
+        e = int(np.searchsorted(t, float(t1), side="right"))
+        s = max(0, min(s, sig.size - 1))
+        e = max(s + 1, min(e, sig.size))
+        seg = sig[s:e]
+        seg = seg[np.isfinite(seg)]
+        if seg.size:
+            amps.append(float(np.nanmax(seg) - np.nanmin(seg)))
+    return np.asarray(amps, float)
+
+
+spont_up_pairs = _pair_up_down_indices(Spontaneous_UP, Spontaneous_DOWN, len(time_s))
+trig_up_pairs = _pair_up_down_indices(Pulse_triggered_UP, Pulse_triggered_DOWN, len(time_s))
+assoc_up_pairs = _pair_up_down_indices(Pulse_associated_UP, Pulse_associated_DOWN, len(time_s))
+
 all_up_pairs = []
-all_up_pairs += _pair_up_down_indices(Spontaneous_UP, Spontaneous_DOWN, len(time_s))
-all_up_pairs += _pair_up_down_indices(Pulse_triggered_UP, Pulse_triggered_DOWN, len(time_s))
-all_up_pairs += _pair_up_down_indices(Pulse_associated_UP, Pulse_associated_DOWN, len(time_s))
+all_up_pairs += spont_up_pairs
+all_up_pairs += trig_up_pairs
+all_up_pairs += assoc_up_pairs
 spindle_intervals_s = detect_spindle_intervals_in_upstates(
     main_channel, time_s, dt, all_up_pairs
 )
 print(f"[SPINDLE] 10-15 Hz intervals (global): n={len(spindle_intervals_s)}")
+
+# Bandpass-Signal (10-15 Hz) für Spindle-Visualisierung/Amplituden.
+main_channel_for_spindle = main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel
+main_channel_bp_10_15 = _bandpass_1d(main_channel_for_spindle, dt, f_lo=10.0, f_hi=15.0, order=3, causal=True)
+
+# Pulse-orientierte Spindle-Klassifikation über Peakzeit (robuster als Startzeit).
+# WICHTIG: Trigger-Referenz ist explizit der Pulse-ONSET (nicht OFF).
+_p1 = np.asarray(pulse_times_1 if pulse_times_1 is not None else [], float)
+_p2 = np.asarray(pulse_times_2 if pulse_times_2 is not None else [], float)
+_p1_off = np.asarray(pulse_times_1_off if pulse_times_1_off is not None else [], float)
+_p2_off = np.asarray(pulse_times_2_off if pulse_times_2_off is not None else [], float)
+_p1_on = _p1[np.isfinite(_p1)]
+_p2_on = _p2[np.isfinite(_p2)]
+spindle_pulses_s = np.unique(np.concatenate([_p1_on, _p2_on])) if (_p1_on.size or _p2_on.size) else np.array([], float)
+spindle_spont_s, spindle_trig_s, spindle_trig_lat_s, spindle_peak_times_s = _classify_spindles_by_pulse_peak_latency(
+    spindle_intervals_s,
+    spindle_pulses_s,
+    main_channel_bp_10_15,
+    time_s,
+    trig_win_s=0.70,
+    min_lat_s=0.10,
+)
+print(
+    "[SPINDLE-CLASS][pulse-peak] spont=", len(spindle_spont_s),
+    "trig=", len(spindle_trig_s),
+    "pulses=", len(spindle_pulses_s),
+    "ref=onset",
+    "trig_lat_mean_s=", (float(np.nanmean(spindle_trig_lat_s)) if spindle_trig_lat_s.size else np.nan),
+)
+
+# Spindle-Metriken (nur spontane vs getriggerte Spindles).
+spindle_dur_spont = np.asarray([t1 - t0 for (t0, t1) in spindle_spont_s], float)
+spindle_dur_trig = np.asarray([t1 - t0 for (t0, t1) in spindle_trig_s], float)
+spindle_amp_spont = _interval_peak_to_peak(main_channel_bp_10_15, spindle_spont_s, time_s)
+spindle_amp_trig = _interval_peak_to_peak(main_channel_bp_10_15, spindle_trig_s, time_s)
+
+# Für PCA: Intervalle in Indexpaare überführen.
+Spindle_Spont_UP, Spindle_Spont_DOWN = _time_intervals_to_idx_pairs(spindle_spont_s, time_s)
+Spindle_Trig_UP, Spindle_Trig_DOWN = _time_intervals_to_idx_pairs(spindle_trig_s, time_s)
 
 debug_log("[DBG before pair] p1_on/off:",
           0 if pulse_times_1 is None else len(pulse_times_1),
@@ -2091,6 +2400,72 @@ if PULSE_ONSET_ONLY:
     ttl1_intervals = []
     ttl2_intervals = []
     print("[PULSE-PLOT] onset-only mode: pulse durations hidden in plots")
+if FORCE_ONSET_ONLY_PLOTS:
+    PULSE_ONSET_ONLY = True
+    ttl1_intervals = []
+    ttl2_intervals = []
+    print("[PULSE-PLOT] FORCE_ONSET_ONLY_PLOTS=1 -> force onset-only pulse display")
+
+pulse_times_1_off_html_plot = np.array([], float) if PULSE_ONSET_ONLY else pulse_times_1_off_html
+pulse_times_2_off_html_plot = np.array([], float) if PULSE_ONSET_ONLY else pulse_times_2_off_html
+
+# Einheitliche y-Achse eine Ebene höher (Parent-Ordner) für alle HTML-Exports.
+# Datei liegt im Parent von BASE_PATH, damit mehrere Experimente dieselbe Skala teilen.
+html_sig_src = main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel
+html_y_range = None
+try:
+    _yy = np.asarray(html_sig_src, float)
+    _yy = _yy[np.isfinite(_yy)]
+    if _yy.size:
+        _ymin = float(np.min(_yy))
+        _ymax = float(np.max(_yy))
+        if _ymax <= _ymin:
+            _delta = max(abs(_ymin), 1.0) * 0.05
+            _ymin -= _delta
+            _ymax += _delta
+        else:
+            _pad = 0.05 * (_ymax - _ymin)
+            _ymin -= _pad
+            _ymax += _pad
+        html_y_range = [_ymin, _ymax]
+
+        _parent_dir = os.path.dirname(os.path.normpath(BASE_PATH))
+        _range_path = os.path.join(_parent_dir, "_html_y_range_parent.json")
+        _parent_min, _parent_max = _ymin, _ymax
+
+        if os.path.isfile(_range_path):
+            try:
+                with open(_range_path, "r", encoding="utf-8") as f:
+                    _saved = json.load(f)
+                _smin = float(_saved.get("ymin"))
+                _smax = float(_saved.get("ymax"))
+                if np.isfinite(_smin) and np.isfinite(_smax) and _smax > _smin:
+                    _parent_min = min(_parent_min, _smin)
+                    _parent_max = max(_parent_max, _smax)
+            except Exception as _e_load:
+                print(f"[HTML] parent y-range load skipped: {_e_load}")
+
+        html_y_range = [float(_parent_min), float(_parent_max)]
+        try:
+            with open(_range_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "ymin": float(_parent_min),
+                        "ymax": float(_parent_max),
+                        "updated_from": os.path.basename(os.path.normpath(BASE_PATH)),
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception as _e_save:
+            print(f"[HTML] parent y-range save skipped: {_e_save}")
+
+        print(
+            f"[HTML] fixed y-range (parent): "
+            f"[{html_y_range[0]:.3f}, {html_y_range[1]:.3f}]"
+        )
+except Exception as e:
+    print(f"[WARN] fixed HTML y-range failed: {e}")
 
 
 
@@ -2104,18 +2479,80 @@ export_interactive_lfp_html(
 
     pulse_times_1=pulse_times_1_html,
     pulse_times_2=pulse_times_2_html,
-    pulse_times_1_off=pulse_times_1_off_html,
-    pulse_times_2_off=pulse_times_2_off_html,
+    pulse_times_1_off=pulse_times_1_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_plot,
     pulse_intervals_1=ttl1_intervals,
     pulse_intervals_2=ttl2_intervals,
     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
-    spindle_intervals=spindle_intervals_s,
+    spindle_intervals=None,
     limit_to_last_pulse=False,
     title=f"{BASE_TAG} — Main LFP (interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=(not PULSE_ONSET_ONLY),
+    y_range=html_y_range,
+)
+
+# Zusatz-HTML: nur Signal + Pulse (keine UP-/Spindle-Markierungen)
+export_interactive_lfp_html(
+    f"{BASE_TAG}__pulse_only", SAVE_DIR, time_s,
+    main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
+    pulse_times_1=pulse_times_1_html,
+    pulse_times_2=pulse_times_2_html,
+    pulse_times_1_off=pulse_times_1_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_plot,
+    pulse_intervals_1=ttl1_intervals,
+    pulse_intervals_2=ttl2_intervals,
+    up_spont=None,
+    up_trig=None,
+    up_assoc=None,
+    spindle_intervals=None,
+    limit_to_last_pulse=False,
+    title=f"{BASE_TAG} — Signal + Pulse (ohne Marker, interaktiv)",
+    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
+    show_pulse_intervals=(not PULSE_ONSET_ONLY),
+    y_range=html_y_range,
+)
+
+# Zusatz-HTML: nur Main-Channel im Spindle-Band (10-15 Hz)
+print(
+    "[SPINDLE-HTML] intervals for shading:",
+    f"spont={len(Spindle_Spont_UP)}",
+    f"trig={len(Spindle_Trig_UP)}",
+)
+main_channel_bp_10_15 = np.asarray(html_sig_src, float).copy()
+try:
+    fs_html = 1.0 / float(dt)
+    nyq_html = 0.5 * fs_html
+    lo_bp = 10.0
+    hi_bp = min(15.0, 0.95 * nyq_html)
+    if lo_bp < hi_bp:
+        x_bp0 = np.nan_to_num(main_channel_bp_10_15, nan=float(np.nanmedian(main_channel_bp_10_15)))
+        sos_bp = signal.butter(3, [lo_bp / nyq_html, hi_bp / nyq_html], btype="bandpass", output="sos")
+        main_channel_bp_10_15 = signal.sosfilt(sos_bp, x_bp0)
+    else:
+        print(f"[WARN] 10-15 Hz bandpass skipped (Nyquist too low: {nyq_html:.2f} Hz)")
+except Exception as e:
+    print(f"[WARN] 10-15 Hz bandpass failed: {e}")
+
+export_interactive_lfp_html(
+    f"{BASE_TAG}__main_10_15hz", SAVE_DIR, time_s, main_channel_bp_10_15,
+    pulse_times_1=pulse_times_1_html,
+    pulse_times_2=pulse_times_2_html,
+    pulse_times_1_off=pulse_times_1_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_plot,
+    pulse_intervals_1=[],
+    pulse_intervals_2=[],
+    up_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
+    up_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
+    up_assoc=None,
+    up_spont_label="Spindle spontaneous",
+    up_trig_label="Spindle triggered",
+    title=f"{BASE_TAG} — Spindle classification (10-15 Hz, interaktiv)",
+    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
+    show_pulse_intervals=False,
+    y_range=html_y_range,
 )
 
 
@@ -2411,7 +2848,7 @@ def plot_up_classification_ax(
         for t0, t1 in spindle_intervals:
             if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
                 continue
-                ax.axvspan(float(t0), float(t1), color="#8a2be2", alpha=0.30, lw=0,
+            ax.axvspan(float(t0), float(t1), color="#8a2be2", alpha=0.30, lw=0,
                        label=("Spindles 10-15 Hz" if first else None))
             first = False
 
@@ -2463,6 +2900,174 @@ def plot_up_classification_ax(
     ax.set_title(title)
    
 
+    return fig
+
+
+def spindle_duration_compare_ax(spont_dur_s, trig_dur_s, ax=None, title="Spindle durations (10-15 Hz)"):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    else:
+        fig = ax.figure
+
+    sp = np.asarray(spont_dur_s, float)
+    tr = np.asarray(trig_dur_s, float)
+    sp = sp[np.isfinite(sp)]
+    tr = tr[np.isfinite(tr)]
+
+    data = []
+    labels = []
+    if sp.size:
+        data.append(sp); labels.append("Spontaneous")
+    if tr.size:
+        data.append(tr); labels.append("Triggered")
+
+    if not data:
+        _blank_ax(ax, "no spindle durations")
+        return fig
+
+    ax.boxplot(data, tick_labels=labels, whis=[5, 95], showfliers=False)
+    ax.set_ylabel("Duration (s)")
+    ax.set_title(title)
+    ax.grid(alpha=0.15, linestyle=":")
+    if sp.size and tr.size:
+        info_txt = (
+            f"n_sp={sp.size}\n"
+            f"n_tr={tr.size}\n"
+            f"mean_sp={np.nanmean(sp):.3f}s\n"
+            f"mean_tr={np.nanmean(tr):.3f}s"
+        )
+    else:
+        info_txt = f"n_sp={sp.size}\n" f"n_tr={tr.size}"
+    ax.text(
+        0.98, 0.95,
+        info_txt,
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
+    )
+    return fig
+
+
+def spindle_amplitude_compare_ax(spont_amp, trig_amp, ax=None, title="Spindle amplitudes (10-15 Hz, peak-to-peak)"):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    else:
+        fig = ax.figure
+
+    sp = np.asarray(spont_amp, float)
+    tr = np.asarray(trig_amp, float)
+    sp = sp[np.isfinite(sp)]
+    tr = tr[np.isfinite(tr)]
+
+    data = []
+    labels = []
+    if sp.size:
+        data.append(sp); labels.append("Spontaneous")
+    if tr.size:
+        data.append(tr); labels.append("Triggered")
+
+    if not data:
+        _blank_ax(ax, "no spindle amplitudes")
+        return fig
+
+    ax.boxplot(data, tick_labels=labels, whis=[5, 95], showfliers=False)
+    ax.set_ylabel("Amplitude (peak-to-peak)")
+    ax.set_title(title)
+    ax.grid(alpha=0.15, linestyle=":")
+    if sp.size and tr.size:
+        info_txt = (
+            f"n_sp={sp.size}\n"
+            f"n_tr={tr.size}\n"
+            f"mean_sp={np.nanmean(sp):.2f}\n"
+            f"mean_tr={np.nanmean(tr):.2f}"
+        )
+    else:
+        info_txt = f"n_sp={sp.size}\n" f"n_tr={tr.size}"
+    ax.text(
+        0.98, 0.95,
+        info_txt,
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
+    )
+    return fig
+
+
+def spindle_classification_main_ax(
+    spindle_signal,
+    time_s,
+    spindle_spont_intervals,
+    spindle_trig_intervals,
+    pulse_times_1=None,
+    pulse_times_2=None,
+    pulse_times_1_off=None,
+    pulse_times_2_off=None,
+    ax=None,
+    title="Main channel spindle classification (10-15 Hz bandpass)"
+):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 3.2))
+    else:
+        fig = ax.figure
+
+    t = np.asarray(time_s, float)
+    x = np.asarray(spindle_signal, float)
+    if t.size == 0 or x.size != t.size:
+        _blank_ax(ax, "no spindle signal")
+        return fig
+
+    ax.plot(t, x, lw=0.8, color="black", label="Main channel (10-15 Hz)")
+    ax.set_xlabel("Zeit (s)")
+    ax.set_ylabel("Bandpass signal")
+
+    def _shade(intervals, color, label):
+        first = True
+        for t0, t1 in intervals:
+            if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+                continue
+            ax.axvspan(float(t0), float(t1), color=color, alpha=0.28, lw=0,
+                       label=(label if first else None))
+            first = False
+
+    _shade(spindle_spont_intervals, "#2ca02c", "Spindle spontaneous")
+    _shade(spindle_trig_intervals, "#1f77b4", "Spindle triggered")
+
+    # Pulse-Linien (optional), analog zum Main-Classification-Plot
+    y0, y1 = ax.get_ylim()
+    def _vlines(ts, style, label, color="red"):
+        if ts is None or len(ts) == 0:
+            return
+        tt = np.asarray(ts, float)
+        if tt.size > 800:
+            tt = tt[::int(np.ceil(tt.size / 800))]
+        ax.vlines(
+            tt, y0, y1,
+            lw=0.9,
+            color=color,
+            alpha=0.35,
+            linestyles=style,
+            label=label,
+            zorder=1
+        )
+
+    _vlines(pulse_times_1, ":", "Pulse 1", color="red")
+    _vlines(pulse_times_2, ":", "Pulse 2", color="red")
+    _vlines(pulse_times_1_off, "--", "Pulse 1 OFF", color="red")
+    _vlines(pulse_times_2_off, "--", "Pulse 2 OFF", color="red")
+    ax.set_ylim(y0, y1)
+
+    handles, labels = ax.get_legend_handles_labels()
+    uniq = dict(zip(labels, handles))
+    if uniq:
+        ax.legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=8, framealpha=0.9)
+
+    ax.text(
+        0.02, 0.95,
+        f"n_sp={len(spindle_spont_intervals)}\n"
+        f"n_tr={len(spindle_trig_intervals)}",
+        transform=ax.transAxes, ha="left", va="top",
+        fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
+    )
+    ax.set_title(title)
+    ax.grid(alpha=0.12, linestyle=":")
     return fig
 
 
@@ -3584,6 +4189,47 @@ else:
     corr_tr = corr_to_template(X_trig, pc1_ref)
 
 
+# --- SPINDLE PCA (spont vs trig; associated excluded) ---
+spindle_X_spont, spindle_meta_sp = _extract_resampled_up_segments(
+    main_channel_bp_10_15, time_s,
+    Spindle_Spont_UP, Spindle_Spont_DOWN,
+    n_points=300, baseline_frac=0.1, do_rms_norm=True
+)
+spindle_X_trig, spindle_meta_tr = _extract_resampled_up_segments(
+    main_channel_bp_10_15, time_s,
+    Spindle_Trig_UP, Spindle_Trig_DOWN,
+    n_points=300, baseline_frac=0.1, do_rms_norm=True
+)
+
+spindle_pca_fit_joint = None
+spindle_pc1z_sp = spindle_mahal_sp = None
+spindle_pc1z_trig = spindle_mahal_trig = None
+spindle_pc_scores_sp = spindle_pc_scores_tr = None
+spindle_pca_fit_sp = None
+spindle_pca_fit_tr = None
+
+if spindle_X_spont.shape[0] >= 3 and spindle_X_trig.shape[0] >= 3:
+    spindle_X_joint = np.vstack([spindle_X_spont, spindle_X_trig])
+    spindle_pca_fit_joint = fit_pca_from_spont(spindle_X_joint, n_components=3)
+    spindle_pc_scores_sp, spindle_pc1z_sp, spindle_mahal_sp = pca_project_and_similarity(
+        spindle_X_spont, spindle_pca_fit_joint
+    )
+    spindle_pc_scores_tr, spindle_pc1z_trig, spindle_mahal_trig = pca_project_and_similarity(
+        spindle_X_trig, spindle_pca_fit_joint
+    )
+else:
+    print(
+        "[SPINDLE PCA] skipped: need >=3 spont and >=3 trig "
+        f"(sp={spindle_X_spont.shape[0]}, trig={spindle_X_trig.shape[0]}) "
+        f"meta_sp={spindle_meta_sp} meta_tr={spindle_meta_tr}"
+    )
+
+if spindle_X_spont.shape[0] >= 3:
+    spindle_pca_fit_sp = fit_pca_from_spont(spindle_X_spont, n_components=3)
+if spindle_X_trig.shape[0] >= 3:
+    spindle_pca_fit_tr = fit_pca_from_spont(spindle_X_trig, n_components=3)
+
+
 
 def mahal_compare_ax(mahal_sp, mahal_trig, ax=None, title="Mahalanobis distance to spontaneous PCA-space"):
     if ax is None:
@@ -4659,6 +5305,68 @@ print(f"[REFRAC SPONT] spon→spon: n={len(refrac_spon2spon)}, "
 # ]
 
 
+spindle_layout_rows = [
+    [lambda ax: spindle_classification_main_ax(
+        main_channel_bp_10_15,
+        time_s,
+        spindle_spont_s,
+        spindle_trig_s,
+        pulse_times_1=pulse_times_1,
+        pulse_times_2=pulse_times_2,
+        pulse_times_1_off=pulse_times_1_off,
+        pulse_times_2_off=pulse_times_2_off,
+        ax=ax,
+        title="Main channel spindle classification (10-15 Hz bandpass)"
+    )],
+    [lambda ax: spindle_duration_compare_ax(
+        spindle_dur_spont, spindle_dur_trig, ax=ax,
+        title="Spindle durations: spontaneous vs triggered"
+    ),
+     lambda ax: spindle_amplitude_compare_ax(
+         spindle_amp_spont, spindle_amp_trig, ax=ax,
+         title="Spindle amplitudes (10-15 Hz, peak-to-peak): spontaneous vs triggered"
+     )],
+    [lambda ax: (
+        _blank_ax(ax, "Spindle PCA spont skipped")
+        if (spindle_pca_fit_sp is None)
+        else pca_template_pc1_ax(
+            spindle_pca_fit_sp,
+            ax=ax,
+            title="Spindle PCA template (spontaneous, PC1)"
+        )
+    ),
+     lambda ax: (
+         _blank_ax(ax, "Spindle PCA trig skipped")
+         if (spindle_pca_fit_tr is None)
+         else pca_template_pc1_ax(
+             spindle_pca_fit_tr,
+             ax=ax,
+             title="Spindle PCA template (triggered, PC1)"
+         )
+     )],
+    [lambda ax: (
+        _blank_ax(ax, "Need both spindle PCAs")
+        if (spindle_pca_fit_sp is None or spindle_pca_fit_tr is None)
+        else pca_pc1_overlay_corr_diff_ax(
+            spindle_pca_fit_sp,
+            spindle_pca_fit_tr,
+            ax=ax,
+            title="Spindle PC1 overlay + corr + diff (spont vs trig)"
+        )
+    )],
+    [lambda ax: (
+        _blank_ax(ax, "Spindle PCA skipped")
+        if (spindle_pca_fit_joint is None or spindle_mahal_trig is None)
+        else mahal_compare_ax(
+            spindle_mahal_sp,
+            spindle_mahal_trig,
+            ax=ax,
+            title="Spindle Mahalanobis distance in JOINT PCA space"
+        )
+    )],
+]
+
+
 layout_rows = [
 
     # ========================================================
@@ -5104,13 +5812,14 @@ rate_bar_svg = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_rate_bar.svg")
 plot_upstate_rates_bar(rates, rate_bar_svg)
 
 
-def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_save_each_svg=False):
+def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_save_each_svg=False, write_summary=True):
     """
     layout_rows: Liste von Zeilen.
       - [callable]                -> 1 Plot, volle Breite (spannt 2 Spalten)
       - [callable, callable]      -> 2 Plots nebeneinander
     """
-    _write_summary_csv()
+    if write_summary:
+        _write_summary_csv()
     os.makedirs(save_dir, exist_ok=True)
     out_pdf = os.path.join(save_dir, f"{base_tag}_ALL_PLOTS_STACKED.pdf")
 
@@ -5182,6 +5891,14 @@ def main():
         BASE_TAG, SAVE_DIR, layout_rows,
         rows_per_page=3,          # 3 Zeilen -> alles auf eine Seite
         also_save_each_svg=True
+    )
+    export_with_layout(
+        f"{BASE_TAG}__SPINDLE_OVERVIEW",
+        SAVE_DIR,
+        spindle_layout_rows,
+        rows_per_page=3,
+        also_save_each_svg=False,
+        write_summary=False
     )
 
     log("Export finished")

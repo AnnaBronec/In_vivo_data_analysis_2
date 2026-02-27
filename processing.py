@@ -1,5 +1,5 @@
 
-import os, math
+import os
 import numpy as np
 _np = np
 import pandas as pd
@@ -7,12 +7,6 @@ import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
 import glob
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-from pathlib import Path
-import re
 
 #Konstanten
 DOWNSAMPLE_FACTOR = 50
@@ -90,7 +84,7 @@ def _ensure_main_channel(LFP_array, preferred_idx=10):
     num_ch = int(LFP_array.shape[0])
     if isinstance(preferred_idx, int) and 0 <= preferred_idx < num_ch:
         return LFP_array[preferred_idx, :], preferred_idx
-    return LFP_array[0, :], 10
+    return LFP_array[0, :], 0
 
 
 def _ensure_seconds(ts, time_ref, fs_xdat=DEFAULT_FS_XDAT):

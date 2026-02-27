@@ -25,12 +25,16 @@ def export_interactive_lfp_html(
     up_spont=None,       # Tuple (UP_idx, DOWN_idx) in SAMPLE-INDIZES
     up_trig=None,        # Tuple (UP_idx, DOWN_idx)
     up_assoc=None,       # Tuple (UP_idx, DOWN_idx)
+    up_spont_label="UP spontaneous",
+    up_trig_label="UP triggered",
+    up_assoc_label="UP associated",
     spindle_intervals=None,  # list[(t0, t1)] in Sekunden
     max_points=300_000,
     title="LFP (interaktiv)",
     limit_to_last_pulse=False,
     y_label="LFP (µV)",
     show_pulse_intervals=True,
+    y_range=None,
 ):
 
 
@@ -84,11 +88,11 @@ def export_interactive_lfp_html(
     # --- UP-Intervalle vorbereiten (Farben an deine Matplotlib-Plots angelehnt)
     intervals = []
     if up_spont:
-        intervals.append(("UP spontaneous", _mk_intervals(*up_spont), "rgba(46, 204, 113, 0.22)"))  # grün
+        intervals.append((str(up_spont_label), _mk_intervals(*up_spont), "rgba(46, 204, 113, 0.22)"))  # grün
     if up_trig:
-        intervals.append(("UP triggered",   _mk_intervals(*up_trig),  "rgba(31, 119, 180, 0.22)"))  # blau
+        intervals.append((str(up_trig_label), _mk_intervals(*up_trig),  "rgba(31, 119, 180, 0.22)"))  # blau
     if up_assoc:
-        intervals.append(("UP associated",  _mk_intervals(*up_assoc), "rgba(255, 127, 14, 0.22)"))  # orange
+        intervals.append((str(up_assoc_label), _mk_intervals(*up_assoc), "rgba(255, 127, 14, 0.22)"))  # orange
 
     # --- Schattierungen als Shapes (über gesamte Plot-Höhe)
     for label, spans, fill in intervals:
@@ -254,10 +258,30 @@ def export_interactive_lfp_html(
                                  name="Pulse 1 duration"))
 
 
+    yaxis_cfg = dict(
+        title=y_label,
+        showline=True,
+        linewidth=2,
+        linecolor="black",
+        mirror="allticks",
+    )
+    if y_range is not None:
+        yr = np.asarray(y_range, dtype=float).ravel()
+        if yr.size >= 2 and np.isfinite(yr[0]) and np.isfinite(yr[1]) and yr[1] > yr[0]:
+            yaxis_cfg["range"] = [float(yr[0]), float(yr[1])]
+            yaxis_cfg["autorange"] = False
+
     fig.update_layout(
         title=title,
-        xaxis=dict(title="Zeit (s)", rangeslider=dict(visible=True)),
-        yaxis=dict(title=y_label),
+        xaxis=dict(
+            title="Zeit (s)",
+            rangeslider=dict(visible=True),
+            showline=True,
+            linewidth=2,
+            linecolor="black",
+            mirror="allticks",
+        ),
+        yaxis=yaxis_cfg,
         shapes=shapes,
         margin=dict(l=60, r=20, t=50, b=50),
         template="plotly_white",
