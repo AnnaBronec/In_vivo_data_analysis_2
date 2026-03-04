@@ -337,12 +337,12 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         return out
 
     # Zielbereich für UP-Anteil (Feature-Zeitachse)
-    target_min = 0.05
-    target_max = 0.50
+    target_min = 0.03
+    target_max = 0.30
 
     # Startwerte
-    k_hi = 3.5
-    k_lo = 3.0
+    k_hi = 4.5
+    k_lo = 4.0
 
     # Wir passen k an (hoch -> weniger UP, runter -> mehr UP)
     for _ in range(20):
@@ -382,7 +382,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     # else:
     #     dt_feat = float(dt)  # fallback
 
-    min_gap_s = 0.05
+    min_gap_s = 0.02
     min_gap = max(1, int(round(min_gap_s / dt_feat)))
 
     binary = up_state_binary.astype(np.int8)
@@ -417,7 +417,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         up_transitions = up_transitions[:-1]
 
     # Keep short but valid UP states; 1.0 s was too strict for many sessions.
-    min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", "0.30"))
+    min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", "0.50"))
     if not up_transitions.size or not down_transitions.size:
         UP_start_i = np.array([], dtype=int)
         DOWN_start_i = np.array([], dtype=int)

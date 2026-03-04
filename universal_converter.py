@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from neuralynx_rawio_to_csv import main as nlx_convert_main
 
 # Deine XDAT-Konvertierung als Funktion
 def _xdat_convert_pair(prefix: Path, out_csv: Path, fs: float | None = None, chunk_rows: int = 200_000):
@@ -146,6 +145,8 @@ def main(session_dir: str, out_csv: str | None = None, *, fs_xdat: float | None 
     # 3) Neuralynx-Rohdaten?
     if _has_neuralynx_raw(sdir):
         print(f"[INFO] Neuralynx erkannt unter {sdir.name} -> konvertiere zu {target_csv.name}")
+        from neuralynx_rawio_to_csv import main as nlx_convert_main
+
         nlx_convert_main(str(sdir), str(target_csv))
         return
 

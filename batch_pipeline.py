@@ -11,6 +11,7 @@ import importlib.util
 import sys
 import csv
 import gc
+import re
 import shutil
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -19,8 +20,14 @@ import math
 
 # ---------- Import-Helpers ----------
 
+_SPLIT_PART_RE = re.compile(r"\.part\d+\.csv$", re.IGNORECASE)
+
+
+def _is_split_part_csv(path: Path) -> bool:
+    return path.is_file() and bool(_SPLIT_PART_RE.search(path.name))
+
 def merge_csv_parts(parts_dir: Path, out_csv: Path) -> int:
-    parts = sorted(parts_dir.glob("*.part*.csv"))
+    parts = sorted(p for p in parts_dir.glob("*.csv") if _is_split_part_csv(p))
     if not parts:
         return 0
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -324,14 +331,13 @@ def _process_one_session_subproc(
             except Exception as e:
                 print(f"{session_dir.name}: [MERGE][WARN] {e}")
 
-            # 4) finaler Lauf auf dem gemergten CSV
-            if out_merged.exists() and not dry_run:
-                print(f"{session_dir.name}: [FINAL] Analysis on merged -> {out_merged.name}")
+            # 4) finaler Lauf über die Parts im Streaming-Modus
+            if not dry_run:
+                print(f"{session_dir.name}: [FINAL] Analysis on split parts (streaming)")
                 cmd = [
                     sys.executable,
                     str(wrapper_script_path),
                     str(session_dir),
-                    "--lfp-filename", out_merged.name,
                 ]
                 env = os.environ.copy()
                 env.update({
@@ -342,13 +348,12 @@ def _process_one_session_subproc(
                     "NUMEXPR_NUM_THREADS": "1",
                     "BLIS_NUM_THREADS": "1",
                     "ANALYSIS_SAVE_DIR": str(session_dir),
-                    "BATCH_IS_MERGED_RUN": "1",
                 })
                 cp = subprocess.run(cmd, env=env)
                 if cp.returncode != 0:
-                    return (session_dir.name, False, f"SubprocessError on merged: returncode={cp.returncode}")
+                    return (session_dir.name, False, f"SubprocessError on final streaming run: returncode={cp.returncode}")
 
-            return (session_dir.name, True, f"OK (split {len(parts)}; analyzed {analyzed}; merged+final-run)")
+            return (session_dir.name, True, f"OK (split {len(parts)}; analyzed {analyzed}; final-stream-run)")
 
         # --- Standardfall (keine Splits) ---
         print(f"{session_dir.name}: [2/2] Analysis on {csv_path.name}")

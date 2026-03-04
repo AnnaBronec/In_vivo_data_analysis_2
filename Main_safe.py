@@ -16,6 +16,7 @@ from matplotlib.colors import TwoSlopeNorm
 import gc
 from glob import glob
 from matplotlib.backends.backend_pdf import PdfPages
+import subprocess
 from loader_old import load_LFP_new, read_nev_timestamps_and_ttl, ttl_to_on_off
 from matplotlib import gridspec
 from scipy.signal import welch
@@ -38,6 +39,7 @@ from plotter import (
 
 from Exports import (
     export_interactive_lfp_html, 
+    export_interactive_dual_lfp_html,
     log,
      _nan_stats,
      _rms
@@ -100,6 +102,8 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 parts_dir = Path(BASE_PATH) / "_csv_parts"
 is_merged_run = os.environ.get("BATCH_IS_MERGED_RUN", "0") == "1"
 has_explicit_filename = "LFP_FILENAME" in globals()
+default_lfp_filename = f"{os.path.basename(os.path.normpath(BASE_PATH))}.csv"
+lfp_filename_is_default = Path(str(LFP_FILENAME)).name == default_lfp_filename
 
 # --- Default init (so we never get NameError) ---
 pulse_times_1_html     = np.array([], dtype=float)
@@ -109,11 +113,16 @@ pulse_times_2_off_html = np.array([], dtype=float)
 chan_cols_raw = []
 FLIP_DEPTH = False
 DEBUG_MAIN_SAFE = os.environ.get("DEBUG_MAIN_SAFE", "0") == "1"
+PART_CSV_RE = re.compile(r"\.part\d+\.csv$", re.IGNORECASE)
 
 
 def debug_log(*args, **kwargs):
     if DEBUG_MAIN_SAFE:
         print(*args, **kwargs)
+
+
+def _is_split_part_csv_name(name: str) -> bool:
+    return bool(PART_CSV_RE.search(name))
 
 
 def edges_from_parts_csv(parts_dir, col, time_col="time", thr=None):
@@ -125,7 +134,10 @@ def edges_from_parts_csv(parts_dir, col, time_col="time", thr=None):
 
 
     # Part-Dateien sortiert
-    files = sorted(glob.glob(os.path.join(str(parts_dir), "*.part*.csv")))
+    files = sorted(
+        fp for fp in glob.glob(os.path.join(str(parts_dir), "*.csv"))
+        if _is_split_part_csv_name(os.path.basename(fp))
+    )
     if not files:
         return np.array([], float), np.array([], float)
 
@@ -278,7 +290,10 @@ def load_parts_to_array_streaming_with_ttl(
     thr2 = None
 
     parts_dir = Path(base_path) / "_csv_parts"
-    part_files = sorted(parts_dir.glob("*.part*.csv"))
+    part_files = sorted(
+        p for p in parts_dir.glob("*.csv")
+        if _is_split_part_csv_name(p.name)
+    )
     if not part_files:
         raise FileNotFoundError(f"Keine Parts unter {parts_dir} gefunden.")
 
@@ -290,6 +305,7 @@ def load_parts_to_array_streaming_with_ttl(
     # TTL-sammler (full-res times)
     p1_on_list, p1_off_list = [], []
     p2_on_list, p2_off_list = [], []
+    time_col_name = None
 
 
 
@@ -302,17 +318,25 @@ def load_parts_to_array_streaming_with_ttl(
 
         # einmalig stim + channels bestimmen
         if stim_cols_in_file is None:
+            for cand in ("time", "timesamples", "timestamps"):
+                if cand in df.columns:
+                    time_col_name = cand
+                    break
+            if time_col_name is None:
+                raise KeyError(f"Keine Zeitspalte in {pf.name} gefunden (erwartet: time/timesamples/timestamps)")
             stim_cols_in_file = [c for c in stim_cols if c in df.columns]
-            raw_chan_cols = [c for c in df.columns if c not in ("time", *stim_cols_in_file)]
+            raw_chan_cols = [
+                c for c in df.columns
+                if c not in (time_col_name, "time", "timesamples", "timestamps", *stim_cols_in_file)
+            ]
             chan_cols = sorted(raw_chan_cols, key=_key_num)
 
         # -------------------------
         # (A) TTL FULL-RES edges
         # -------------------------
-        if "time" in df.columns:
-            t_full = pd.to_numeric(df["time"], errors="coerce").to_numpy(float)
+        if time_col_name in df.columns:
+            t_full = pd.to_numeric(df[time_col_name], errors="coerce").to_numpy(float)
         else:
-            # kein time -> skip
             t_full = None
 
         if t_full is not None and t_full.size:
@@ -357,8 +381,10 @@ def load_parts_to_array_streaming_with_ttl(
         # -------------------------
         # (B) LFP DOWNSAMPLED
         # -------------------------
-        keep_cols = ["time", *chan_cols]
+        keep_cols = [time_col_name, *chan_cols]
         df_lfp = df[keep_cols]
+        if time_col_name != "time":
+            df_lfp = df_lfp.rename(columns={time_col_name: "time"})
 
         if ds_factor and ds_factor > 1:
             df_lfp = df_lfp.iloc[::int(ds_factor), :].reset_index(drop=True)
@@ -463,9 +489,10 @@ is_merged_run = os.environ.get("BATCH_IS_MERGED_RUN", "0") == "1"
 has_explicit_filename = "LFP_FILENAME" in globals()
 
 USE_STREAM = (
-    (not is_merged_run) and (not has_explicit_filename)
+    (not is_merged_run)
+    and ((not has_explicit_filename) or lfp_filename_is_default)
     and parts_dir.exists()
-    and any(parts_dir.glob("*.part*.csv"))
+    and any(_is_split_part_csv_name(p.name) for p in parts_dir.glob("*.csv"))
 )
 
 if USE_STREAM:
@@ -1813,6 +1840,27 @@ Trig_UP_crop, Trig_DOWN_crop = crop_up_intervals(
     Pulse_triggered_UP, Pulse_triggered_DOWN, dt, start_s=0.3, end_s=1.0
 )
 
+# --- UP-Dauern pro Event (ungecroppt) als CSV ---
+_sU = np.asarray(Spontaneous_UP, int)
+_sD = np.asarray(Spontaneous_DOWN, int)
+_tU = np.asarray(Pulse_triggered_UP, int)
+_tD = np.asarray(Pulse_triggered_DOWN, int)
+
+_ms = min(_sU.size, _sD.size)
+_mt = min(_tU.size, _tD.size)
+dur_sp = ((_sD[:_ms] - _sU[:_ms]) * float(dt)) if _ms else np.array([], float)
+dur_tr = ((_tD[:_mt] - _tU[:_mt]) * float(dt)) if _mt else np.array([], float)
+dur_sp = dur_sp[np.isfinite(dur_sp) & (dur_sp > 0)]
+dur_tr = dur_tr[np.isfinite(dur_tr) & (dur_tr > 0)]
+
+dur_df = pd.DataFrame({
+    "group": (["spontaneous"] * len(dur_sp)) + (["triggered"] * len(dur_tr)),
+    "duration_s": np.concatenate([dur_sp, dur_tr]) if (len(dur_sp) or len(dur_tr)) else np.array([], float),
+})
+dur_csv_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_durations.csv")
+dur_df.to_csv(dur_csv_path, index=False)
+print(f"[CSV] UP-Dauern geschrieben: {dur_csv_path}  (spont={len(dur_sp)}, trig={len(dur_tr)})")
+
 
 # --- Amplituden pro UP-Typ (max - min) berechnen + CSV ablegen ---
 spont_amp = _upstate_amplitudes(main_channel, Spon_UP_crop, Spon_DOWN_crop)
@@ -1864,16 +1912,16 @@ def detect_spindle_intervals_in_upstates(
     *,
     f_lo=10.0,
     f_hi=15.0,
-    thr_k_on=1.4,
-    thr_k_off=0.7,
-    min_dur_s=0.35,
+    thr_k_on=1.1,
+    thr_k_off=0.5,
+    min_dur_s=0.25,
     max_dur_s=3.0,
-    max_gap_s=0.12,
+    max_gap_s=0.0,
     min_cycles=1,
-    min_spindle_band_power_ratio=1.2,
-    min_spindle_power_fraction=0.12,
-    min_env_peak_quantile=0.10,
-    min_env_peak_sigma=1.2,
+    min_spindle_band_power_ratio=1.05,
+    min_spindle_power_fraction=0.08,
+    min_env_peak_quantile=0.05,
+    min_env_peak_sigma=0.9,
     only_in_upstates=False,
     use_psd_check=False,
     causal_filter=True,
@@ -2119,7 +2167,7 @@ def _classify_spindles_by_pulse_peak_latency(
     time_s,
     *,
     trig_win_s=0.7,
-    min_lat_s=0.10,
+    min_lat_s=0.0,
 ):
     pulses = np.asarray(pulse_times_s, float) if pulse_times_s is not None else np.array([], float)
     pulses = pulses[np.isfinite(pulses)]
@@ -2163,9 +2211,8 @@ def _classify_spindles_by_pulse_peak_latency(
 
         lat = float(t_peak - pulses[j])
         if float(min_lat_s) <= lat <= float(trig_win_s):
-            # Enforce causal onset for triggered class in plots/metrics:
-            # triggered spindle intervals are clipped to start no earlier than pulse reference + min_lat.
-            t0_trig = max(float(t0), float(pulses[j]) + float(min_lat_s))
+            # Keep triggered spindle onset causal relative to the pulse.
+            t0_trig = max(float(t0), float(pulses[j]))
             if t1 > t0_trig:
                 trig.append((t0_trig, float(t1)))
             else:
@@ -2233,7 +2280,7 @@ print(f"[SPINDLE] 10-15 Hz intervals (global): n={len(spindle_intervals_s)}")
 main_channel_for_spindle = main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel
 main_channel_bp_10_15 = _bandpass_1d(main_channel_for_spindle, dt, f_lo=10.0, f_hi=15.0, order=3, causal=True)
 
-# Pulse-orientierte Spindle-Klassifikation über Peakzeit (robuster als Startzeit).
+# Pulse-orientierte Spindle-Klassifikation über echten Spindle-Onset.
 # WICHTIG: Trigger-Referenz ist explizit der Pulse-ONSET (nicht OFF).
 _p1 = np.asarray(pulse_times_1 if pulse_times_1 is not None else [], float)
 _p2 = np.asarray(pulse_times_2 if pulse_times_2 is not None else [], float)
@@ -2242,16 +2289,14 @@ _p2_off = np.asarray(pulse_times_2_off if pulse_times_2_off is not None else [],
 _p1_on = _p1[np.isfinite(_p1)]
 _p2_on = _p2[np.isfinite(_p2)]
 spindle_pulses_s = np.unique(np.concatenate([_p1_on, _p2_on])) if (_p1_on.size or _p2_on.size) else np.array([], float)
-spindle_spont_s, spindle_trig_s, spindle_trig_lat_s, spindle_peak_times_s = _classify_spindles_by_pulse_peak_latency(
+spindle_spont_s, spindle_trig_s, spindle_trig_lat_s = _classify_spindles_by_pulse_latency(
     spindle_intervals_s,
     spindle_pulses_s,
-    main_channel_bp_10_15,
-    time_s,
     trig_win_s=0.70,
-    min_lat_s=0.10,
+    min_lat_s=0.00,
 )
 print(
-    "[SPINDLE-CLASS][pulse-peak] spont=", len(spindle_spont_s),
+    "[SPINDLE-CLASS][pulse-onset] spont=", len(spindle_spont_s),
     "trig=", len(spindle_trig_s),
     "pulses=", len(spindle_pulses_s),
     "ref=onset",
@@ -2553,6 +2598,51 @@ export_interactive_lfp_html(
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=False,
     y_range=html_y_range,
+)
+
+export_interactive_lfp_html(
+    f"{BASE_TAG}__upstate_spindle_overlay", SAVE_DIR, time_s,
+    main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
+    pulse_times_1=pulse_times_1_html,
+    pulse_times_2=pulse_times_2_html,
+    pulse_times_1_off=pulse_times_1_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_plot,
+    pulse_intervals_1=ttl1_intervals,
+    pulse_intervals_2=ttl2_intervals,
+    up_spont=(Spontaneous_UP, Spontaneous_DOWN),
+    up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
+    up_assoc=None,
+    spindle_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
+    spindle_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
+    title=f"{BASE_TAG} — UP states + Spindles (Overlay, interaktiv)",
+    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
+    show_pulse_intervals=(not PULSE_ONSET_ONLY),
+    y_range=html_y_range,
+)
+
+export_interactive_dual_lfp_html(
+    f"{BASE_TAG}__lfp_plus_main_10_15hz", SAVE_DIR,
+    time_s,
+    main_channel_bp_10_15,
+    main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
+    pulse_times_1=pulse_times_1_html,
+    pulse_times_2=pulse_times_2_html,
+    pulse_times_1_off=pulse_times_1_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_plot,
+    pulse_intervals_1=ttl1_intervals,
+    pulse_intervals_2=ttl2_intervals,
+    top_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
+    top_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
+    top_assoc=None,
+    bottom_spont=(Spontaneous_UP, Spontaneous_DOWN),
+    bottom_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
+    bottom_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
+    title=f"{BASE_TAG} — Main LFP + 10-15 Hz bandpass (interaktiv)",
+    top_y_label=("10-15 Hz bandpass (µV)" if HTML_IN_uV else f"10-15 Hz bandpass ({UNIT_LABEL})"),
+    bottom_y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
+    y_range_top=None,
+    y_range_bottom=html_y_range,
+    show_pulse_intervals=(not PULSE_ONSET_ONLY),
 )
 
 
@@ -5657,6 +5747,50 @@ layout_rows = [
     )],
 ]
 
+# Compact UP-state report for cross-subfolder summary:
+# no spectrum panel; keep PCA templates (spont/trig) and Mahalanobis.
+upstate_compact_layout_rows = [
+    [layout_rows[0][0]],
+    [layout_rows[1][0], layout_rows[2][0]],
+    [layout_rows[3][0]],
+    [layout_rows[4][0]],
+    [layout_rows[5][0], layout_rows[6][0]],
+    [layout_rows[7][0]],
+    [layout_rows[8][0]],
+    [layout_rows[9][0]],
+    [layout_rows[10][0]],
+    [lambda ax: (
+        _blank_ax(ax, "PCA spont skipped")
+        if (pca_fit_sp is None)
+        else pca_template_pc1_ax(
+            pca_fit_sp,
+            ax=ax,
+            title="PCA template (spontaneous, PC1)"
+        )
+    ),
+     lambda ax: (
+         _blank_ax(ax, "PCA trig skipped")
+         if (pca_fit_tr is None)
+         else pca_template_pc1_ax(
+             pca_fit_tr,
+             ax=ax,
+             title="PCA template (triggered, PC1)"
+         )
+     )],
+    [lambda ax: (
+        _blank_ax(ax, "PCA skipped")
+        if (pca_fit_joint is None or mahal_trig is None)
+        else mahal_compare_ax(
+            mahal_sp,
+            mahal_trig,
+            ax=ax,
+            title="Mahalanobis distance in JOINT PCA space"
+        )
+    )],
+    [layout_rows[16][0]],
+    [layout_rows[17][0]],
+]
+
 
 def _write_summary_csv():
     import csv, io
@@ -5882,6 +6016,68 @@ def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_sa
     print(f"[PDF] geschrieben: {out_pdf}")
 
 
+def _merge_pdfs(out_pdf, in_pdfs):
+    files = [str(Path(p)) for p in in_pdfs if Path(p).is_file()]
+    if not files:
+        return False, "no input files"
+    out_pdf = str(Path(out_pdf))
+    try:
+        cmd = ["pdfunite", *files, out_pdf]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return True, f"merged {len(files)} files with pdfunite"
+    except Exception as e_pdfunite:
+        try:
+            cmd = ["gs", "-dBATCH", "-dNOPAUSE", "-q", "-sDEVICE=pdfwrite", f"-sOutputFile={out_pdf}", *files]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return True, f"merged {len(files)} files with gs"
+        except Exception as e_gs:
+            return False, f"pdfunite failed ({e_pdfunite}); gs failed ({e_gs})"
+
+
+def _aggregate_subfolder_reports(base_path):
+    if os.environ.get("AGGREGATE_SUBFOLDER_PDFS", "1") != "1":
+        print("[AGG] skipped (AGGREGATE_SUBFOLDER_PDFS!=1)")
+        return
+
+    base = Path(base_path).resolve()
+    parent = base.parent.resolve()
+    scope = os.environ.get("AGGREGATE_SCOPE", "parent").strip().lower()
+    root = parent if scope != "base" else base
+
+    def _count_hits(root_dir):
+        hits = list(root_dir.rglob("*__UPSTATES_COMPACT_ALL_PLOTS_STACKED.pdf"))
+        hits += list(root_dir.rglob("*__SPINDLE_OVERVIEW_ALL_PLOTS_STACKED.pdf"))
+        return len([p for p in hits if p.is_file() and p.parent != root_dir])
+
+    if _count_hits(root) == 0:
+        print(f"[AGG] no subfolder reports found under {root}")
+        return
+
+    up_files = sorted(
+        p for p in root.rglob("*__UPSTATES_COMPACT_ALL_PLOTS_STACKED.pdf")
+        if p.is_file() and p.parent != root
+    )
+    sp_files = sorted(
+        p for p in root.rglob("*__SPINDLE_OVERVIEW_ALL_PLOTS_STACKED.pdf")
+        if p.is_file() and p.parent != root
+    )
+
+    out_up = root / "UPSTATES__ALL_SUBFOLDERS.pdf"
+    out_sp = root / "SPINDLES__ALL_SUBFOLDERS.pdf"
+
+    up_in = [p for p in up_files if p.resolve() != out_up.resolve()]
+    sp_in = [p for p in sp_files if p.resolve() != out_sp.resolve()]
+
+    ok_up, msg_up = _merge_pdfs(out_up, up_in)
+    ok_sp, msg_sp = _merge_pdfs(out_sp, sp_in)
+
+    print(f"[AGG] root: {root}")
+    print(f"[AGG] UP: {len(up_in)} files -> {out_up} | {msg_up}")
+    print(f"[AGG] SP: {len(sp_in)} files -> {out_sp} | {msg_sp}")
+    if not ok_up or not ok_sp:
+        print("[AGG][WARN] one or more merged PDFs could not be created")
+
+
 def main():
     log("START")
     log("Exporting layout PDF/SVG ...")
@@ -5900,6 +6096,16 @@ def main():
         also_save_each_svg=False,
         write_summary=False
     )
+    export_with_layout(
+        f"{BASE_TAG}__UPSTATES_COMPACT",
+        SAVE_DIR,
+        upstate_compact_layout_rows,
+        rows_per_page=3,
+        also_save_each_svg=False,
+        write_summary=False
+    )
+
+    _aggregate_subfolder_reports(BASE_PATH)
 
     log("Export finished")
 

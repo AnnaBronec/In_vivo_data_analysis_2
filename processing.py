@@ -1,11 +1,13 @@
 
 import os
+import re
 import numpy as np
 _np = np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 import glob
 
 #Konstanten
@@ -798,6 +800,295 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         df.to_csv(path, sep=";", index=False, encoding="utf-8")
 
+    def _infer_group(row):
+        exp = str(row.get("Experiment", "") or "").strip()
+        parent = str(row.get("Parent", "") or "").strip()
+        src = exp if exp else parent
+        s = src.upper()
+        for key in ("TLX", "DRD", "PV", "CHR2", "CHR", "WT", "GFP"):
+            if key in s:
+                return key
+        m = re.match(r"([A-Z]{2,}\d*)", s)
+        if m:
+            return m.group(1)
+        return "OTHER"
+
+    def _to_num(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    def _write_group_compare(df_rollup, out_dir, stem):
+        if df_rollup is None or df_rollup.empty:
+            return
+
+        d = df_rollup.copy()
+        d["Group"] = d.apply(_infer_group, axis=1)
+        d["triggered"] = _to_num(d.get("triggered"))
+        d["spon"] = _to_num(d.get("spon"))
+        d["associated"] = _to_num(d.get("associated"))
+        d["Mean UP Dauer [s]"] = _to_num(d.get("Mean UP Dauer [s]"))
+        d["UP rate total [Hz]"] = _to_num(d.get("UP rate total [Hz]"))
+
+        for c in ("triggered", "spon", "associated"):
+            if c not in d or d[c].isna().all():
+                d[c] = 0.0
+        total = d["triggered"].fillna(0.0) + d["spon"].fillna(0.0) + d["associated"].fillna(0.0)
+        total = total.where(total > 0, np.nan)
+        d["frac_triggered"] = d["triggered"] / total
+        d["frac_associated"] = d["associated"] / total
+
+        grp = d.groupby("Group", dropna=False).agg(
+            n_sessions=("Experiment", "count"),
+            mean_frac_triggered=("frac_triggered", "mean"),
+            mean_frac_associated=("frac_associated", "mean"),
+            mean_up_duration_s=("Mean UP Dauer [s]", "mean"),
+            mean_up_rate_hz=("UP rate total [Hz]", "mean"),
+        ).reset_index()
+        if grp.empty:
+            return
+
+        grp = grp.sort_values("n_sessions", ascending=False)
+        out_csv = os.path.join(out_dir, f"{stem}__group_compare.csv")
+        _write_semicolon(out_csv, grp)
+        print(f"[SUMMARY][GROUP] {out_csv}")
+
+        fig, axs = plt.subplots(2, 2, figsize=(11, 7))
+        axs = axs.ravel()
+        panels = [
+            ("mean_frac_triggered", "frac_triggered", "Mean triggered fraction"),
+            ("mean_frac_associated", "frac_associated", "Mean associated fraction"),
+            ("mean_up_duration_s", "Mean UP Dauer [s]", "Mean UP duration [s]"),
+            ("mean_up_rate_hz", "UP rate total [Hz]", "Mean UP rate [Hz]"),
+        ]
+        for ax, (col_mean, col_raw, title) in zip(axs, panels):
+            groups = grp["Group"].astype(str).tolist()
+            x = np.arange(len(groups), dtype=float)
+            data = []
+            for gname in groups:
+                vals = pd.to_numeric(d.loc[d["Group"] == gname, col_raw], errors="coerce").to_numpy(float)
+                vals = vals[np.isfinite(vals)]
+                data.append(vals)
+
+            valid_pairs = [(i, arr) for i, arr in enumerate(data) if arr.size > 0]
+            if valid_pairs:
+                pos = [i for i, _ in valid_pairs]
+                arrs = [arr for _, arr in valid_pairs]
+                bp = ax.boxplot(
+                    arrs,
+                    positions=pos,
+                    widths=0.5,
+                    whis=[5, 95],
+                    showfliers=False,
+                    patch_artist=True,
+                )
+                for patch in bp["boxes"]:
+                    patch.set(facecolor="#4C78A8", alpha=0.22, edgecolor="#4C78A8")
+                for med in bp["medians"]:
+                    med.set(color="#4C78A8", linewidth=1.8)
+                for whisk in bp["whiskers"]:
+                    whisk.set(color="#4C78A8", linewidth=1.2)
+                for cap in bp["caps"]:
+                    cap.set(color="#4C78A8", linewidth=1.2)
+
+            for i, vals in enumerate(data):
+                if vals.size == 0:
+                    continue
+                if vals.size == 1:
+                    xx = np.array([x[i]], dtype=float)
+                else:
+                    xx = np.linspace(x[i] - 0.16, x[i] + 0.16, vals.size)
+                ax.scatter(xx, vals, s=24, color="#111111", alpha=0.8, zorder=3, linewidths=0)
+                ax.text(x[i], np.nanmax(vals), f"n={vals.size}", ha="center", va="bottom", fontsize=8, color="#222222")
+
+            ax.set_title(title)
+            ax.set_xticks(np.arange(len(groups), dtype=float))
+            xt = [f"{g}\n(n={int(n)})" for g, n in zip(groups, grp["n_sessions"])]
+            ax.set_xticklabels(xt, rotation=0, ha="center")
+            ax.grid(axis="y", alpha=0.25)
+        fig.suptitle(f"{stem}: Group comparison (session means)", y=0.995)
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        out_png = os.path.join(out_dir, f"{stem}__group_compare.png")
+        fig.savefig(out_png, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[SUMMARY][GROUP] {out_png}")
+
+    def _load_metric_events(summary_files, metric):
+        rows = []
+        for sp in summary_files:
+            sess_dir = os.path.dirname(sp)
+            df_one = _read_any(sp)
+            if df_one is None or df_one.empty:
+                continue
+            r = df_one.iloc[-1].to_dict()
+            grp = _infer_group(r)
+
+            if metric == "up_duration_s":
+                files = sorted(glob.glob(os.path.join(sess_dir, "*__upstate_durations.csv")))
+                if not files:
+                    continue
+                try:
+                    dfm = pd.read_csv(files[-1])
+                    st = dfm.get("group", pd.Series([], dtype=str)).astype(str).str.lower().str.strip()
+                    st = st.replace({"spont": "spontaneous", "trig": "triggered", "trigger": "triggered"})
+                    val = pd.to_numeric(dfm.get("duration_s", pd.Series([], dtype=float)), errors="coerce")
+                    mask = np.isfinite(val) & st.isin(["spontaneous", "triggered"])
+                    for s, v in zip(st[mask], val[mask]):
+                        rows.append({"session_dir": sess_dir, "group": grp, "state": str(s), metric: float(v)})
+                except Exception:
+                    continue
+
+            elif metric == "up_amplitude":
+                files = sorted(glob.glob(os.path.join(sess_dir, "*__upstate_amplitudes.csv")))
+                if not files:
+                    continue
+                try:
+                    dfm = pd.read_csv(files[-1])
+                    st = dfm.get("group", pd.Series([], dtype=str)).astype(str).str.lower().str.strip()
+                    st = st.replace({"spont": "spontaneous", "trig": "triggered", "trigger": "triggered"})
+                    val = pd.to_numeric(dfm.get("amplitude", pd.Series([], dtype=float)), errors="coerce")
+                    mask = np.isfinite(val) & st.isin(["spontaneous", "triggered"])
+                    for s, v in zip(st[mask], val[mask]):
+                        rows.append({"session_dir": sess_dir, "group": grp, "state": str(s), metric: float(v)})
+                except Exception:
+                    continue
+
+            elif metric == "mahal_k3":
+                files = sorted(glob.glob(os.path.join(sess_dir, "*__pca_similarity_joint.csv")))
+                if not files:
+                    continue
+                try:
+                    dfm = pd.read_csv(files[-1])
+                    st = dfm.get("event_type", pd.Series([], dtype=str)).astype(str).str.lower().str.strip()
+                    st = st.replace({"spont": "spontaneous", "trig": "triggered", "trigger": "triggered"})
+                    val = pd.to_numeric(dfm.get("mahal_k3", pd.Series([], dtype=float)), errors="coerce")
+                    mask = np.isfinite(val) & st.isin(["spontaneous", "triggered"])
+                    for s, v in zip(st[mask], val[mask]):
+                        rows.append({"session_dir": sess_dir, "group": grp, "state": str(s), metric: float(v)})
+                except Exception:
+                    continue
+
+        return pd.DataFrame(rows)
+
+    def _group_pair_box_scatter(ax, df, col, title, ylabel):
+        if df is None or df.empty or col not in df.columns:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return
+
+        d = df.copy()
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+        d["state"] = d["state"].astype(str).str.lower()
+        d = d[np.isfinite(d[col]) & d["state"].isin(["spontaneous", "triggered"])]
+        if d.empty:
+            ax.text(0.5, 0.5, "no valid values", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return
+
+        groups = sorted(
+            d["group"].dropna().unique().tolist(),
+            key=lambda g: (
+                -(d.loc[d["group"] == g, "session_dir"].nunique()),
+                str(g)
+            ),
+        )
+        if not groups:
+            ax.text(0.5, 0.5, "no groups", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return
+
+        base_x = np.arange(len(groups), dtype=float)
+        states = [("spontaneous", -0.18, "#2ca02c"), ("triggered", 0.18, "#1f77b4")]
+        rng = np.random.default_rng(0)
+
+        for st, off, color in states:
+            plot_data = []
+            plot_pos = []
+            for i, g in enumerate(groups):
+                arr = pd.to_numeric(d.loc[(d["group"] == g) & (d["state"] == st), col], errors="coerce").to_numpy(float)
+                arr = arr[np.isfinite(arr)]
+                if arr.size == 0:
+                    continue
+                plot_data.append(arr)
+                plot_pos.append(base_x[i] + off)
+
+            if plot_data:
+                bp = ax.boxplot(
+                    plot_data,
+                    positions=plot_pos,
+                    widths=0.28,
+                    whis=[5, 95],
+                    showfliers=False,
+                    patch_artist=True,
+                )
+                for patch in bp["boxes"]:
+                    patch.set(facecolor=color, alpha=0.28, edgecolor=color)
+                for med in bp["medians"]:
+                    med.set(color=color, linewidth=1.8)
+                for whisk in bp["whiskers"]:
+                    whisk.set(color=color, linewidth=1.2)
+                for cap in bp["caps"]:
+                    cap.set(color=color, linewidth=1.2)
+
+                for pos, arr in zip(plot_pos, plot_data):
+                    xx = np.full(arr.size, pos, dtype=float)
+                    if arr.size > 1:
+                        xx = xx + (rng.random(arr.size) - 0.5) * 0.12
+                    ax.scatter(xx, arr, s=20, alpha=0.75, color=color, linewidths=0, zorder=3)
+                    ax.text(pos, np.nanmax(arr), f"n={arr.size}", ha="center", va="bottom", fontsize=7, color=color)
+
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(base_x)
+        ax.set_xticklabels(groups, rotation=0, ha="center")
+        ax.grid(axis="y", alpha=0.25, ls=":")
+        ax.plot([], [], color="#2ca02c", lw=2, label="Spontaneous")
+        ax.plot([], [], color="#1f77b4", lw=2, label="Triggered")
+        ax.legend(loc="best", frameon=False, fontsize=8)
+
+    def _write_parent_group_compare_pdf(parent_dir, summary_files):
+        d_dur = _load_metric_events(summary_files, "up_duration_s")
+        d_amp = _load_metric_events(summary_files, "up_amplitude")
+        d_mah = _load_metric_events(summary_files, "mahal_k3")
+        if d_dur.empty and d_amp.empty and d_mah.empty:
+            print("[SUMMARY][GROUP][PDF] skipped: no event-level rows")
+            return
+
+        if not d_dur.empty:
+            out_csv = os.path.join(parent_dir, "upstate_summary_ALL_parent__group_event_up_durations.csv")
+            _write_semicolon(out_csv, d_dur)
+            print(f"[SUMMARY][GROUP][PDF] {out_csv}")
+        if not d_amp.empty:
+            out_csv = os.path.join(parent_dir, "upstate_summary_ALL_parent__group_event_up_amplitudes.csv")
+            _write_semicolon(out_csv, d_amp)
+            print(f"[SUMMARY][GROUP][PDF] {out_csv}")
+        if not d_mah.empty:
+            out_csv = os.path.join(parent_dir, "upstate_summary_ALL_parent__group_event_mahal.csv")
+            _write_semicolon(out_csv, d_mah)
+            print(f"[SUMMARY][GROUP][PDF] {out_csv}")
+
+        out_pdf = os.path.join(parent_dir, "upstate_summary_ALL_parent__group_compare.pdf")
+        with PdfPages(out_pdf) as pdf:
+            fig, axs = plt.subplots(3, 1, figsize=(10, 12))
+            _group_pair_box_scatter(
+                axs[0], d_dur, "up_duration_s",
+                "UP duration (spontaneous vs triggered)",
+                "duration [s]"
+            )
+            _group_pair_box_scatter(
+                axs[1], d_amp, "up_amplitude",
+                "UP amplitude (spontaneous vs triggered)",
+                "amplitude [a.u.]"
+            )
+            _group_pair_box_scatter(
+                axs[2], d_mah, "mahal_k3",
+                "Mahalanobis distance in JOINT PCA space",
+                "mahal_k3"
+            )
+            fig.suptitle("Parent Group Compare", y=0.995)
+            fig.tight_layout(rect=[0, 0, 1, 0.98])
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+        print(f"[SUMMARY][GROUP][PDF] {out_pdf}")
+
     exp_dir       = os.path.dirname(summary_path)
     parent_dir    = os.path.dirname(exp_dir)        
     for_david_dir = os.path.dirname(parent_dir)     
@@ -811,6 +1102,8 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         out_parent = os.path.join(parent_dir, out_name)
         _write_semicolon(out_parent, r)
         print(f"[SUMMARY][ROLLUP Parent] {out_parent}  (Quellen: {len(files_parent)})")
+        _write_group_compare(r, parent_dir, "upstate_summary_ALL_parent")
+        _write_parent_group_compare_pdf(parent_dir, files_parent)
     else:
         print("[SUMMARY][ROLLUP Parent] keine Quellen gefunden")
 
@@ -823,5 +1116,6 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         out_fd = os.path.join(for_david_dir, out_name)
         _write_semicolon(out_fd, r_all)
         print(f"[SUMMARY][ROLLUP For David] {out_fd}  (Quellen: {len(files_all)})")
+        _write_group_compare(r_all, for_david_dir, "upstate_summary_ALL_global")
     else:
         print("[SUMMARY][ROLLUP For David] keine Quellen gefunden")
