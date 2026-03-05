@@ -31,8 +31,10 @@ def export_interactive_lfp_html(
     up_assoc_label="UP associated",
     spindle_spont=None,  # Tuple (UP_idx, DOWN_idx)
     spindle_trig=None,   # Tuple (UP_idx, DOWN_idx)
+    spindle_assoc=None,  # Tuple (UP_idx, DOWN_idx)
     spindle_spont_label="Spindle spontaneous",
     spindle_trig_label="Spindle triggered",
+    spindle_assoc_label="Spindle associated",
     spindle_intervals=None,  # list[(t0, t1)] in Sekunden
     max_points=300_000,
     title="LFP (interaktiv)",
@@ -125,6 +127,8 @@ def export_interactive_lfp_html(
         spindle_layers.append((str(spindle_spont_label), _mk_intervals(*spindle_spont), "rgba(46, 204, 113, 0.38)"))
     if spindle_trig:
         spindle_layers.append((str(spindle_trig_label), _mk_intervals(*spindle_trig), "rgba(31, 119, 180, 0.38)"))
+    if spindle_assoc:
+        spindle_layers.append((str(spindle_assoc_label), _mk_intervals(*spindle_assoc), "rgba(255, 127, 14, 0.38)"))
     if spindle_layers:
         for _, spans, fill in spindle_layers:
             _add_interval_spans(spans, fill, 0.52, 1.00)
@@ -310,6 +314,7 @@ def export_interactive_lfp_html(
             linewidth=2,
             linecolor="black",
             mirror="allticks",
+            tickfont=dict(size=16),
         ),
         yaxis=yaxis_cfg,
         shapes=shapes,
@@ -377,6 +382,17 @@ def export_interactive_dual_lfp_html(
         x_top = x_top[::step]
         x_bottom = x_bottom[::step]
 
+    # For display only: add a smooth spindle envelope so bursts stay readable when zoomed in.
+    x_top_env = np.abs(np.asarray(x_top, float))
+    if x_top_env.size:
+        dt_top = float(np.median(np.diff(t))) if t.size >= 2 and np.all(np.isfinite(t)) else np.nan
+        win = int(round(0.08 / dt_top)) if np.isfinite(dt_top) and dt_top > 0 else 5
+        win = max(5, win)
+        win = min(win, max(5, x_top_env.size))
+        if win > 1 and x_top_env.size >= win:
+            ker = np.ones(int(win), dtype=float) / float(win)
+            x_top_env = np.convolve(x_top_env, ker, mode="same")
+
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -386,7 +402,12 @@ def export_interactive_dual_lfp_html(
     )
     fig.add_trace(go.Scatter(
         x=t, y=x_top, mode="lines", name="10-15 Hz bandpass",
-        line=dict(color="magenta", width=1.8)
+        line=dict(color="magenta", width=1.2),
+        opacity=0.45,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=t, y=x_top_env, mode="lines", name="Spindle envelope",
+        line=dict(color="#8b0000", width=2.6)
     ), row=1, col=1)
     fig.add_trace(go.Scatter(x=t, y=x_bottom, mode="lines", name="LFP"), row=2, col=1)
 
@@ -524,6 +545,7 @@ def export_interactive_dual_lfp_html(
         linewidth=2,
         linecolor="black",
         mirror="allticks",
+        tickfont=dict(size=16),
         row=2, col=1,
     )
     fig.update_xaxes(
@@ -531,6 +553,7 @@ def export_interactive_dual_lfp_html(
         linewidth=2,
         linecolor="black",
         mirror="allticks",
+        tickfont=dict(size=16),
         row=1, col=1,
     )
     fig.update_yaxes(
@@ -539,6 +562,9 @@ def export_interactive_dual_lfp_html(
         linewidth=2,
         linecolor="black",
         mirror="allticks",
+        tickfont=dict(size=16),
+        title_font=dict(size=18),
+        fixedrange=True,
         row=1, col=1,
     )
     fig.update_yaxes(
@@ -547,6 +573,8 @@ def export_interactive_dual_lfp_html(
         linewidth=2,
         linecolor="black",
         mirror="allticks",
+        tickfont=dict(size=12),
+        title_font=dict(size=14),
         row=2, col=1,
     )
     fig.update_xaxes(rangeslider=dict(visible=True), row=2, col=1)
@@ -555,7 +583,7 @@ def export_interactive_dual_lfp_html(
         if range_vals is not None:
             yr = np.asarray(range_vals, dtype=float).ravel()
             if yr.size >= 2 and np.isfinite(yr[0]) and np.isfinite(yr[1]) and yr[1] > yr[0]:
-                fig.update_yaxes(range=[float(yr[0]), float(yr[1])], row=row, col=1)
+                fig.update_yaxes(range=[float(yr[0]), float(yr[1])], autorange=False, row=row, col=1)
             return
         if data is None:
             return
@@ -569,10 +597,10 @@ def export_interactive_dual_lfp_html(
             return
         if y1 <= y0:
             pad = max(abs(y0) * 0.1, 1.0)
-            fig.update_yaxes(range=[y0 - pad, y1 + pad], row=row, col=1)
+            fig.update_yaxes(range=[y0 - pad, y1 + pad], autorange=False, row=row, col=1)
             return
         pad = (y1 - y0) * float(pad_frac)
-        fig.update_yaxes(range=[y0 - pad, y1 + pad], row=row, col=1)
+        fig.update_yaxes(range=[y0 - pad, y1 + pad], autorange=False, row=row, col=1)
 
     _apply_y_range(y_range_top, 1, data=x_top, pad_frac=0.20)
     _apply_y_range(y_range_bottom, 2, data=x_bottom, pad_frac=0.08)

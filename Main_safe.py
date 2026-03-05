@@ -57,6 +57,7 @@ from processing import (
     crop_up_intervals,
     compute_refractory_period,
     compute_refractory_any_to_type,
+    pulse_to_event_latencies,
     pulse_to_up_latencies,
     upstate_amplitude_compare_ax,
     pulse_to_up_latency_hist_ax,
@@ -306,6 +307,35 @@ def load_parts_to_array_streaming_with_ttl(
     p1_on_list, p1_off_list = [], []
     p2_on_list, p2_off_list = [], []
     time_col_name = None
+    auto_stim_col = None
+
+    def _detect_auto_stim_col_in_df(df, chan_cols_local):
+        def _is_quasi_binary_local(col_name):
+            x = pd.to_numeric(df[col_name], errors="coerce").to_numpy(float)
+            x = x[np.isfinite(x)]
+            if x.size < 10:
+                return False
+            vals = np.unique(np.round(x, 3))
+            if len(vals) <= 4:
+                return True
+            p01 = (np.isclose(x, 0).sum() + np.isclose(x, 1).sum()) / x.size
+            return p01 >= 0.95
+
+        best_col, best_count = None, -1
+        for c in chan_cols_local:
+            if not _is_quasi_binary_local(c):
+                continue
+            x = pd.to_numeric(df[c], errors="coerce").to_numpy(float)
+            x = x[np.isfinite(x)]
+            if x.size < 3:
+                continue
+            lo, hi = np.nanpercentile(x, [10, 90])
+            thr = 0.5 * (lo + hi)
+            b = (x > thr).astype(np.int8)
+            rising = int(np.sum((b[1:] == 1) & (b[:-1] == 0)))
+            if rising > best_count:
+                best_col, best_count = c, rising
+        return best_col, best_count
 
 
 
@@ -330,6 +360,29 @@ def load_parts_to_array_streaming_with_ttl(
                 if c not in (time_col_name, "time", "timesamples", "timestamps", *stim_cols_in_file)
             ]
             chan_cols = sorted(raw_chan_cols, key=_key_num)
+
+            # Fallback wie im Non-Stream-Pfad:
+            # wenn keine bekannten TTL-Spalten vorhanden sind, nimm einen quasi-binären Kanal mit den meisten Rising-Edges.
+            if (
+                auto_stim_col is None
+                and not any(c in stim_cols_in_file for c in ("din_1", "din_2", "stim", "StartStop", "TTL", "DI0", "DI1"))
+            ):
+                best_col, best_count = _detect_auto_stim_col_in_df(df, chan_cols)
+                if best_col is not None and best_count > 0:
+                    auto_stim_col = best_col
+                    print(f"[STREAM] auto-detected stim channel fallback: {auto_stim_col} (rising={best_count})")
+
+        # Falls im ersten Part noch keine Flanken vorkamen, in späteren Parts erneut probieren.
+        if (
+            auto_stim_col is None
+            and stim_cols_in_file is not None
+            and not any(c in stim_cols_in_file for c in ("din_1", "din_2", "stim", "StartStop", "TTL", "DI0", "DI1"))
+            and chan_cols is not None
+        ):
+            best_col, best_count = _detect_auto_stim_col_in_df(df, chan_cols)
+            if best_col is not None and best_count > 0:
+                auto_stim_col = best_col
+                print(f"[STREAM] auto-detected stim channel fallback: {auto_stim_col} (rising={best_count})")
 
         # -------------------------
         # (A) TTL FULL-RES edges
@@ -368,6 +421,24 @@ def load_parts_to_array_streaming_with_ttl(
             # Fallback: wenn weder din_1 noch din_2 existiert, nimm stim als p1
             if ("din_1" not in stim_cols_in_file) and ("din_2" not in stim_cols_in_file) and ("stim" in stim_cols_in_file):
                 x1 = df["stim"]
+                if thr1 is None:
+                    xx = pd.to_numeric(x1, errors="coerce").to_numpy(float)
+                    xx = xx[np.isfinite(xx)]
+                    if xx.size:
+                        lo, hi = np.nanpercentile(xx, [10, 90])
+                        thr1 = 0.5 * (lo + hi)
+                if thr1 is not None:
+                    on, off, prev_b1 = edges_stateful(t_full, x1, thr1, prev_b1)
+                    p1_on_list.append(on); p1_off_list.append(off)
+
+            if (
+                ("din_1" not in stim_cols_in_file)
+                and ("din_2" not in stim_cols_in_file)
+                and ("stim" not in stim_cols_in_file)
+                and (auto_stim_col is not None)
+                and (auto_stim_col in df.columns)
+            ):
+                x1 = df[auto_stim_col]
                 if thr1 is None:
                     xx = pd.to_numeric(x1, errors="coerce").to_numpy(float)
                     xx = xx[np.isfinite(xx)]
@@ -1912,16 +1983,16 @@ def detect_spindle_intervals_in_upstates(
     *,
     f_lo=10.0,
     f_hi=15.0,
-    thr_k_on=1.1,
-    thr_k_off=0.5,
-    min_dur_s=0.25,
+    thr_k_on=0.8,
+    thr_k_off=0.3,
+    min_dur_s=0.18,
     max_dur_s=3.0,
-    max_gap_s=0.0,
+    max_gap_s=0.06,
     min_cycles=1,
-    min_spindle_band_power_ratio=1.05,
-    min_spindle_power_fraction=0.08,
-    min_env_peak_quantile=0.05,
-    min_env_peak_sigma=0.9,
+    min_spindle_band_power_ratio=1.0,
+    min_spindle_power_fraction=0.05,
+    min_env_peak_quantile=0.02,
+    min_env_peak_sigma=0.6,
     only_in_upstates=False,
     use_psd_check=False,
     causal_filter=True,
@@ -2127,6 +2198,7 @@ def _classify_spindles_by_pulse_latency(
     *,
     trig_win_s=1.0,
     min_lat_s=0.0,
+    followup_trig_gap_s=1.00,
 ):
     pulses = np.asarray(pulse_times_s, float) if pulse_times_s is not None else np.array([], float)
     pulses = pulses[np.isfinite(pulses)]
@@ -2135,9 +2207,23 @@ def _classify_spindles_by_pulse_latency(
     spont = []
     trig = []
     trig_latencies = []
+    last_triggered_end = None
 
     for t0, t1 in spindle_intervals_s:
         if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+            continue
+
+        # Cascade rule: if a spindle starts shortly after a triggered spindle ended,
+        # keep it in the triggered class instead of reclassifying it as spontaneous.
+        if (
+            last_triggered_end is not None
+            and float(followup_trig_gap_s) > 0
+            and float(t0) >= float(last_triggered_end)
+            and (float(t0) - float(last_triggered_end)) <= float(followup_trig_gap_s)
+        ):
+            trig.append((float(t0), float(t1)))
+            trig_latencies.append(np.nan)
+            last_triggered_end = float(t1)
             continue
 
         # Pulse-orientiert: Klassifikation über Latenz des Spindle-Onsets zum letzten Puls.
@@ -2154,6 +2240,7 @@ def _classify_spindles_by_pulse_latency(
         if float(min_lat_s) <= lat <= float(trig_win_s):
             trig.append((float(t0), float(t1)))
             trig_latencies.append(lat)
+            last_triggered_end = float(t1)
         else:
             spont.append((float(t0), float(t1)))
 
@@ -2273,6 +2360,25 @@ all_up_pairs += trig_up_pairs
 all_up_pairs += assoc_up_pairs
 spindle_intervals_s = detect_spindle_intervals_in_upstates(
     main_channel, time_s, dt, all_up_pairs
+    ,
+    thr_k_on=float(os.environ.get("SPINDLE_THR_ON", "0.8")),
+    thr_k_off=float(os.environ.get("SPINDLE_THR_OFF", "0.3")),
+    min_dur_s=float(os.environ.get("SPINDLE_MIN_DUR_S", "0.18")),
+    max_dur_s=float(os.environ.get("SPINDLE_MAX_DUR_S", "3.0")),
+    max_gap_s=float(os.environ.get("SPINDLE_MAX_GAP_S", "0.06")),
+    min_cycles=int(os.environ.get("SPINDLE_MIN_CYCLES", "1")),
+    min_spindle_band_power_ratio=float(os.environ.get("SPINDLE_MIN_BAND_RATIO", "1.0")),
+    min_spindle_power_fraction=float(os.environ.get("SPINDLE_MIN_POWER_FRACTION", "0.05")),
+    min_env_peak_quantile=float(os.environ.get("SPINDLE_MIN_ENV_Q", "0.02")),
+    min_env_peak_sigma=float(os.environ.get("SPINDLE_MIN_ENV_SIGMA", "0.6")),
+)
+print(
+    "[SPINDLE-CONFIG] "
+    f"thr_on={os.environ.get('SPINDLE_THR_ON', '0.8')} "
+    f"thr_off={os.environ.get('SPINDLE_THR_OFF', '0.3')} "
+    f"min_dur={os.environ.get('SPINDLE_MIN_DUR_S', '0.18')}s "
+    f"max_gap={os.environ.get('SPINDLE_MAX_GAP_S', '0.06')}s "
+    f"min_cycles={os.environ.get('SPINDLE_MIN_CYCLES', '1')}"
 )
 print(f"[SPINDLE] 10-15 Hz intervals (global): n={len(spindle_intervals_s)}")
 
@@ -2295,9 +2401,19 @@ spindle_spont_s, spindle_trig_s, spindle_trig_lat_s = _classify_spindles_by_puls
     trig_win_s=0.70,
     min_lat_s=0.00,
 )
+assoc_up_s = _pair_idx_to_time_intervals(assoc_up_pairs, time_s)
+spindle_assoc_s = []
+spindle_spont_only_s = []
+for t0, t1 in spindle_spont_s:
+    if any(_intervals_overlap(t0, t1, a0, a1) for a0, a1 in assoc_up_s):
+        spindle_assoc_s.append((float(t0), float(t1)))
+    else:
+        spindle_spont_only_s.append((float(t0), float(t1)))
+spindle_spont_s = spindle_spont_only_s
 print(
     "[SPINDLE-CLASS][pulse-onset] spont=", len(spindle_spont_s),
     "trig=", len(spindle_trig_s),
+    "assoc=", len(spindle_assoc_s),
     "pulses=", len(spindle_pulses_s),
     "ref=onset",
     "trig_lat_mean_s=", (float(np.nanmean(spindle_trig_lat_s)) if spindle_trig_lat_s.size else np.nan),
@@ -2312,6 +2428,40 @@ spindle_amp_trig = _interval_peak_to_peak(main_channel_bp_10_15, spindle_trig_s,
 # Für PCA: Intervalle in Indexpaare überführen.
 Spindle_Spont_UP, Spindle_Spont_DOWN = _time_intervals_to_idx_pairs(spindle_spont_s, time_s)
 Spindle_Trig_UP, Spindle_Trig_DOWN = _time_intervals_to_idx_pairs(spindle_trig_s, time_s)
+Spindle_Assoc_UP, Spindle_Assoc_DOWN = _time_intervals_to_idx_pairs(spindle_assoc_s, time_s)
+
+# Pulse->Spindle-Latenzen erst hier berechnen, weil Spindle_Trig_UP jetzt definiert ist.
+_lat_pulses = []
+if pulse_times_1 is not None and len(pulse_times_1):
+    _lat_pulses.append(np.asarray(pulse_times_1, float))
+if pulse_times_2 is not None and len(pulse_times_2):
+    _lat_pulses.append(np.asarray(pulse_times_2, float))
+all_pulse_times_for_latency = (
+    np.sort(np.concatenate(_lat_pulses))
+    if _lat_pulses
+    else np.array([], dtype=float)
+)
+
+spindle_latencies_trig = pulse_to_event_latencies(
+    all_pulse_times_for_latency,
+    Spindle_Trig_UP,
+    time_s,
+    max_win_s=1.0,
+)
+
+if spindle_latencies_trig.size:
+    spindle_lat_df = pd.DataFrame({
+        "latency_s": spindle_latencies_trig,
+        "latency_ms": spindle_latencies_trig * 1000.0,
+    })
+    spindle_lat_csv_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__pulse_to_spindle_latency.csv")
+    spindle_lat_df.to_csv(spindle_lat_csv_path, index=False)
+    print(
+        f"[CSV] Pulse->Spindle Latenzen geschrieben: "
+        f"{spindle_lat_csv_path}  (n={len(spindle_latencies_trig)})"
+    )
+else:
+    print("[INFO] keine Pulse->Spindle Latenzen gefunden (keine Pulse oder keine Trigger-Spindles)")
 
 debug_log("[DBG before pair] p1_on/off:",
           0 if pulse_times_1 is None else len(pulse_times_1),
@@ -2565,6 +2715,7 @@ print(
     "[SPINDLE-HTML] intervals for shading:",
     f"spont={len(Spindle_Spont_UP)}",
     f"trig={len(Spindle_Trig_UP)}",
+    f"assoc={len(Spindle_Assoc_UP)}",
 )
 main_channel_bp_10_15 = np.asarray(html_sig_src, float).copy()
 try:
@@ -2591,9 +2742,10 @@ export_interactive_lfp_html(
     pulse_intervals_2=[],
     up_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
     up_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
-    up_assoc=None,
+    up_assoc=(Spindle_Assoc_UP, Spindle_Assoc_DOWN),
     up_spont_label="Spindle spontaneous",
     up_trig_label="Spindle triggered",
+    up_assoc_label="Spindle associated",
     title=f"{BASE_TAG} — Spindle classification (10-15 Hz, interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=False,
@@ -2614,6 +2766,7 @@ export_interactive_lfp_html(
     up_assoc=None,
     spindle_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
     spindle_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
+    spindle_assoc=(Spindle_Assoc_UP, Spindle_Assoc_DOWN),
     title=f"{BASE_TAG} — UP states + Spindles (Overlay, interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=(not PULSE_ONSET_ONLY),
@@ -2633,7 +2786,7 @@ export_interactive_dual_lfp_html(
     pulse_intervals_2=ttl2_intervals,
     top_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
     top_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
-    top_assoc=None,
+    top_assoc=(Spindle_Assoc_UP, Spindle_Assoc_DOWN),
     bottom_spont=(Spontaneous_UP, Spontaneous_DOWN),
     bottom_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     bottom_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
@@ -3086,6 +3239,7 @@ def spindle_classification_main_ax(
     time_s,
     spindle_spont_intervals,
     spindle_trig_intervals,
+    spindle_assoc_intervals=None,
     pulse_times_1=None,
     pulse_times_2=None,
     pulse_times_1_off=None,
@@ -3119,6 +3273,7 @@ def spindle_classification_main_ax(
 
     _shade(spindle_spont_intervals, "#2ca02c", "Spindle spontaneous")
     _shade(spindle_trig_intervals, "#1f77b4", "Spindle triggered")
+    _shade(([] if spindle_assoc_intervals is None else spindle_assoc_intervals), "#ff7f0e", "Spindle associated")
 
     # Pulse-Linien (optional), analog zum Main-Classification-Plot
     y0, y1 = ax.get_ylim()
@@ -5401,6 +5556,7 @@ spindle_layout_rows = [
         time_s,
         spindle_spont_s,
         spindle_trig_s,
+        spindle_assoc_s,
         pulse_times_1=pulse_times_1,
         pulse_times_2=pulse_times_2,
         pulse_times_1_off=pulse_times_1_off,
@@ -5416,6 +5572,11 @@ spindle_layout_rows = [
          spindle_amp_spont, spindle_amp_trig, ax=ax,
          title="Spindle amplitudes (10-15 Hz, peak-to-peak): spontaneous vs triggered"
      )],
+    [lambda ax: pulse_to_up_latency_hist_ax(
+        spindle_latencies_trig,
+        ax=ax,
+        event_label="Spindle onset"
+    )],
     [lambda ax: (
         _blank_ax(ax, "Spindle PCA spont skipped")
         if (spindle_pca_fit_sp is None)

@@ -418,35 +418,47 @@ def compute_refractory_any_to_type(
     return np.array(refrac_any_to_spont, float), np.array(refrac_any_to_trig, float)
 
 
-def pulse_to_up_latencies(pulse_times, up_indices, time_s, max_win_s=1.0):
+def pulse_to_event_latencies(pulse_times, event_indices, time_s, max_win_s=1.0):
     """
-    Berechnet die Latenz zwischen Puls und Beginn des UP-Zustands.
-    Für jeden UP-Index wird der *letzte Puls davor* gesucht (innerhalb von max_win_s),
-    und die Differenz (UP_time - pulse_time) in Sekunden zurückgegeben.
+    Berechnet die Latenz zwischen Puls und Event-Beginn.
+    Fuer jeden Event-Index wird der letzte Puls davor gesucht (innerhalb von max_win_s),
+    und die Differenz (Event-Zeit - Puls-Zeit) in Sekunden zurueckgegeben.
     """
-    if pulse_times is None or len(pulse_times) == 0 or len(up_indices) == 0:
+    if pulse_times is None or len(pulse_times) == 0 or len(event_indices) == 0:
         return np.array([], float)
 
     pulse_times = np.asarray(pulse_times, float)
-    up_indices  = np.asarray(up_indices, int)
+    event_indices = np.asarray(event_indices, int)
 
-    # Zeitpunkte der UP-Onsets
-    up_t = time_s[up_indices]
+    # Zeitpunkte der Event-Onsets
+    event_t = time_s[event_indices]
     latencies = []
 
-    for t_up in up_t:
-        # alle Pulse, die vor diesem UP liegen
-        mask = pulse_times <= t_up
+    for t_event in event_t:
+        # alle Pulse, die vor diesem Event liegen
+        mask = pulse_times <= t_event
         if not mask.any():
             continue
-        t_p = pulse_times[mask][-1]    # letzter Puls vor UP
+        t_p = pulse_times[mask][-1]    # letzter Puls vor Event
 
-        lat = t_up - t_p
+        lat = t_event - t_p
         # Optionales Fenster: nur Pulse, die "in der Nähe" liegen
         if 0.0 <= lat <= max_win_s:
             latencies.append(lat)
 
     return np.array(latencies, float)
+
+
+def pulse_to_up_latencies(pulse_times, up_indices, time_s, max_win_s=1.0):
+    """
+    Rueckwaertskompatibler Wrapper fuer Pulse->UP-Latenzen.
+    """
+    return pulse_to_event_latencies(
+        pulse_times,
+        up_indices,
+        time_s,
+        max_win_s=max_win_s,
+    )
 
 
 
@@ -494,9 +506,10 @@ def upstate_amplitude_compare_ax(
     return fig
 
 
-def pulse_to_up_latency_hist_ax(latencies, ax=None, bins=30):
+def pulse_to_up_latency_hist_ax(latencies, ax=None, bins=30, event_label="UP", title=None):
 
     latencies = np.asarray(latencies, float)
+    event_label = str(event_label)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6.5, 3.0))
@@ -504,7 +517,7 @@ def pulse_to_up_latency_hist_ax(latencies, ax=None, bins=30):
         fig = ax.figure
 
     if latencies.size == 0:
-        ax.text(0.5, 0.5, "no Pulse→UP latencies", 
+        ax.text(0.5, 0.5, f"no Pulse->{event_label} latencies",
                 ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
         return fig
@@ -512,6 +525,7 @@ def pulse_to_up_latency_hist_ax(latencies, ax=None, bins=30):
     # in Millisekunden umrechnen
     lat_ms  = latencies * 1000.0
     mean_ms = float(np.nanmean(lat_ms))
+    plot_title = title or f"Pulse->{event_label} latencies (Mean = {mean_ms:.1f} ms)"
 
     # Histogramm
     ax.hist(lat_ms, bins=bins, alpha=0.8, label="Einzel-Latenzen")
@@ -520,9 +534,9 @@ def pulse_to_up_latency_hist_ax(latencies, ax=None, bins=30):
     ax.axvline(mean_ms, linestyle="--", linewidth=2,
                label=f"Mean = {mean_ms:.1f} ms")
 
-    ax.set_xlabel("Pulse→UP Latenz (ms)")
+    ax.set_xlabel(f"Pulse->{event_label} latency (ms)")
     ax.set_ylabel("Anzahl")
-    ax.set_title(f"Pulse→UP Latenzen (Mean = {mean_ms:.1f} ms)")
+    ax.set_title(plot_title)
 
     # Textbox oben rechts mit Mean + n
     ax.text(
