@@ -274,22 +274,39 @@ def export_interactive_lfp_html(
             name="Spindles 10-15 Hz",
             showlegend=True
         ))
-    # if pulse_times_1 is not None and len(pulse_times_1):
-    #     fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-    #                              line=dict(width=1, dash="dot", color="red"),
-    #                              name="Pulse 1"))
+    if pulse_times_1 is not None and len(pulse_times_1):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dot", color="red"),
+            name="Pulse 1 ON"
+        ))
+    if pulse_times_2 is not None and len(pulse_times_2):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 ON"
+        ))
     if pulse_times_1_off is not None and len(pulse_times_1_off):
-        fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-                                 line=dict(width=1, dash="dot", color="red"),
-                                 name="Pulse 1 OFF"))
-    # if pulse_times_2 is not None and len(pulse_times_2):
-    #     fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-    #                              line=dict(width=1, dash="dash", color="red"),
-    #                              name="Pulse 2"))
-    if show_pulse_intervals and pulse_intervals_1 is not None and len(pulse_intervals_1):
-        fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-                                 line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
-                                 name="Pulse 1 duration"))
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dot", color="red"),
+            name="Pulse 1 OFF"
+        ))
+    if pulse_times_2_off is not None and len(pulse_times_2_off):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 OFF"
+        ))
+    if show_pulse_intervals and (
+        (pulse_intervals_1 is not None and len(pulse_intervals_1)) or
+        (pulse_intervals_2 is not None and len(pulse_intervals_2))
+    ):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
+            name="Pulse duration (ON→OFF)"
+        ))
 
 
     yaxis_cfg = dict(
@@ -517,19 +534,38 @@ def export_interactive_dual_lfp_html(
             line=dict(width=12, color=fill),
             name=label,
         ))
-    if show_pulse_intervals and pulse_intervals_1 is not None and len(pulse_intervals_1):
+    if pulse_times_1 is not None and len(pulse_times_1):
         fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode="lines",
-            line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
-            name="Pulse duration",
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dot", color="red"),
+            name="Pulse 1 ON",
+        ))
+    if pulse_times_2 is not None and len(pulse_times_2):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 ON",
         ))
     if pulse_times_1_off is not None and len(pulse_times_1_off):
         fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode="lines",
+            x=[None], y=[None], mode="lines",
             line=dict(width=2, dash="dot", color="red"),
-            name="Pulse OFF",
+            name="Pulse 1 OFF",
+        ))
+    if pulse_times_2_off is not None and len(pulse_times_2_off):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 OFF",
+        ))
+    if show_pulse_intervals and (
+        (pulse_intervals_1 is not None and len(pulse_intervals_1)) or
+        (pulse_intervals_2 is not None and len(pulse_intervals_2))
+    ):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
+            name="Pulse duration (ON→OFF)",
         ))
 
     fig.update_layout(
@@ -765,19 +801,38 @@ def export_interactive_spectrogram_html(
     _add_pulse_lines(pulse_times_1_off, "dot", 0.55, "x2")
     _add_pulse_lines(pulse_times_2_off, "dash", 0.55, "x2")
 
-    if pulse_intervals_1 is not None and len(pulse_intervals_1):
+    if pulse_times_1 is not None and len(pulse_times_1):
         fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode="lines",
-            line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
-            name="Pulse duration",
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dot", color="red"),
+            name="Pulse 1 ON",
+        ))
+    if pulse_times_2 is not None and len(pulse_times_2):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 ON",
         ))
     if pulse_times_1_off is not None and len(pulse_times_1_off):
         fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode="lines",
+            x=[None], y=[None], mode="lines",
             line=dict(width=2, dash="dot", color="red"),
-            name="Pulse OFF",
+            name="Pulse 1 OFF",
+        ))
+    if pulse_times_2_off is not None and len(pulse_times_2_off):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 OFF",
+        ))
+    if (
+        (pulse_intervals_1 is not None and len(pulse_intervals_1)) or
+        (pulse_intervals_2 is not None and len(pulse_intervals_2))
+    ):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
+            name="Pulse duration (ON→OFF)",
         ))
     if intervals:
         for label, _, fill in intervals:

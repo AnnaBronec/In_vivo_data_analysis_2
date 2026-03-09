@@ -85,6 +85,8 @@ AUTO_PULSE_EDGE_SHIFT = os.environ.get("AUTO_PULSE_EDGE_SHIFT", "0") == "1"
 AUTO_CLEAR_TINY_OFFSETS = os.environ.get("AUTO_CLEAR_TINY_OFFSETS", "0") == "1"
 AUTO_PULSE_ARTIFACT_ALIGN = os.environ.get("AUTO_PULSE_ARTIFACT_ALIGN", "0") == "1"
 FORCE_ONSET_ONLY_PLOTS = os.environ.get("FORCE_ONSET_ONLY_PLOTS", "1") == "1"
+IGNORE_PULSE_2 = os.environ.get("IGNORE_PULSE_2", "0") == "1"
+SPINDLE_ZERO_PHASE = os.environ.get("SPINDLE_ZERO_PHASE", "1") == "1"
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
 
@@ -1115,6 +1117,16 @@ pulse_times_2 = _ensure_seconds(pulse_times_2, time_s, DEFAULT_FS_XDAT)
 pulse_times_1_off = _ensure_seconds(pulse_times_1_off, time_s, DEFAULT_FS_XDAT)
 pulse_times_2_off = _ensure_seconds(pulse_times_2_off, time_s, DEFAULT_FS_XDAT)
 
+# Optional: second pulse train komplett ignorieren (Analyse + HTML + CSV).
+if IGNORE_PULSE_2:
+    pulse_times_2 = np.array([], dtype=float)
+    pulse_times_2_off = np.array([], dtype=float)
+    pulse_times_2_full = np.array([], dtype=float)
+    pulse_times_2_off_full = np.array([], dtype=float)
+    pulse_times_2_html = np.array([], dtype=float)
+    pulse_times_2_off_html = np.array([], dtype=float)
+    print("[PULSE] IGNORE_PULSE_2=1 -> Pulse 2 disabled")
+
 if pulse_times_1_full is not None and len(pulse_times_1_full):
     _debug_event_snap_report("P1-ONSET-SNAP", pulse_times_1_full, pulse_times_1, time_s)
 if pulse_times_1_off_full is not None and len(pulse_times_1_off_full):
@@ -1983,17 +1995,19 @@ def detect_spindle_intervals_in_upstates(
     *,
     f_lo=10.0,
     f_hi=15.0,
-    thr_k_on=0.8,
-    thr_k_off=0.3,
-    min_dur_s=0.18,
+    thr_k_on=0.75,
+    thr_k_off=0.20,
+    min_dur_s=0.14,
     max_dur_s=3.0,
-    max_gap_s=0.06,
+    max_gap_s=0.12,
     min_cycles=1,
     min_spindle_band_power_ratio=1.0,
     min_spindle_power_fraction=0.05,
     min_env_peak_quantile=0.02,
-    min_env_peak_sigma=0.6,
-    only_in_upstates=False,
+    min_env_peak_sigma=0.55,
+    off_below_s=0.06,
+    only_in_upstates=True,
+    require_up_overlap=False,
     use_psd_check=False,
     causal_filter=True,
 ):
@@ -2021,14 +2035,28 @@ def detect_spindle_intervals_in_upstates(
     except Exception:
         return []
 
+    valid_up_pairs = []
+    for u, d in up_pairs:
+        try:
+            ui = int(u)
+            di = int(d)
+        except Exception:
+            continue
+        ui = max(0, min(ui, x.size))
+        di = max(0, min(di, x.size))
+        if di > ui:
+            valid_up_pairs.append((ui, di))
+
     if only_in_upstates:
         up_mask = np.zeros_like(x, dtype=bool)
-        for u, d in up_pairs:
+        for u, d in valid_up_pairs:
             up_mask[u:d] = True
         if not np.any(up_mask):
             return []
     else:
         up_mask = np.ones_like(x, dtype=bool)
+        if require_up_overlap and (not valid_up_pairs):
+            return []
 
     e_up = env[up_mask]
     med = float(np.nanmedian(e_up))
@@ -2048,20 +2076,29 @@ def detect_spindle_intervals_in_upstates(
     segs = []
     in_seg = False
     s = 0
+    off_below_n = max(1, int(round(float(off_below_s) / dt)))
+    below_count = 0
     for i in range(x.size):
         if not up_mask[i]:
             if in_seg:
                 segs.append((s, i))
                 in_seg = False
+                below_count = 0
             continue
         if not in_seg:
             if env[i] >= thr_on:
                 s = i
                 in_seg = True
+                below_count = 0
         else:
             if env[i] < thr_off:
-                segs.append((s, i))
-                in_seg = False
+                below_count += 1
+                if below_count >= off_below_n:
+                    segs.append((s, i + 1))
+                    in_seg = False
+                    below_count = 0
+            else:
+                below_count = 0
     if in_seg:
         segs.append((s, x.size))
 
@@ -2089,6 +2126,14 @@ def detect_spindle_intervals_in_upstates(
     n_after_psd = 0
     min_peak_distance = max(1, int(round(fs / max(f_hi, 1.0) * 0.8)))
     for s, e in segs:
+        if require_up_overlap:
+            hit_up = False
+            for u, d in valid_up_pairs:
+                if (s < d) and (e > u):
+                    hit_up = True
+                    break
+            if not hit_up:
+                continue
         L = e - s
         if L < min_len or L > max_len:
             continue
@@ -2198,7 +2243,7 @@ def _classify_spindles_by_pulse_latency(
     *,
     trig_win_s=1.0,
     min_lat_s=0.0,
-    followup_trig_gap_s=1.00,
+    followup_trig_gap_s=0.35,
 ):
     pulses = np.asarray(pulse_times_s, float) if pulse_times_s is not None else np.array([], float)
     pulses = pulses[np.isfinite(pulses)]
@@ -2334,6 +2379,47 @@ def _classify_spindles_by_up_type(spindle_intervals_s, spont_up_s, trig_up_s, as
     return spont, trig, assoc, other
 
 
+def _enforce_assoc_blocks_triggered(assoc_intervals_s, trig_intervals_s, block_gap_s=0.35):
+    gap = max(0.0, float(block_gap_s))
+    assoc_in = [
+        (float(t0), float(t1))
+        for (t0, t1) in assoc_intervals_s
+        if np.isfinite(t0) and np.isfinite(t1) and (t1 > t0)
+    ]
+    trig_in = [
+        (float(t0), float(t1))
+        for (t0, t1) in trig_intervals_s
+        if np.isfinite(t0) and np.isfinite(t1) and (t1 > t0)
+    ]
+    if gap <= 0.0 or (not assoc_in) or (not trig_in):
+        return assoc_in, trig_in
+
+    events = [(t0, t1, "assoc") for (t0, t1) in assoc_in] + [(t0, t1, "trig") for (t0, t1) in trig_in]
+    events.sort(key=lambda v: (v[0], v[1], 0 if v[2] == "assoc" else 1))
+
+    assoc_out = []
+    trig_out = []
+    last_assoc_end = None
+
+    for t0, t1, tag in events:
+        if tag == "assoc":
+            assoc_out.append((t0, t1))
+            last_assoc_end = t1
+            continue
+
+        if (
+            last_assoc_end is not None
+            and t0 >= last_assoc_end
+            and (t0 - last_assoc_end) <= gap
+        ):
+            assoc_out.append((t0, t1))
+            last_assoc_end = t1
+        else:
+            trig_out.append((t0, t1))
+
+    return assoc_out, trig_out
+
+
 def _interval_peak_to_peak(signal_1d, intervals_s, time_s):
     sig = np.asarray(signal_1d, float).reshape(-1)
     t = np.asarray(time_s, float).reshape(-1)
@@ -2350,6 +2436,20 @@ def _interval_peak_to_peak(signal_1d, intervals_s, time_s):
     return np.asarray(amps, float)
 
 
+def _spindle_counts_per_upstate(up_intervals_s, spindle_intervals_s):
+    up = [(float(u0), float(u1)) for (u0, u1) in up_intervals_s if np.isfinite(u0) and np.isfinite(u1) and (u1 > u0)]
+    sp = [(float(s0), float(s1)) for (s0, s1) in spindle_intervals_s if np.isfinite(s0) and np.isfinite(s1) and (s1 > s0)]
+    if not up:
+        return np.array([], dtype=float)
+    if not sp:
+        return np.zeros(len(up), dtype=float)
+    spindle_onsets = np.asarray([s0 for (s0, _) in sp], dtype=float)
+    counts = np.zeros(len(up), dtype=float)
+    for i, (u0, u1) in enumerate(up):
+        counts[i] = float(np.sum((spindle_onsets >= u0) & (spindle_onsets < u1)))
+    return counts
+
+
 spont_up_pairs = _pair_up_down_indices(Spontaneous_UP, Spontaneous_DOWN, len(time_s))
 trig_up_pairs = _pair_up_down_indices(Pulse_triggered_UP, Pulse_triggered_DOWN, len(time_s))
 assoc_up_pairs = _pair_up_down_indices(Pulse_associated_UP, Pulse_associated_DOWN, len(time_s))
@@ -2361,30 +2461,41 @@ all_up_pairs += assoc_up_pairs
 spindle_intervals_s = detect_spindle_intervals_in_upstates(
     main_channel, time_s, dt, all_up_pairs
     ,
-    thr_k_on=float(os.environ.get("SPINDLE_THR_ON", "0.8")),
-    thr_k_off=float(os.environ.get("SPINDLE_THR_OFF", "0.3")),
-    min_dur_s=float(os.environ.get("SPINDLE_MIN_DUR_S", "0.18")),
+    thr_k_on=float(os.environ.get("SPINDLE_THR_ON", "0.75")),
+    thr_k_off=float(os.environ.get("SPINDLE_THR_OFF", "0.20")),
+    min_dur_s=float(os.environ.get("SPINDLE_MIN_DUR_S", "0.14")),
     max_dur_s=float(os.environ.get("SPINDLE_MAX_DUR_S", "3.0")),
-    max_gap_s=float(os.environ.get("SPINDLE_MAX_GAP_S", "0.06")),
+    max_gap_s=float(os.environ.get("SPINDLE_MAX_GAP_S", "0.12")),
     min_cycles=int(os.environ.get("SPINDLE_MIN_CYCLES", "1")),
     min_spindle_band_power_ratio=float(os.environ.get("SPINDLE_MIN_BAND_RATIO", "1.0")),
     min_spindle_power_fraction=float(os.environ.get("SPINDLE_MIN_POWER_FRACTION", "0.05")),
     min_env_peak_quantile=float(os.environ.get("SPINDLE_MIN_ENV_Q", "0.02")),
-    min_env_peak_sigma=float(os.environ.get("SPINDLE_MIN_ENV_SIGMA", "0.6")),
+    min_env_peak_sigma=float(os.environ.get("SPINDLE_MIN_ENV_SIGMA", "0.55")),
+    off_below_s=float(os.environ.get("SPINDLE_OFF_BELOW_S", "0.06")),
+    only_in_upstates=False,
+    require_up_overlap=True,
+    causal_filter=(not SPINDLE_ZERO_PHASE),
 )
 print(
     "[SPINDLE-CONFIG] "
-    f"thr_on={os.environ.get('SPINDLE_THR_ON', '0.8')} "
-    f"thr_off={os.environ.get('SPINDLE_THR_OFF', '0.3')} "
-    f"min_dur={os.environ.get('SPINDLE_MIN_DUR_S', '0.18')}s "
-    f"max_gap={os.environ.get('SPINDLE_MAX_GAP_S', '0.06')}s "
-    f"min_cycles={os.environ.get('SPINDLE_MIN_CYCLES', '1')}"
+    f"thr_on={os.environ.get('SPINDLE_THR_ON', '0.75')} "
+    f"thr_off={os.environ.get('SPINDLE_THR_OFF', '0.20')} "
+    f"min_dur={os.environ.get('SPINDLE_MIN_DUR_S', '0.14')}s "
+    f"max_gap={os.environ.get('SPINDLE_MAX_GAP_S', '0.12')}s "
+    f"min_cycles={os.environ.get('SPINDLE_MIN_CYCLES', '1')} "
+    f"min_env_sigma={os.environ.get('SPINDLE_MIN_ENV_SIGMA', '0.55')} "
+    f"off_below_s={os.environ.get('SPINDLE_OFF_BELOW_S', '0.06')} "
+    f"only_in_upstates=0 "
+    f"require_up_overlap=1 "
+    f"filter_mode={'zero_phase' if SPINDLE_ZERO_PHASE else 'causal'}"
 )
-print(f"[SPINDLE] 10-15 Hz intervals (global): n={len(spindle_intervals_s)}")
+print(f"[SPINDLE] 10-15 Hz intervals (UP-overlap required): n={len(spindle_intervals_s)}")
 
 # Bandpass-Signal (10-15 Hz) für Spindle-Visualisierung/Amplituden.
 main_channel_for_spindle = main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel
-main_channel_bp_10_15 = _bandpass_1d(main_channel_for_spindle, dt, f_lo=10.0, f_hi=15.0, order=3, causal=True)
+main_channel_bp_10_15 = _bandpass_1d(
+    main_channel_for_spindle, dt, f_lo=10.0, f_hi=15.0, order=3, causal=(not SPINDLE_ZERO_PHASE)
+)
 
 # Pulse-orientierte Spindle-Klassifikation über echten Spindle-Onset.
 # WICHTIG: Trigger-Referenz ist explizit der Pulse-ONSET (nicht OFF).
@@ -2400,7 +2511,10 @@ spindle_spont_s, spindle_trig_s, spindle_trig_lat_s = _classify_spindles_by_puls
     spindle_pulses_s,
     trig_win_s=0.70,
     min_lat_s=0.00,
+    followup_trig_gap_s=float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.35")),
 )
+spont_up_s = _pair_idx_to_time_intervals(spont_up_pairs, time_s)
+trig_up_s = _pair_idx_to_time_intervals(trig_up_pairs, time_s)
 assoc_up_s = _pair_idx_to_time_intervals(assoc_up_pairs, time_s)
 spindle_assoc_s = []
 spindle_spont_only_s = []
@@ -2410,14 +2524,26 @@ for t0, t1 in spindle_spont_s:
     else:
         spindle_spont_only_s.append((float(t0), float(t1)))
 spindle_spont_s = spindle_spont_only_s
+spindle_assoc_s, spindle_trig_s = _enforce_assoc_blocks_triggered(
+    spindle_assoc_s,
+    spindle_trig_s,
+    block_gap_s=float(os.environ.get("SPINDLE_ASSOC_BLOCK_TRIG_GAP_S", "0.35")),
+)
 print(
     "[SPINDLE-CLASS][pulse-onset] spont=", len(spindle_spont_s),
     "trig=", len(spindle_trig_s),
     "assoc=", len(spindle_assoc_s),
     "pulses=", len(spindle_pulses_s),
     "ref=onset",
+    "followup_gap_s=", float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.35")),
+    "assoc_blocks_trig_gap_s=", float(os.environ.get("SPINDLE_ASSOC_BLOCK_TRIG_GAP_S", "0.35")),
     "trig_lat_mean_s=", (float(np.nanmean(spindle_trig_lat_s)) if spindle_trig_lat_s.size else np.nan),
 )
+
+# Spindles pro UP-state (Onset innerhalb des UP-Intervalls; inklusive 0er-UPs).
+spindle_per_up_spont = _spindle_counts_per_upstate(spont_up_s, spindle_intervals_s)
+spindle_per_up_trig = _spindle_counts_per_upstate(trig_up_s, spindle_intervals_s)
+spindle_per_up_assoc = _spindle_counts_per_upstate(assoc_up_s, spindle_intervals_s)
 
 # Spindle-Metriken (nur spontane vs getriggerte Spindles).
 spindle_dur_spont = np.asarray([t1 - t0 for (t0, t1) in spindle_spont_s], float)
@@ -2475,6 +2601,11 @@ pulse_times_1_html     = _ensure_seconds(pulse_times_1_full,     time_s, DEFAULT
 pulse_times_1_off_html = _ensure_seconds(pulse_times_1_off_full, time_s, DEFAULT_FS_XDAT)
 pulse_times_2_html     = _ensure_seconds(pulse_times_2_full,     time_s, DEFAULT_FS_XDAT)
 pulse_times_2_off_html = _ensure_seconds(pulse_times_2_off_full, time_s, DEFAULT_FS_XDAT)
+
+# Safety guard: ensure Pulse 2 is really absent in HTML exports when disabled.
+if IGNORE_PULSE_2:
+    pulse_times_2_html = np.array([], dtype=float)
+    pulse_times_2_off_html = np.array([], dtype=float)
 
 # clip to current plot window (after cropping)
 t0, t1 = float(time_s[0]), float(time_s[-1])
@@ -2571,12 +2702,17 @@ pulse_times_1_off_html = _clip_to_window(pulse_times_1_off_html, tmin, tmax)
 pulse_times_2_html     = _clip_to_window(pulse_times_2_html,     tmin, tmax)
 pulse_times_2_off_html = _clip_to_window(pulse_times_2_off_html, tmin, tmax)
 
+if IGNORE_PULSE_2:
+    pulse_times_2_html = np.array([], dtype=float)
+    pulse_times_2_off_html = np.array([], dtype=float)
+
 # Intervals neu bauen (nach dem Clip!)
 ttl1_intervals = _pair_on_off(pulse_times_1_html, pulse_times_1_off_html, max_width_s=5.0)
 ttl2_intervals = _pair_on_off(pulse_times_2_html, pulse_times_2_off_html, max_width_s=5.0)
 
 print("[HTML FINAL] p1_on/off:", len(pulse_times_1_html), len(pulse_times_1_off_html),
-      "| ttl1_intervals:", len(ttl1_intervals))
+      "| p2_on/off:", len(pulse_times_2_html), len(pulse_times_2_off_html),
+      "| ttl1/ttl2:", len(ttl1_intervals), len(ttl2_intervals))
 print("[HTML FINAL] time window:", tmin, "->", tmax)
 
 # If OFF edges are missing/unreliable, show only onset lines (no pulse-duration areas).
@@ -2603,6 +2739,16 @@ if FORCE_ONSET_ONLY_PLOTS:
 
 pulse_times_1_off_html_plot = np.array([], float) if PULSE_ONSET_ONLY else pulse_times_1_off_html
 pulse_times_2_off_html_plot = np.array([], float) if PULSE_ONSET_ONLY else pulse_times_2_off_html
+
+# Final export-level guard (prevents any Pulse 2 rendering in HTML when requested).
+if IGNORE_PULSE_2:
+    pulse_times_2_html_export = np.array([], dtype=float)
+    pulse_times_2_off_html_export = np.array([], dtype=float)
+    ttl2_intervals_export = []
+else:
+    pulse_times_2_html_export = pulse_times_2_html
+    pulse_times_2_off_html_export = pulse_times_2_off_html_plot
+    ttl2_intervals_export = ttl2_intervals
 
 # Einheitliche y-Achse eine Ebene höher (Parent-Ordner) für alle HTML-Exports.
 # Datei liegt im Parent von BASE_PATH, damit mehrere Experimente dieselbe Skala teilen.
@@ -2673,11 +2819,11 @@ export_interactive_lfp_html(
     main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
 
     pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html,
+    pulse_times_2=pulse_times_2_html_export,
     pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_export,
     pulse_intervals_1=ttl1_intervals,
-    pulse_intervals_2=ttl2_intervals,
+    pulse_intervals_2=ttl2_intervals_export,
     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
@@ -2694,11 +2840,11 @@ export_interactive_lfp_html(
     f"{BASE_TAG}__pulse_only", SAVE_DIR, time_s,
     main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
     pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html,
+    pulse_times_2=pulse_times_2_html_export,
     pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_export,
     pulse_intervals_1=ttl1_intervals,
-    pulse_intervals_2=ttl2_intervals,
+    pulse_intervals_2=ttl2_intervals_export,
     up_spont=None,
     up_trig=None,
     up_assoc=None,
@@ -2735,9 +2881,9 @@ except Exception as e:
 export_interactive_lfp_html(
     f"{BASE_TAG}__main_10_15hz", SAVE_DIR, time_s, main_channel_bp_10_15,
     pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html,
+    pulse_times_2=pulse_times_2_html_export,
     pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_export,
     pulse_intervals_1=[],
     pulse_intervals_2=[],
     up_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
@@ -2756,11 +2902,11 @@ export_interactive_lfp_html(
     f"{BASE_TAG}__upstate_spindle_overlay", SAVE_DIR, time_s,
     main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
     pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html,
+    pulse_times_2=pulse_times_2_html_export,
     pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_export,
     pulse_intervals_1=ttl1_intervals,
-    pulse_intervals_2=ttl2_intervals,
+    pulse_intervals_2=ttl2_intervals_export,
     up_spont=(Spontaneous_UP, Spontaneous_DOWN),
     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     up_assoc=None,
@@ -2779,11 +2925,11 @@ export_interactive_dual_lfp_html(
     main_channel_bp_10_15,
     main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
     pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html,
+    pulse_times_2=pulse_times_2_html_export,
     pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_plot,
+    pulse_times_2_off=pulse_times_2_off_html_export,
     pulse_intervals_1=ttl1_intervals,
-    pulse_intervals_2=ttl2_intervals,
+    pulse_intervals_2=ttl2_intervals_export,
     top_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
     top_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
     top_assoc=(Spindle_Assoc_UP, Spindle_Assoc_DOWN),
@@ -3152,6 +3298,31 @@ def spindle_duration_compare_ax(spont_dur_s, trig_dur_s, ax=None, title="Spindle
     else:
         fig = ax.figure
 
+    def _p_to_sig_label(p, alpha=0.05):
+        if not np.isfinite(p):
+            return "n/a"
+        if p < 1e-4:
+            return "****"
+        if p < 1e-3:
+            return "***"
+        if p < 1e-2:
+            return "**"
+        if p < float(alpha):
+            return "*"
+        return "n.s."
+
+    def _annotate_sig(axh, x1, x2, p, alpha=0.05):
+        lab = _p_to_sig_label(p, alpha=alpha)
+        if lab == "n/a":
+            return
+        y0, y1 = axh.get_ylim()
+        yr = (y1 - y0) if (np.isfinite(y1 - y0) and (y1 > y0)) else max(abs(y1), 1.0)
+        h = 0.04 * yr
+        y = y1 + 0.01 * yr
+        axh.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=1.2, color="black", clip_on=False)
+        axh.text((x1 + x2) * 0.5, y + h, lab, ha="center", va="bottom", fontsize=10, fontweight="bold")
+        axh.set_ylim(y0, y1 + 0.14 * yr)
+
     sp = np.asarray(spont_dur_s, float)
     tr = np.asarray(trig_dur_s, float)
     sp = sp[np.isfinite(sp)]
@@ -3172,21 +3343,112 @@ def spindle_duration_compare_ax(spont_dur_s, trig_dur_s, ax=None, title="Spindle
     ax.set_ylabel("Duration (s)")
     ax.set_title(title)
     ax.grid(alpha=0.15, linestyle=":")
+    p_val = np.nan
+    delta = np.nan
+    if sp.size >= 2 and tr.size >= 2:
+        try:
+            _, p_val = stats.mannwhitneyu(sp, tr, alternative="two-sided")
+        except Exception:
+            p_val = np.nan
+        try:
+            gt = np.sum(sp[:, None] > tr[None, :])
+            lt = np.sum(sp[:, None] < tr[None, :])
+            delta = float((gt - lt) / float(sp.size * tr.size))
+        except Exception:
+            delta = np.nan
     if sp.size and tr.size:
         info_txt = (
             f"n_sp={sp.size}\n"
             f"n_tr={tr.size}\n"
             f"mean_sp={np.nanmean(sp):.3f}s\n"
-            f"mean_tr={np.nanmean(tr):.3f}s"
+            f"mean_tr={np.nanmean(tr):.3f}s\n"
+            f"MWU p={(p_val if np.isfinite(p_val) else np.nan):.2e}"
         )
     else:
         info_txt = f"n_sp={sp.size}\n" f"n_tr={tr.size}"
+    if np.isfinite(p_val):
+        info_txt += f"\nsignifikant (a=0.05): {'ja' if p_val < 0.05 else 'nein'}"
+        info_txt += f"\nSig: {_p_to_sig_label(p_val, alpha=0.05)}"
+    if np.isfinite(delta):
+        info_txt += f"\nCliff's d={delta:.2f}"
     ax.text(
         0.98, 0.95,
         info_txt,
         transform=ax.transAxes, ha="right", va="top",
         fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
     )
+    if sp.size and tr.size and np.isfinite(p_val):
+        _annotate_sig(ax, 1, 2, p_val, alpha=0.05)
+    return fig
+
+
+def spindle_count_per_upstate_ax(
+    counts_spont,
+    counts_trig,
+    counts_assoc,
+    ax=None,
+    title="Spindles per UP-state (10-15 Hz bandpass)"
+):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    else:
+        fig = ax.figure
+
+    groups = [
+        ("Spontaneous", np.asarray(counts_spont, float), "#2ca02c"),
+        ("Triggered", np.asarray(counts_trig, float), "#1f77b4"),
+        ("Associated", np.asarray(counts_assoc, float), "#ff7f0e"),
+    ]
+    rng = np.random.default_rng(0)
+    any_data = False
+
+    for i, (label, arr, color) in enumerate(groups, start=1):
+        vals = arr[np.isfinite(arr)]
+        if vals.size == 0:
+            continue
+        any_data = True
+        jitter = rng.uniform(-0.14, 0.14, size=vals.size)
+        x = i + jitter
+        ax.scatter(x, vals, s=24, alpha=0.65, color=color, edgecolors="none", label=label)
+        m = float(np.nanmean(vals))
+        ax.hlines(m, i - 0.23, i + 0.23, colors=color, linewidth=2.6, zorder=4)
+
+    if not any_data:
+        _blank_ax(ax, "no UP-states for spindle count")
+        return fig
+
+    ax.set_xticks([1, 2, 3], ["Spontaneous", "Triggered", "Associated"])
+    ax.set_ylabel("Spindles per UP-state (count)")
+    ax.set_title(title)
+    ax.grid(alpha=0.15, linestyle=":")
+    ax.set_axisbelow(True)
+
+    ymax = float(np.nanmax([
+        np.nanmax(np.asarray(counts_spont, float)) if np.asarray(counts_spont, float).size else 0.0,
+        np.nanmax(np.asarray(counts_trig, float)) if np.asarray(counts_trig, float).size else 0.0,
+        np.nanmax(np.asarray(counts_assoc, float)) if np.asarray(counts_assoc, float).size else 0.0,
+    ]))
+    ax.set_ylim(bottom=-0.1, top=max(1.0, ymax + 0.8))
+
+    def _fmt(arr):
+        v = np.asarray(arr, float)
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            return "n=0, mean=na"
+        return f"n={v.size}, mean={np.nanmean(v):.2f}"
+
+    info_txt = (
+        f"Spont: {_fmt(counts_spont)}\n"
+        f"Trig: {_fmt(counts_trig)}\n"
+        f"Assoc: {_fmt(counts_assoc)}"
+    )
+    ax.text(
+        0.98, 0.95,
+        info_txt,
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
+    )
+
     return fig
 
 
@@ -3195,6 +3457,31 @@ def spindle_amplitude_compare_ax(spont_amp, trig_amp, ax=None, title="Spindle am
         fig, ax = plt.subplots(figsize=(6.5, 3.4))
     else:
         fig = ax.figure
+
+    def _p_to_sig_label(p, alpha=0.05):
+        if not np.isfinite(p):
+            return "n/a"
+        if p < 1e-4:
+            return "****"
+        if p < 1e-3:
+            return "***"
+        if p < 1e-2:
+            return "**"
+        if p < float(alpha):
+            return "*"
+        return "n.s."
+
+    def _annotate_sig(axh, x1, x2, p, alpha=0.05):
+        lab = _p_to_sig_label(p, alpha=alpha)
+        if lab == "n/a":
+            return
+        y0, y1 = axh.get_ylim()
+        yr = (y1 - y0) if (np.isfinite(y1 - y0) and (y1 > y0)) else max(abs(y1), 1.0)
+        h = 0.04 * yr
+        y = y1 + 0.01 * yr
+        axh.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=1.2, color="black", clip_on=False)
+        axh.text((x1 + x2) * 0.5, y + h, lab, ha="center", va="bottom", fontsize=10, fontweight="bold")
+        axh.set_ylim(y0, y1 + 0.14 * yr)
 
     sp = np.asarray(spont_amp, float)
     tr = np.asarray(trig_amp, float)
@@ -3216,21 +3503,42 @@ def spindle_amplitude_compare_ax(spont_amp, trig_amp, ax=None, title="Spindle am
     ax.set_ylabel("Amplitude (peak-to-peak)")
     ax.set_title(title)
     ax.grid(alpha=0.15, linestyle=":")
+    p_val = np.nan
+    delta = np.nan
+    if sp.size >= 2 and tr.size >= 2:
+        try:
+            _, p_val = stats.mannwhitneyu(sp, tr, alternative="two-sided")
+        except Exception:
+            p_val = np.nan
+        try:
+            gt = np.sum(sp[:, None] > tr[None, :])
+            lt = np.sum(sp[:, None] < tr[None, :])
+            delta = float((gt - lt) / float(sp.size * tr.size))
+        except Exception:
+            delta = np.nan
     if sp.size and tr.size:
         info_txt = (
             f"n_sp={sp.size}\n"
             f"n_tr={tr.size}\n"
             f"mean_sp={np.nanmean(sp):.2f}\n"
-            f"mean_tr={np.nanmean(tr):.2f}"
+            f"mean_tr={np.nanmean(tr):.2f}\n"
+            f"MWU p={(p_val if np.isfinite(p_val) else np.nan):.2e}"
         )
     else:
         info_txt = f"n_sp={sp.size}\n" f"n_tr={tr.size}"
+    if np.isfinite(p_val):
+        info_txt += f"\nsignifikant (a=0.05): {'ja' if p_val < 0.05 else 'nein'}"
+        info_txt += f"\nSig: {_p_to_sig_label(p_val, alpha=0.05)}"
+    if np.isfinite(delta):
+        info_txt += f"\nCliff's d={delta:.2f}"
     ax.text(
         0.98, 0.95,
         info_txt,
         transform=ax.transAxes, ha="right", va="top",
         fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
     )
+    if sp.size and tr.size and np.isfinite(p_val):
+        _annotate_sig(ax, 1, 2, p_val, alpha=0.05)
     return fig
 
 
@@ -3447,8 +3755,13 @@ def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, p_vals
         p_sig = p_vals_fdr
     else:
         p_sig = p_vals
+    sig_bins = 0
+    min_p = np.nan
     if p_sig is not None and np.size(p_sig) == np.size(f):
         sig = (p_sig < alpha)
+        sig_bins = int(np.sum(sig))
+        with np.errstate(invalid="ignore"):
+            min_p = float(np.nanmin(p_sig)) if np.size(p_sig) else np.nan
         if np.any(sig):
             idx = np.where(sig)[0]
             # zusammenhängende Bereiche füllen
@@ -3470,9 +3783,17 @@ def Power_spectrum_compare_ax(freqs, spont_mean, pulse_mean, p_vals=None, p_vals
         n_sp = int(meta.get("n_spont", 0))
         n_tr = int(meta.get("n_trig", 0))
         n_m = int(meta.get("n_match", 0))
+        sig_txt = (
+            f"sig bins={sig_bins}/{len(f)}\n"
+            f"min p={min_p:.2e}\n"
+            f"signifikant (a={alpha:.2f}): {'ja' if sig_bins > 0 else 'nein'}\n"
+            f"Sig: {'*' if sig_bins > 0 else 'n.s.'}"
+            if (p_sig is not None and np.size(p_sig) == np.size(f))
+            else f"signifikanz: keine p-werte"
+        )
         ax.text(
             0.98, 0.95,
-            f"n_sp={n_sp}, n_tr={n_tr}\nmatched n={n_m}",
+            f"n_sp={n_sp}, n_tr={n_tr}\nmatched n={n_m}\n{sig_txt}",
             transform=ax.transAxes, ha="right", va="top",
             fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
         )
@@ -3929,6 +4250,19 @@ def refractory_from_spont_single_folder_ax(
         np.asarray(refrac_spon2spon, float),
         np.asarray(refrac_spon2trig, float)
     ]
+    data = [d[np.isfinite(d)] for d in data]
+    def _p_to_sig_label(p, alpha=0.05):
+        if not np.isfinite(p):
+            return "n/a"
+        if p < 1e-4:
+            return "****"
+        if p < 1e-3:
+            return "***"
+        if p < 1e-2:
+            return "**"
+        if p < float(alpha):
+            return "*"
+        return "n.s."
     labels = ["spon → spon", "spon → trig"]
     x_pos  = [0, 1]
 
@@ -3961,6 +4295,43 @@ def refractory_from_spont_single_folder_ax(
     ax.set_ylabel("Refraktärzeit (s)")
     ax.set_title(f"{title}\n{folder_name}")
     ax.grid(alpha=0.2, linestyle=":")
+    p_val = np.nan
+    delta = np.nan
+    if data[0].size >= 2 and data[1].size >= 2:
+        try:
+            _, p_val = stats.mannwhitneyu(data[0], data[1], alternative="two-sided")
+        except Exception:
+            p_val = np.nan
+        try:
+            gt = np.sum(data[0][:, None] > data[1][None, :])
+            lt = np.sum(data[0][:, None] < data[1][None, :])
+            delta = float((gt - lt) / float(data[0].size * data[1].size))
+        except Exception:
+            delta = np.nan
+    txt = (
+        f"n_s2s={data[0].size}, n_s2t={data[1].size}\n"
+        f"MWU p={p_val:.2e}"
+        if np.isfinite(p_val) else
+        f"n_s2s={data[0].size}, n_s2t={data[1].size}\nMWU p=na"
+    )
+    if np.isfinite(p_val):
+        txt += f"\nsignifikant (a=0.05): {'ja' if p_val < 0.05 else 'nein'}"
+        txt += f"\nSig: {_p_to_sig_label(p_val, alpha=0.05)}"
+    if np.isfinite(delta):
+        txt += f"\nCliff's d={delta:.2f}"
+    ax.text(
+        0.98, 0.95, txt,
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
+    )
+    if data[0].size and data[1].size and np.isfinite(p_val):
+        y0, y1 = ax.get_ylim()
+        yr = (y1 - y0) if (np.isfinite(y1 - y0) and (y1 > y0)) else max(abs(y1), 1.0)
+        h = 0.04 * yr
+        y = y1 + 0.01 * yr
+        ax.plot([0, 0, 1, 1], [y, y + h, y + h, y], lw=1.2, color="black", clip_on=False)
+        ax.text(0.5, y + h, _p_to_sig_label(p_val, alpha=0.05), ha="center", va="bottom", fontsize=10, fontweight="bold")
+        ax.set_ylim(y0, y1 + 0.14 * yr)
     return fig
 
 
@@ -4217,6 +4588,19 @@ def pca_similarity_stats_ax(corr_sp, corr_tr, p_val=None, ax=None,
     data = [corr_sp, corr_tr]
     labels = ["Spontaneous", "Triggered"]
 
+    def _p_to_sig_label(p, alpha=0.05):
+        if not np.isfinite(p):
+            return "n/a"
+        if p < 1e-4:
+            return "****"
+        if p < 1e-3:
+            return "***"
+        if p < 1e-2:
+            return "**"
+        if p < float(alpha):
+            return "*"
+        return "n.s."
+
     # Violin + Punkte
     parts = ax.violinplot(data, showmeans=True, showextrema=False)
     for pc in parts["bodies"]:
@@ -4240,9 +4624,13 @@ def pca_similarity_stats_ax(corr_sp, corr_tr, p_val=None, ax=None,
 
     # Statistik-Textbox
     if p_val is not None:
+        sig_flag = (np.isfinite(p_val) and float(p_val) < 0.05)
+        sig_label = _p_to_sig_label(float(p_val), alpha=0.05) if np.isfinite(p_val) else "n/a"
         ax.text(
             0.98, 0.95,
             f"p = {p_val:.2e}\n"
+            f"signifikant (a=0.05): {'ja' if sig_flag else 'nein'}\n"
+            f"Sig: {sig_label}\n"
             f"n_sp = {len(corr_sp)}\n"
             f"n_tr = {len(corr_tr)}",
             transform=ax.transAxes,
@@ -4250,6 +4638,14 @@ def pca_similarity_stats_ax(corr_sp, corr_tr, p_val=None, ax=None,
             fontsize=9,
             bbox=dict(boxstyle="round", fc="white", alpha=0.7)
         )
+        if np.isfinite(p_val):
+            y0, y1 = ax.get_ylim()
+            yr = (y1 - y0) if (np.isfinite(y1 - y0) and (y1 > y0)) else max(abs(y1), 1.0)
+            h = 0.04 * yr
+            y = y1 + 0.01 * yr
+            ax.plot([1, 1, 2, 2], [y, y + h, y + h, y], lw=1.2, color="black", clip_on=False)
+            ax.text(1.5, y + h, sig_label, ha="center", va="bottom", fontsize=10, fontweight="bold")
+            ax.set_ylim(y0, y1 + 0.14 * yr)
 
     return fig
 
@@ -4484,6 +4880,21 @@ def mahal_compare_ax(mahal_sp, mahal_trig, ax=None, title="Mahalanobis distance 
 
     ms = np.asarray(mahal_sp, float)
     mt = np.asarray(mahal_trig, float)
+    ms = ms[np.isfinite(ms)]
+    mt = mt[np.isfinite(mt)]
+
+    def _p_to_sig_label(p, alpha=0.05):
+        if not np.isfinite(p):
+            return "n/a"
+        if p < 1e-4:
+            return "****"
+        if p < 1e-3:
+            return "***"
+        if p < 1e-2:
+            return "**"
+        if p < float(alpha):
+            return "*"
+        return "n.s."
 
     data = []
     labels = []
@@ -4515,18 +4926,48 @@ def mahal_compare_ax(mahal_sp, mahal_trig, ax=None, title="Mahalanobis distance 
     ax.set_ylabel("Mahalanobis distance (k PCs)")
     ax.set_title(title)
     ax.grid(alpha=0.15, linestyle=":")
+    p_val = np.nan
+    delta = np.nan
+    if ms.size >= 2 and mt.size >= 2:
+        try:
+            _, p_val = stats.mannwhitneyu(ms, mt, alternative="two-sided")
+        except Exception:
+            p_val = np.nan
+        try:
+            gt = np.sum(ms[:, None] > mt[None, :])
+            lt = np.sum(ms[:, None] < mt[None, :])
+            delta = float((gt - lt) / float(ms.size * mt.size))
+        except Exception:
+            delta = np.nan
 
     # kleine summary
     def _s(arr):
         arr = np.asarray(arr, float)
         if arr.size == 0: return "n=0"
         return f"n={arr.size}, mean={np.nanmean(arr):.2f}, med={np.nanmedian(arr):.2f}"
+    stats_lines = []
+    if np.isfinite(p_val):
+        stats_lines.append(f"MWU p={p_val:.2e}")
+        stats_lines.append(f"signifikant (a=0.05): {'ja' if p_val < 0.05 else 'nein'}")
+        stats_lines.append(f"Sig: {_p_to_sig_label(p_val, alpha=0.05)}")
+    else:
+        stats_lines.append("MWU p=na")
+    if np.isfinite(delta):
+        stats_lines.append(f"Cliff's d={delta:.2f}")
     ax.text(
         0.98, 0.95,
-        f"Spont: {_s(ms)}\nTrig:  {_s(mt)}",
+        f"Spont: {_s(ms)}\nTrig:  {_s(mt)}\n" + "\n".join(stats_lines),
         transform=ax.transAxes, ha="right", va="top",
         fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.7)
     )
+    if ms.size and mt.size and np.isfinite(p_val):
+        y0, y1 = ax.get_ylim()
+        yr = (y1 - y0) if (np.isfinite(y1 - y0) and (y1 > y0)) else max(abs(y1), 1.0)
+        h = 0.04 * yr
+        y = y1 + 0.01 * yr
+        ax.plot([1, 1, 2, 2], [y, y + h, y + h, y], lw=1.2, color="black", clip_on=False)
+        ax.text(1.5, y + h, _p_to_sig_label(p_val, alpha=0.05), ha="center", va="bottom", fontsize=10, fontweight="bold")
+        ax.set_ylim(y0, y1 + 0.14 * yr)
     return fig
 
 def _find_clusters(mask_bool):
@@ -5572,6 +6013,13 @@ spindle_layout_rows = [
          spindle_amp_spont, spindle_amp_trig, ax=ax,
          title="Spindle amplitudes (10-15 Hz, peak-to-peak): spontaneous vs triggered"
      )],
+    [lambda ax: spindle_count_per_upstate_ax(
+        spindle_per_up_spont,
+        spindle_per_up_trig,
+        spindle_per_up_assoc,
+        ax=ax,
+        title="Spindles per UP-state: points + mean"
+    )],
     [lambda ax: pulse_to_up_latency_hist_ax(
         spindle_latencies_trig,
         ax=ax,

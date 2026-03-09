@@ -260,6 +260,66 @@ def _even_subsample(idx, k):
     return idx[pos]
 
 
+def _mwu_stats(spont, trig, alpha=0.05):
+    """
+    Mann-Whitney-U + Cliff's delta fuer Spontan vs Getriggert.
+    """
+    sp = np.asarray(spont, float)
+    tr = np.asarray(trig, float)
+    sp = sp[np.isfinite(sp)]
+    tr = tr[np.isfinite(tr)]
+    out = {
+        "n_sp": int(sp.size),
+        "n_tr": int(tr.size),
+        "p": np.nan,
+        "delta": np.nan,
+        "significant": False,
+    }
+    if sp.size < 2 or tr.size < 2:
+        return out
+    try:
+        from scipy.stats import mannwhitneyu
+        _, p = mannwhitneyu(sp, tr, alternative="two-sided")
+        out["p"] = float(p)
+        out["significant"] = bool(np.isfinite(p) and (p < float(alpha)))
+    except Exception:
+        pass
+    try:
+        gt = np.sum(sp[:, None] > tr[None, :])
+        lt = np.sum(sp[:, None] < tr[None, :])
+        out["delta"] = float((gt - lt) / float(sp.size * tr.size))
+    except Exception:
+        pass
+    return out
+
+
+def _p_to_sig_label(p, alpha=0.05):
+    if not np.isfinite(p):
+        return "n/a"
+    if p < 1e-4:
+        return "****"
+    if p < 1e-3:
+        return "***"
+    if p < 1e-2:
+        return "**"
+    if p < float(alpha):
+        return "*"
+    return "n.s."
+
+
+def _annotate_sig_2groups(ax, x1, x2, p, alpha=0.05):
+    label = _p_to_sig_label(p, alpha=alpha)
+    if label == "n/a":
+        return
+    y0, y1 = ax.get_ylim()
+    yr = (y1 - y0) if (np.isfinite(y1 - y0) and (y1 > y0)) else max(abs(y1), 1.0)
+    h = 0.04 * yr
+    y = y1 + 0.01 * yr
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], lw=1.2, color="black", clip_on=False)
+    ax.text((x1 + x2) * 0.5, y + h, label, ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax.set_ylim(y0, y1 + 0.14 * yr)
+
+
 
 def _check_peak_indices(label, peaks, n):
     import numpy as np
@@ -470,6 +530,8 @@ def upstate_amplitude_compare_ax(
 
     spont_amp = np.asarray(spont_amp, float)
     trig_amp  = np.asarray(trig_amp,  float)
+    sp_valid = spont_amp[np.isfinite(spont_amp)]
+    tr_valid = trig_amp[np.isfinite(trig_amp)]
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(6.5, 3.4))
@@ -477,10 +539,10 @@ def upstate_amplitude_compare_ax(
         fig = ax.figure
 
     data, labels = [], []
-    if spont_amp.size:
-        data.append(spont_amp); labels.append("Spontan")
-    if trig_amp.size:
-        data.append(trig_amp); labels.append("Getriggert")
+    if sp_valid.size:
+        data.append(sp_valid); labels.append("Spontan")
+    if tr_valid.size:
+        data.append(tr_valid); labels.append("Getriggert")
 
     if not data:
         ax.text(0.5, 0.5, "no UP amplitudes", ha="center", va="center", transform=ax.transAxes)
@@ -503,6 +565,25 @@ def upstate_amplitude_compare_ax(
     ax.set_ylabel(f"Amplitude ({UNIT_LABEL})")
     ax.set_title(title)
     ax.grid(alpha=0.15, linestyle=":")
+    st = _mwu_stats(sp_valid, tr_valid, alpha=0.05)
+    txt = (
+        f"n_sp={st['n_sp']}, n_tr={st['n_tr']}\n"
+        f"MWU p={(st['p'] if np.isfinite(st['p']) else np.nan):.2e}"
+        if np.isfinite(st["p"]) else
+        f"n_sp={st['n_sp']}, n_tr={st['n_tr']}\nMWU p=na"
+    )
+    txt += f"\nsignifikant (a=0.05): {'ja' if st['significant'] else 'nein'}"
+    if np.isfinite(st["delta"]):
+        txt += f"\nCliff's d={st['delta']:.2f}"
+    if np.isfinite(st["p"]):
+        txt += f"\nSig: {_p_to_sig_label(st['p'], alpha=0.05)}"
+    ax.text(
+        0.98, 0.95, txt,
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
+    )
+    if sp_valid.size and tr_valid.size and np.isfinite(st["p"]):
+        _annotate_sig_2groups(ax, 1, 2, st["p"], alpha=0.05)
     return fig
 
 
@@ -614,13 +695,18 @@ def upstate_duration_compare_ax(
         f"MWU p={p_val:.2e}" if np.isfinite(p_val) else
         f"n_sp={spon_valid.size}, n_tr={trig_valid.size}\nMWU p=na"
     )
+    txt += f"\nsignifikant (a=0.05): {'ja' if (np.isfinite(p_val) and p_val < 0.05) else 'nein'}"
     if np.isfinite(delta):
         txt += f"\nCliff's d={delta:.2f}"
+    if np.isfinite(p_val):
+        txt += f"\nSig: {_p_to_sig_label(p_val, alpha=0.05)}"
     ax.text(
         0.98, 0.95, txt,
         transform=ax.transAxes, ha="right", va="top",
         fontsize=9, bbox=dict(boxstyle="round", fc="white", alpha=0.75)
     )
+    if spon_valid.size and trig_valid.size and np.isfinite(p_val):
+        _annotate_sig_2groups(ax, 1, 2, p_val, alpha=0.05)
     return fig
 
 def refractory_compare_ax(refrac_spont, refrac_trig, ax=None, title="Refraktärzeit bis zum nächsten UP"):
@@ -634,13 +720,15 @@ def refractory_compare_ax(refrac_spont, refrac_trig, ax=None, title="Refraktärz
 
     refrac_spont = np.asarray(refrac_spont, float)
     refrac_trig  = np.asarray(refrac_trig,  float)
+    sp_valid = refrac_spont[np.isfinite(refrac_spont)]
+    tr_valid = refrac_trig[np.isfinite(refrac_trig)]
 
     data, labels = [], []
-    if refrac_spont.size:
-        data.append(refrac_spont)
+    if sp_valid.size:
+        data.append(sp_valid)
         labels.append("Spontan")
-    if refrac_trig.size:
-        data.append(refrac_trig)
+    if tr_valid.size:
+        data.append(tr_valid)
         labels.append("Getriggert")
 
     if not data:
@@ -658,12 +746,17 @@ def refractory_compare_ax(refrac_spont, refrac_trig, ax=None, title="Refraktärz
     ax.set_title(title)
     ax.grid(alpha=0.15, linestyle=":")
 
-    # kleine n-Angabe
-    txt = []
-    if refrac_spont.size:
-        txt.append(f"Spontan: n={refrac_spont.size}")
-    if refrac_trig.size:
-        txt.append(f"Getriggert: n={refrac_trig.size}")
+    st = _mwu_stats(sp_valid, tr_valid, alpha=0.05)
+    txt = [f"Spontan: n={st['n_sp']}", f"Getriggert: n={st['n_tr']}"]
+    if np.isfinite(st["p"]):
+        txt.append(f"MWU p={st['p']:.2e}")
+    else:
+        txt.append("MWU p=na")
+    txt.append(f"signifikant (a=0.05): {'ja' if st['significant'] else 'nein'}")
+    if np.isfinite(st["delta"]):
+        txt.append(f"Cliff's d={st['delta']:.2f}")
+    if np.isfinite(st["p"]):
+        txt.append(f"Sig: {_p_to_sig_label(st['p'], alpha=0.05)}")
     ax.text(
         0.98, 0.95,
         "\n".join(txt),
@@ -672,6 +765,8 @@ def refractory_compare_ax(refrac_spont, refrac_trig, ax=None, title="Refraktärz
         fontsize=9,
         bbox=dict(boxstyle="round", fc="white", alpha=0.7)
     )
+    if sp_valid.size and tr_valid.size and np.isfinite(st["p"]):
+        _annotate_sig_2groups(ax, 1, 2, st["p"], alpha=0.05)
 
     return fig
 

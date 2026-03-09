@@ -155,6 +155,17 @@ def _find_sessions(root: Path, recursive: bool) -> list[Path]:
 def _bytes_to_gb(nbytes: int) -> float:
     return nbytes / (1024**3)
 
+def _free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+def _format_gb(nbytes: int) -> str:
+    return f"{_bytes_to_gb(nbytes):.2f} GB"
+
+def _has_min_free_space(path: Path, min_free_gb: float) -> tuple[bool, int]:
+    free_b = _free_bytes(path)
+    min_b = int(min_free_gb * (1024**3))
+    return free_b >= min_b, free_b
+
 def _split_csv_by_rows(csv_path: Path, out_dir: Path, rows_per_part: int = 5_000_000, header: bool = True) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     parts: list[Path] = []
@@ -244,8 +255,20 @@ def _process_one_session_subproc(
         split_threshold_gb = float(os.environ.get("BATCH_SPLIT_THRESHOLD_GB", "7.0"))
         rows_per_part      = int(os.environ.get("BATCH_ROWS_PER_PART", "5000000"))
         min_rows_per_part  = int(os.environ.get("BATCH_MIN_ROWS_PER_PART", "200000"))
+        min_free_gb        = float(os.environ.get("BATCH_MIN_FREE_GB", "5.0"))
+        split_overhead     = float(os.environ.get("BATCH_SPLIT_OVERHEAD_FACTOR", "1.15"))
+        keep_csv_parts     = os.environ.get("BATCH_KEEP_CSV_PARTS", "0") == "1"
+        merge_split_parts  = os.environ.get("BATCH_MERGE_SPLIT_PARTS", "0") == "1"
 
         csv_path = Path(out_csv).expanduser().resolve() if out_csv else _default_csv_for_session(session_dir)
+
+        ok_free, free_b = _has_min_free_space(session_dir, min_free_gb)
+        if not ok_free:
+            return (
+                session_dir.name,
+                False,
+                f"Insufficient free space before conversion: {_format_gb(free_b)} available, need >= {min_free_gb:.2f} GB"
+            )
 
         if skip_convert_if_exists and not csv_path.exists():
             csvs = sorted([f for f in session_dir.iterdir() if _is_good_csv_file(f, session_dir)])
@@ -276,6 +299,18 @@ def _process_one_session_subproc(
         if size_gb >= split_threshold_gb:
             print(f"{session_dir.name}: CSV {size_gb:.2f} GB ≥ {split_threshold_gb:.2f} GB -> split in Teile")
             parts_dir = session_dir / "_csv_parts"
+
+            csv_size_b = csv_path.stat().st_size
+            est_needed_b = int(csv_size_b * split_overhead)
+            free_before_split_b = _free_bytes(session_dir)
+            if free_before_split_b < est_needed_b:
+                return (
+                    session_dir.name,
+                    False,
+                    "Insufficient free space for CSV split: "
+                    f"{_format_gb(free_before_split_b)} free, estimated {_format_gb(est_needed_b)} needed"
+                )
+
             parts = _split_csv_by_rows(csv_path, parts_dir, rows_per_part=rows_per_part, header=True)
             if not parts:
                 return (session_dir.name, False, "Split failed / no parts created")
@@ -322,14 +357,15 @@ def _process_one_session_subproc(
                         return (session_dir.name, False, f"SubprocessError on part {i}: returncode={cp.returncode}")
                     analyzed += 1
 
-            # 3) wieder mergen
-            out_merged = session_dir / f"{session_dir.name}.merged.csv"
-            try:
-                n_parts = merge_csv_parts(parts_dir, out_merged)
-                if n_parts == 0:
-                    print(f"{session_dir.name}: [MERGE][WARN] keine Parts gefunden")
-            except Exception as e:
-                print(f"{session_dir.name}: [MERGE][WARN] {e}")
+            # 3) optional: Parts wieder mergen (kostet zusätzlichen Speicher)
+            if merge_split_parts:
+                out_merged = session_dir / f"{session_dir.name}.merged.csv"
+                try:
+                    n_parts = merge_csv_parts(parts_dir, out_merged)
+                    if n_parts == 0:
+                        print(f"{session_dir.name}: [MERGE][WARN] keine Parts gefunden")
+                except Exception as e:
+                    print(f"{session_dir.name}: [MERGE][WARN] {e}")
 
             # 4) finaler Lauf über die Parts im Streaming-Modus
             if not dry_run:
@@ -352,6 +388,13 @@ def _process_one_session_subproc(
                 cp = subprocess.run(cmd, env=env)
                 if cp.returncode != 0:
                     return (session_dir.name, False, f"SubprocessError on final streaming run: returncode={cp.returncode}")
+
+            if not keep_csv_parts:
+                try:
+                    shutil.rmtree(parts_dir)
+                    print(f"{session_dir.name}: [CLEANUP] removed {parts_dir.name}")
+                except Exception as e:
+                    print(f"{session_dir.name}: [CLEANUP][WARN] could not remove {parts_dir}: {e}")
 
             return (session_dir.name, True, f"OK (split {len(parts)}; analyzed {analyzed}; final-stream-run)")
 
