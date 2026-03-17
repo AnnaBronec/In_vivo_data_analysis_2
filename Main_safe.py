@@ -1357,11 +1357,18 @@ print(f"[CHAN-FILTER] kept {NUM_CHANNELS_GOOD}/{NUM_CHANNELS} Kanäle:", ch_name
 
 log(f"Channel filter: kept={NUM_CHANNELS_GOOD}/{NUM_CHANNELS}, good_idx={good_idx}")
 
-# Main channel neu wählen: nur aus den gefilterten "good" Kanälen
-main_channel_local, good_local_idx = _ensure_main_channel(
-    LFP_array_good, preferred_idx=min(9, max(0, NUM_CHANNELS_GOOD - 1))
-)
-ch_idx_used = int(good_idx[int(good_local_idx)])  # globaler Kanalindex im Original-Array
+# Kanal-Policy laut User:
+# - viele Kanäle (2 Elektroden): UP=ch15, SWR=ch9
+# - weniger Kanäle (1 Elektrode): UP=ch9, SWR deaktiviert
+dual_probe_min_ch = int(os.environ.get("DUAL_PROBE_MIN_CHANNELS", "24"))
+is_dual_probe_mode = int(NUM_CHANNELS) >= dual_probe_min_ch
+req_up_ch = 15 if is_dual_probe_mode else 9
+req_swr_ch = 9
+enable_swr = bool(is_dual_probe_mode)
+
+ch_idx_used = int(np.clip(req_up_ch, 0, int(NUM_CHANNELS) - 1))
+if ch_idx_used != int(req_up_ch):
+    print(f"[WARN] requested UP channel pri_{req_up_ch} not available -> using pri_{ch_idx_used}")
 main_channel = np.asarray(LFP_array[ch_idx_used], dtype=float)
 
 # Für HTML: Main-Channel in µV (mit passendem Gain des globalen Kanals)
@@ -1378,41 +1385,14 @@ if HTML_IN_uV:
     else:
         main_channel_uV = main_channel.copy()
 
-print(f"[MAIN-CH] using filtered main channel: pri_{ch_idx_used}")
-
-# SWR channel: bei Mehrkanal bevorzugt ADEN-Kanal; sonst Fallback auf Kanal 9 (wie bisher).
-def _pick_swr_channel_idx(chan_cols_local, good_idx_local, n_ch_total, fallback_idx=9):
-    if n_ch_total <= 0:
-        return 0, "empty"
-
-    fb = int(np.clip(int(fallback_idx), 0, n_ch_total - 1))
-    has_multi = int(n_ch_total) > 1
-    if not has_multi:
-        return fb, "single_channel_fallback"
-
-    aden_hits = []
-    for i, name in enumerate(chan_cols_local or []):
-        s = str(name).strip().lower()
-        if "aden" in s:
-            aden_hits.append(i)
-
-    if aden_hits:
-        good_set = set(int(v) for v in (good_idx_local or []))
-        for idx in aden_hits:
-            if idx in good_set:
-                return int(idx), "aden_good"
-        return int(aden_hits[0]), "aden_any"
-
-    return fb, "fallback_9"
-
-swr_ch_idx_main, swr_pick_reason = _pick_swr_channel_idx(
-    chan_cols,
-    good_idx,
-    int(NUM_CHANNELS),
-    fallback_idx=9,
+print(f"[MAIN-CH] using fixed UP channel: pri_{ch_idx_used}")
+swr_ch_idx_main = int(np.clip(req_swr_ch, 0, int(NUM_CHANNELS) - 1))
+swr_channel = np.asarray(LFP_array[int(swr_ch_idx_main)], dtype=float) if enable_swr else None
+print(
+    f"[CHAN-MODE] dual_probe={int(is_dual_probe_mode)} "
+    f"UP=pri_{ch_idx_used} "
+    f"SWR={'pri_' + str(swr_ch_idx_main) if enable_swr else 'disabled'}"
 )
-swr_channel = np.asarray(LFP_array[int(swr_ch_idx_main)], dtype=float)
-print(f"[SWR-CH] using pri_{int(swr_ch_idx_main)} (reason={swr_pick_reason})")
 
 
 if HIGH_CUTOFF <= LOW_CUTOFF:
@@ -1815,13 +1795,68 @@ def compute_upstate_rate(time_s,
 
 
 nT = LFP_array.shape[1]
-for kU, kD in [
-    ("Spontaneous_UP","Spontaneous_DOWN"),
-    ("Pulse_triggered_UP","Pulse_triggered_DOWN"),
-    ("Pulse_associated_UP","Pulse_associated_DOWN"),
-]:
-    Uc, Dc = _clip_pairs(Up.get(kU, []), Up.get(kD, []), nT)
+
+def _set_up_pair_preferring_raw(kU, kD, kU_raw, kD_raw):
+    use_raw = str(os.environ.get("PREFER_RAW_UP_INDICES", "1")).strip().lower() not in ("0", "false", "no", "off")
+    U_src = Up.get(kU_raw, []) if use_raw else Up.get(kU, [])
+    D_src = Up.get(kD_raw, []) if use_raw else Up.get(kD, [])
+    # Fallback auf nicht-raw, wenn raw nicht vorhanden/leer ist.
+    if len(np.asarray(U_src).reshape(-1)) == 0 or len(np.asarray(D_src).reshape(-1)) == 0:
+        U_src = Up.get(kU, [])
+        D_src = Up.get(kD, [])
+        used = "feature"
+    else:
+        used = "raw" if use_raw else "feature"
+    Uc, Dc = _clip_pairs(U_src, D_src, nT)
     Up[kU], Up[kD] = Uc, Dc
+    print(f"[UP-IDX] {kU}/{kD}: source={used}, n={len(Uc)}")
+
+_set_up_pair_preferring_raw("Spontaneous_UP", "Spontaneous_DOWN", "Spontaneous_UP_raw", "Spontaneous_DOWN_raw")
+_set_up_pair_preferring_raw("Pulse_triggered_UP", "Pulse_triggered_DOWN", "Pulse_triggered_UP_raw", "Pulse_triggered_DOWN_raw")
+_set_up_pair_preferring_raw("Pulse_associated_UP", "Pulse_associated_DOWN", "Pulse_associated_UP_raw", "Pulse_associated_DOWN_raw")
+
+# Konsistente Gesamtliste (raw-basiert nach obiger Auswahl), nach Onset sortiert.
+_all_pairs = []
+for kU, kD in [
+    ("Spontaneous_UP", "Spontaneous_DOWN"),
+    ("Pulse_triggered_UP", "Pulse_triggered_DOWN"),
+    ("Pulse_associated_UP", "Pulse_associated_DOWN"),
+]:
+    U = np.asarray(Up.get(kU, []), int)
+    D = np.asarray(Up.get(kD, []), int)
+    _all_pairs.extend([(int(u), int(d)) for u, d in zip(U, D) if d > u])
+_all_pairs = sorted(set(_all_pairs), key=lambda p: p[0])
+Up["UP_start_i"] = np.asarray([p[0] for p in _all_pairs], int) if _all_pairs else np.array([], int)
+Up["DOWN_start_i"] = np.asarray([p[1] for p in _all_pairs], int) if _all_pairs else np.array([], int)
+
+# Zusätzlicher robuster Dauerfilter auf Raw-Sample-Ebene:
+# verwirft sehr kurze UPs nach der Klassifikation in allen Klassen konsistent.
+up_min_dur_post_s = float(os.environ.get("UP_MIN_DUR_POST_S", os.environ.get("UP_MIN_LEN_S", "0.80")))
+up_min_dur_floor_s = float(os.environ.get("UP_MIN_DUR_POST_FLOOR_S", "0.60"))
+up_min_dur_post_s = max(up_min_dur_post_s, up_min_dur_floor_s)
+if np.isfinite(up_min_dur_post_s) and up_min_dur_post_s > 0:
+    def _filter_short_up_pairs(U, D, min_dur_s, dt_s, label):
+        U = np.asarray(U, dtype=int)
+        D = np.asarray(D, dtype=int)
+        m = min(U.size, D.size)
+        if m == 0:
+            print(f"[UP-FILTER-POST] {label}: kept=0 drop_short=0 (min_dur={min_dur_s:.3f}s)")
+            return U[:0], D[:0]
+        U, D = U[:m], D[:m]
+        dur_s = (D - U).astype(float) * float(dt_s)
+        keep = np.isfinite(dur_s) & (dur_s >= float(min_dur_s))
+        dropped = int(np.sum(~keep))
+        print(f"[UP-FILTER-POST] {label}: kept={int(np.sum(keep))} drop_short={dropped} (min_dur={min_dur_s:.3f}s)")
+        return U[keep], D[keep]
+
+    for kU, kD, lbl in [
+        ("UP_start_i", "DOWN_start_i", "all"),
+        ("Spontaneous_UP", "Spontaneous_DOWN", "spont"),
+        ("Pulse_triggered_UP", "Pulse_triggered_DOWN", "trig"),
+        ("Pulse_associated_UP", "Pulse_associated_DOWN", "assoc"),
+    ]:
+        Uf, Df = _filter_short_up_pairs(Up.get(kU, []), Up.get(kD, []), up_min_dur_post_s, dt, lbl)
+        Up[kU], Up[kD] = Uf, Df
 
 
 
@@ -2548,7 +2583,7 @@ try:
     n_scan_default = int(os.environ.get("SWR_SCAN_N_CH", "8"))
     n_scan = min(max(1, n_scan_default), int(LFP_array.shape[0])) if (hasattr(LFP_array, "shape") and len(LFP_array.shape) >= 2) else 0
     swr_scan_mode = str(os.environ.get("SWR_SCAN_MODE", "html")).strip().lower()  # html | pdf | qa | all | off
-    swr_enable = swr_scan_mode not in ("off", "0", "false", "no")
+    swr_enable = (swr_scan_mode not in ("off", "0", "false", "no")) and bool(enable_swr)
     swr_make_html = swr_scan_mode in ("html", "all")
     swr_make_pdf = swr_scan_mode in ("pdf", "all")
     swr_make_qa = swr_scan_mode in ("qa", "all")
@@ -2688,72 +2723,100 @@ try:
 except Exception as e:
     print(f"[WARN] SWR channel scan skipped: {e}")
 
+spindle_min_dur_s = max(
+    float(os.environ.get("SPINDLE_MIN_DUR_S", "0.45")),
+    float(os.environ.get("SPINDLE_MIN_DUR_FLOOR_S", "0.35")),
+)
+spindle_min_cycles = max(
+    int(os.environ.get("SPINDLE_MIN_CYCLES", "3")),
+    int(os.environ.get("SPINDLE_MIN_CYCLES_FLOOR", "3")),
+)
+spindle_thr_on = max(
+    float(os.environ.get("SPINDLE_THR_ON", "0.92")),
+    float(os.environ.get("SPINDLE_THR_ON_FLOOR", "0.85")),
+)
+spindle_thr_off = max(
+    float(os.environ.get("SPINDLE_THR_OFF", "0.30")),
+    float(os.environ.get("SPINDLE_THR_OFF_FLOOR", "0.25")),
+)
+spindle_min_env_sigma = max(
+    float(os.environ.get("SPINDLE_MIN_ENV_SIGMA", "0.72")),
+    float(os.environ.get("SPINDLE_MIN_ENV_SIGMA_FLOOR", "0.65")),
+)
+spindle_use_psd_check = str(os.environ.get("SPINDLE_USE_PSD_CHECK", "0")).strip().lower() not in ("0", "false", "no", "off")
+
 spindle_intervals_s = detect_spindle_intervals_in_upstates(
     main_channel, time_s, dt, all_up_pairs
     ,
-    thr_k_on=float(os.environ.get("SPINDLE_THR_ON", "0.75")),
-    thr_k_off=float(os.environ.get("SPINDLE_THR_OFF", "0.20")),
-    min_dur_s=float(os.environ.get("SPINDLE_MIN_DUR_S", "0.14")),
+    thr_k_on=spindle_thr_on,
+    thr_k_off=spindle_thr_off,
+    min_dur_s=spindle_min_dur_s,
     max_dur_s=float(os.environ.get("SPINDLE_MAX_DUR_S", "3.0")),
     max_gap_s=float(os.environ.get("SPINDLE_MAX_GAP_S", "0.12")),
-    min_cycles=int(os.environ.get("SPINDLE_MIN_CYCLES", "1")),
+    min_cycles=spindle_min_cycles,
     min_spindle_band_power_ratio=float(os.environ.get("SPINDLE_MIN_BAND_RATIO", "1.0")),
     min_spindle_power_fraction=float(os.environ.get("SPINDLE_MIN_POWER_FRACTION", "0.05")),
     min_env_peak_quantile=float(os.environ.get("SPINDLE_MIN_ENV_Q", "0.02")),
-    min_env_peak_sigma=float(os.environ.get("SPINDLE_MIN_ENV_SIGMA", "0.55")),
+    min_env_peak_sigma=spindle_min_env_sigma,
     off_below_s=float(os.environ.get("SPINDLE_OFF_BELOW_S", "0.06")),
     only_in_upstates=False,
     require_up_overlap=require_up_overlap_main,
+    use_psd_check=spindle_use_psd_check,
     causal_filter=(not SPINDLE_ZERO_PHASE),
 )
 print(
     "[SPINDLE-CONFIG] "
-    f"thr_on={os.environ.get('SPINDLE_THR_ON', '0.75')} "
-    f"thr_off={os.environ.get('SPINDLE_THR_OFF', '0.20')} "
-    f"min_dur={os.environ.get('SPINDLE_MIN_DUR_S', '0.14')}s "
+    f"thr_on={spindle_thr_on:.3f} "
+    f"thr_off={spindle_thr_off:.3f} "
+    f"min_dur={spindle_min_dur_s:.3f}s "
     f"max_gap={os.environ.get('SPINDLE_MAX_GAP_S', '0.12')}s "
-    f"min_cycles={os.environ.get('SPINDLE_MIN_CYCLES', '1')} "
-    f"min_env_sigma={os.environ.get('SPINDLE_MIN_ENV_SIGMA', '0.55')} "
+    f"min_cycles={spindle_min_cycles} "
+    f"min_env_sigma={spindle_min_env_sigma:.3f} "
+    f"use_psd_check={int(spindle_use_psd_check)} "
     f"off_below_s={os.environ.get('SPINDLE_OFF_BELOW_S', '0.06')} "
     f"only_in_upstates=0 "
     f"require_up_overlap={int(require_up_overlap_main)} "
     f"filter_mode={'zero_phase' if SPINDLE_ZERO_PHASE else 'causal'}"
 )
 print(f"[SPINDLE] 10-15 Hz intervals (UP-overlap required): n={len(spindle_intervals_s)}")
-ripple_intervals_s = detect_sharp_wave_ripple_intervals_in_upstates(
-    swr_channel, time_s, dt, all_up_pairs,
-    f_lo=float(os.environ.get("SWR_F_LO_HZ", "120.0")),
-    f_hi=float(os.environ.get("SWR_F_HI_HZ", "250.0")),
-    thr_k_on=float(os.environ.get("SWR_THR_ON", "1.25")),
-    thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.45")),
-    min_dur_s=float(os.environ.get("SWR_MIN_DUR_S", "0.020")),
-    max_dur_s=float(os.environ.get("SWR_MAX_DUR_S", "0.120")),
-    max_gap_s=float(os.environ.get("SWR_MAX_GAP_S", "0.015")),
-    min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "3")),
-    min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.05")),
-    min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "0.80")),
-    off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.008")),
-    only_in_upstates=False,
-    require_up_overlap=require_up_overlap_main,
-    causal_filter=(not SPINDLE_ZERO_PHASE),
-)
-print(
-    "[SWR-CONFIG] "
-    f"f_lo={os.environ.get('SWR_F_LO_HZ', '120.0')}Hz "
-    f"f_hi={os.environ.get('SWR_F_HI_HZ', '250.0')}Hz "
-    f"thr_on={os.environ.get('SWR_THR_ON', '1.25')} "
-    f"thr_off={os.environ.get('SWR_THR_OFF', '0.45')} "
-    f"min_dur={os.environ.get('SWR_MIN_DUR_S', '0.020')}s "
-    f"max_dur={os.environ.get('SWR_MAX_DUR_S', '0.120')}s "
-    f"max_gap={os.environ.get('SWR_MAX_GAP_S', '0.015')}s "
-    f"min_cycles={os.environ.get('SWR_MIN_CYCLES', '3')} "
-    f"min_env_sigma={os.environ.get('SWR_MIN_ENV_SIGMA', '0.80')} "
-    f"off_below_s={os.environ.get('SWR_OFF_BELOW_S', '0.008')} "
-    f"only_in_upstates=0 "
-    f"require_up_overlap={int(require_up_overlap_main)} "
-    f"filter_mode={'zero_phase' if SPINDLE_ZERO_PHASE else 'causal'}"
-)
-print(f"[SWR] sharp-wave ripple intervals (UP-overlap required): n={len(ripple_intervals_s)}")
+if enable_swr:
+    ripple_intervals_s = detect_sharp_wave_ripple_intervals_in_upstates(
+        swr_channel, time_s, dt, all_up_pairs,
+        f_lo=float(os.environ.get("SWR_F_LO_HZ", "120.0")),
+        f_hi=float(os.environ.get("SWR_F_HI_HZ", "250.0")),
+        thr_k_on=float(os.environ.get("SWR_THR_ON", "1.25")),
+        thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.45")),
+        min_dur_s=float(os.environ.get("SWR_MIN_DUR_S", "0.020")),
+        max_dur_s=float(os.environ.get("SWR_MAX_DUR_S", "0.120")),
+        max_gap_s=float(os.environ.get("SWR_MAX_GAP_S", "0.015")),
+        min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "3")),
+        min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.05")),
+        min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "0.80")),
+        off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.008")),
+        only_in_upstates=False,
+        require_up_overlap=require_up_overlap_main,
+        causal_filter=(not SPINDLE_ZERO_PHASE),
+    )
+    print(
+        "[SWR-CONFIG] "
+        f"f_lo={os.environ.get('SWR_F_LO_HZ', '120.0')}Hz "
+        f"f_hi={os.environ.get('SWR_F_HI_HZ', '250.0')}Hz "
+        f"thr_on={os.environ.get('SWR_THR_ON', '1.25')} "
+        f"thr_off={os.environ.get('SWR_THR_OFF', '0.45')} "
+        f"min_dur={os.environ.get('SWR_MIN_DUR_S', '0.020')}s "
+        f"max_dur={os.environ.get('SWR_MAX_DUR_S', '0.120')}s "
+        f"max_gap={os.environ.get('SWR_MAX_GAP_S', '0.015')}s "
+        f"min_cycles={os.environ.get('SWR_MIN_CYCLES', '3')} "
+        f"min_env_sigma={os.environ.get('SWR_MIN_ENV_SIGMA', '0.80')} "
+        f"off_below_s={os.environ.get('SWR_OFF_BELOW_S', '0.008')} "
+        f"only_in_upstates=0 "
+        f"require_up_overlap={int(require_up_overlap_main)} "
+        f"filter_mode={'zero_phase' if SPINDLE_ZERO_PHASE else 'causal'}"
+    )
+    print(f"[SWR] sharp-wave ripple intervals (UP-overlap required): n={len(ripple_intervals_s)}")
+else:
+    ripple_intervals_s = []
+    print("[SWR] disabled for single-electrode mode (few channels).")
 
 # Bandpass-Signal (10-15 Hz) für Spindle-Visualisierung/Amplituden.
 main_channel_for_spindle = main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel
@@ -2777,26 +2840,82 @@ spindle_spont_s, spindle_trig_s, spindle_trig_lat_s = _classify_spindles_by_puls
     min_lat_s=0.00,
     followup_trig_gap_s=float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.35")),
 )
+
 spont_up_s = _pair_idx_to_time_intervals(spont_up_pairs, time_s)
 trig_up_s = _pair_idx_to_time_intervals(trig_up_pairs, time_s)
 assoc_up_s = _pair_idx_to_time_intervals(assoc_up_pairs, time_s)
-spindle_assoc_s = []
-spindle_spont_only_s = []
-for t0, t1 in spindle_spont_s:
-    if any(_intervals_overlap(t0, t1, a0, a1) for a0, a1 in assoc_up_s):
-        spindle_assoc_s.append((float(t0), float(t1)))
-    else:
-        spindle_spont_only_s.append((float(t0), float(t1)))
-spindle_spont_s = spindle_spont_only_s
-spindle_assoc_s, spindle_trig_s = _enforce_assoc_blocks_triggered(
-    spindle_assoc_s,
-    spindle_trig_s,
-    block_gap_s=float(os.environ.get("SPINDLE_ASSOC_BLOCK_TRIG_GAP_S", "0.35")),
+
+# Finale Spindle-Klassen strikt an UP-Klassen koppeln.
+spindle_spont_s, spindle_trig_s, spindle_assoc_s, spindle_other_s = _classify_spindles_by_up_type(
+    spindle_intervals_s,
+    spont_up_s,
+    trig_up_s,
+    assoc_up_s,
 )
+
+# Bidirektionale Trigger-Konsistenz:
+# - triggered spindle nur in triggered UP
+# - triggered UP nur mit triggered spindle
+if str(os.environ.get("REQUIRE_TRIGGERED_SPINDLE_FOR_TRIGGERED_UP", "1")).strip().lower() not in ("0", "false", "no", "off"):
+    trig_keep_u = []
+    trig_keep_d = []
+    trig_move_u = []
+    trig_move_d = []
+    m_trig = min(len(Pulse_triggered_UP), len(Pulse_triggered_DOWN))
+    for u, d in zip(np.asarray(Pulse_triggered_UP[:m_trig], int), np.asarray(Pulse_triggered_DOWN[:m_trig], int)):
+        if u < 0 or d <= u or d > len(time_s):
+            continue
+        t0 = float(time_s[u])
+        t1 = float(time_s[d - 1]) if d - 1 < len(time_s) else float(time_s[-1])
+        has_trig_sp = any(_intervals_overlap(t0, t1, s0, s1) for s0, s1 in spindle_trig_s)
+        if has_trig_sp:
+            trig_keep_u.append(int(u))
+            trig_keep_d.append(int(d))
+        else:
+            trig_move_u.append(int(u))
+            trig_move_d.append(int(d))
+
+    if trig_move_u:
+        assoc_u = np.asarray(Pulse_associated_UP, int)
+        assoc_d = np.asarray(Pulse_associated_DOWN, int)
+        assoc_pairs = {(int(u), int(d)) for u, d in zip(assoc_u, assoc_d)}
+        for u, d in zip(trig_move_u, trig_move_d):
+            assoc_pairs.add((int(u), int(d)))
+        assoc_sorted = sorted(assoc_pairs, key=lambda p: p[0])
+        Pulse_associated_UP = np.asarray([p[0] for p in assoc_sorted], int) if assoc_sorted else np.array([], int)
+        Pulse_associated_DOWN = np.asarray([p[1] for p in assoc_sorted], int) if assoc_sorted else np.array([], int)
+
+    Pulse_triggered_UP = np.asarray(trig_keep_u, int)
+    Pulse_triggered_DOWN = np.asarray(trig_keep_d, int)
+    Up["Pulse_triggered_UP"] = Pulse_triggered_UP
+    Up["Pulse_triggered_DOWN"] = Pulse_triggered_DOWN
+    Up["Pulse_associated_UP"] = Pulse_associated_UP
+    Up["Pulse_associated_DOWN"] = Pulse_associated_DOWN
+
+    # Nach möglichem Move UP-Intervalle neu bauen und Spindles final neu mappen.
+    spont_up_pairs = _pair_up_down_indices(Spontaneous_UP, Spontaneous_DOWN, len(time_s))
+    trig_up_pairs = _pair_up_down_indices(Pulse_triggered_UP, Pulse_triggered_DOWN, len(time_s))
+    assoc_up_pairs = _pair_up_down_indices(Pulse_associated_UP, Pulse_associated_DOWN, len(time_s))
+    spont_up_s = _pair_idx_to_time_intervals(spont_up_pairs, time_s)
+    trig_up_s = _pair_idx_to_time_intervals(trig_up_pairs, time_s)
+    assoc_up_s = _pair_idx_to_time_intervals(assoc_up_pairs, time_s)
+    spindle_spont_s, spindle_trig_s, spindle_assoc_s, spindle_other_s = _classify_spindles_by_up_type(
+        spindle_intervals_s,
+        spont_up_s,
+        trig_up_s,
+        assoc_up_s,
+    )
+    print(
+        "[UP-SPINDLE-CONSISTENCY] strict=1",
+        f"trig_up_kept={len(Pulse_triggered_UP)}",
+        f"trig_up_moved_to_assoc={len(trig_move_u)}",
+    )
+
 print(
     "[SPINDLE-CLASS][pulse-onset] spont=", len(spindle_spont_s),
     "trig=", len(spindle_trig_s),
     "assoc=", len(spindle_assoc_s),
+    "other=", len(spindle_other_s),
     "pulses=", len(spindle_pulses_s),
     "ref=onset",
     "followup_gap_s=", float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.35")),
@@ -3253,8 +3372,11 @@ export_interactive_dual_lfp_html(
 
 # Zusatz-HTML: 3 Panels (ch9 SWR, ch40 UP, ch40 10-15Hz Spindles)
 try:
+    if not enable_swr:
+        raise RuntimeError("SWR disabled by channel policy")
+
     req_swr_ch = int(swr_ch_idx_main)
-    req_up_ch = 40
+    req_up_ch = int(ch_idx_used)
 
     n_ch_total = int(LFP_array.shape[0]) if (hasattr(LFP_array, "shape") and len(LFP_array.shape) >= 2) else 0
     if n_ch_total <= 0:
@@ -3337,19 +3459,20 @@ try:
     # Spindles in channel 40 (10-15 Hz), Klassifikation wie im Main-Flow.
     ch40_spindle_intervals_s = detect_spindle_intervals_in_upstates(
         ch40_raw, time_s, dt, all_up_pairs,
-        thr_k_on=float(os.environ.get("SPINDLE_THR_ON", "0.75")),
-        thr_k_off=float(os.environ.get("SPINDLE_THR_OFF", "0.20")),
-        min_dur_s=float(os.environ.get("SPINDLE_MIN_DUR_S", "0.14")),
+        thr_k_on=spindle_thr_on,
+        thr_k_off=spindle_thr_off,
+        min_dur_s=spindle_min_dur_s,
         max_dur_s=float(os.environ.get("SPINDLE_MAX_DUR_S", "3.0")),
         max_gap_s=float(os.environ.get("SPINDLE_MAX_GAP_S", "0.12")),
-        min_cycles=int(os.environ.get("SPINDLE_MIN_CYCLES", "1")),
+        min_cycles=spindle_min_cycles,
         min_spindle_band_power_ratio=float(os.environ.get("SPINDLE_MIN_BAND_RATIO", "1.0")),
         min_spindle_power_fraction=float(os.environ.get("SPINDLE_MIN_POWER_FRACTION", "0.05")),
         min_env_peak_quantile=float(os.environ.get("SPINDLE_MIN_ENV_Q", "0.02")),
-        min_env_peak_sigma=float(os.environ.get("SPINDLE_MIN_ENV_SIGMA", "0.55")),
+        min_env_peak_sigma=spindle_min_env_sigma,
         off_below_s=float(os.environ.get("SPINDLE_OFF_BELOW_S", "0.06")),
         only_in_upstates=False,
         require_up_overlap=bool(len(all_up_pairs)),
+        use_psd_check=spindle_use_psd_check,
         causal_filter=(not SPINDLE_ZERO_PHASE),
     )
     ch40_sp_spont_s, ch40_sp_trig_s, _ = _classify_spindles_by_pulse_latency(
@@ -3429,7 +3552,10 @@ try:
         show_pulse_intervals=(not PULSE_ONSET_ONLY),
     )
 except Exception as e:
-    print(f"[WARN] 3-panel HTML export skipped: {e}")
+    if "SWR disabled by channel policy" in str(e):
+        print("[INFO] 3-panel HTML export skipped: SWR disabled in single-electrode mode.")
+    else:
+        print(f"[WARN] 3-panel HTML export skipped: {e}")
 
 # Zusatz-HTML: zwei "gute" Channels übereinander (ohne Spindle)
 try:

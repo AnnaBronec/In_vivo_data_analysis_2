@@ -417,8 +417,8 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     up_transitions = up_transitions[:m_ud]
     down_transitions = down_transitions[:m_ud]
 
-    # Keep short but valid UP states; 1.0 s was too strict for many sessions.
-    min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", "0.30"))
+    # Strengeres Default gegen sehr kurze Fehl-Detektionen.
+    min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", "0.60"))
     if not up_transitions.size or not down_transitions.size:
         UP_start_i = np.array([], dtype=int)
         DOWN_start_i = np.array([], dtype=int)
