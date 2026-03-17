@@ -36,6 +36,13 @@ def export_interactive_lfp_html(
     spindle_trig_label="Spindle triggered",
     spindle_assoc_label="Spindle associated",
     spindle_intervals=None,  # list[(t0, t1)] in Sekunden
+    ripple_spont=None,   # Tuple (UP_idx, DOWN_idx)
+    ripple_trig=None,    # Tuple (UP_idx, DOWN_idx)
+    ripple_assoc=None,   # Tuple (UP_idx, DOWN_idx)
+    ripple_spont_label="SWR spontaneous",
+    ripple_trig_label="SWR triggered",
+    ripple_assoc_label="SWR associated",
+    ripple_intervals=None,  # list[(t0, t1)] in Sekunden
     max_points=300_000,
     title="LFP (interaktiv)",
     limit_to_last_pulse=False,
@@ -101,7 +108,8 @@ def export_interactive_lfp_html(
     if up_assoc:
         intervals.append((str(up_assoc_label), _mk_intervals(*up_assoc), "rgba(255, 127, 14, 0.22)"))  # orange
 
-    split_bands = bool(spindle_spont or spindle_trig)
+    has_spindle_layers = bool(spindle_spont or spindle_trig or spindle_assoc)
+    has_ripple_layers = bool(ripple_spont or ripple_trig or ripple_assoc)
 
     def _add_interval_spans(spans, fill, y0, y1):
         for (t0, t1) in spans:
@@ -117,8 +125,23 @@ def export_interactive_lfp_html(
                 fillcolor=fill
             ))
 
-    # --- Schattierungen als Shapes
-    up_y0, up_y1 = (0.00, 0.48) if split_bands else (0.00, 1.00)
+    # --- Schattierungen als Shapes (UP / Spindle / Ripple in getrennten Bändern)
+    if has_spindle_layers and has_ripple_layers:
+        up_y0, up_y1 = 0.00, 0.30
+        spindle_y0, spindle_y1 = 0.35, 0.65
+        ripple_y0, ripple_y1 = 0.70, 1.00
+    elif has_spindle_layers:
+        up_y0, up_y1 = 0.00, 0.48
+        spindle_y0, spindle_y1 = 0.52, 1.00
+        ripple_y0, ripple_y1 = 0.52, 1.00
+    elif has_ripple_layers:
+        up_y0, up_y1 = 0.00, 0.48
+        spindle_y0, spindle_y1 = 0.52, 1.00
+        ripple_y0, ripple_y1 = 0.52, 1.00
+    else:
+        up_y0, up_y1 = 0.00, 1.00
+        spindle_y0, spindle_y1 = 0.00, 1.00
+        ripple_y0, ripple_y1 = 0.00, 1.00
     for label, spans, fill in intervals:
         _add_interval_spans(spans, fill, up_y0, up_y1)
 
@@ -131,7 +154,18 @@ def export_interactive_lfp_html(
         spindle_layers.append((str(spindle_assoc_label), _mk_intervals(*spindle_assoc), "rgba(255, 127, 14, 0.38)"))
     if spindle_layers:
         for _, spans, fill in spindle_layers:
-            _add_interval_spans(spans, fill, 0.52, 1.00)
+            _add_interval_spans(spans, fill, spindle_y0, spindle_y1)
+
+    ripple_layers = []
+    if ripple_spont:
+        ripple_layers.append((str(ripple_spont_label), _mk_intervals(*ripple_spont), "rgba(46, 204, 113, 0.46)"))
+    if ripple_trig:
+        ripple_layers.append((str(ripple_trig_label), _mk_intervals(*ripple_trig), "rgba(31, 119, 180, 0.46)"))
+    if ripple_assoc:
+        ripple_layers.append((str(ripple_assoc_label), _mk_intervals(*ripple_assoc), "rgba(255, 127, 14, 0.46)"))
+    if ripple_layers:
+        for _, spans, fill in ripple_layers:
+            _add_interval_spans(spans, fill, ripple_y0, ripple_y1)
 
     if spindle_intervals:
         for (t0, t1) in spindle_intervals:
@@ -147,6 +181,21 @@ def export_interactive_lfp_html(
                 xref="x", yref="paper",
                 line=dict(width=0),
                 fillcolor="rgba(138, 43, 226, 0.30)"
+            ))
+    if ripple_intervals:
+        for (t0, t1) in ripple_intervals:
+            t0 = float(t0); t1 = float(t1)
+            if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+                continue
+            if len(t) and (t1 < t[0] or t0 > t[-1]):
+                continue
+            shapes.append(dict(
+                type="rect",
+                x0=t0, x1=t1,
+                y0=0, y1=1,
+                xref="x", yref="paper",
+                line=dict(width=0),
+                fillcolor="rgba(220, 20, 60, 0.22)"
             ))
         # --- Pulse-Intervalle (Onset->Offset) als rote Fläche, bewusst NACH den UP-Flächen
     def _add_pulse_intervals(intervals, fill):
@@ -266,12 +315,29 @@ def export_interactive_lfp_html(
                 name=label,
                 showlegend=True
             ))
+    if ripple_layers:
+        for label, _, fill in ripple_layers:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode="lines",
+                line=dict(width=12, color=fill),
+                name=label,
+                showlegend=True
+            ))
     if spindle_intervals:
         fig.add_trace(go.Scatter(
             x=[None], y=[None],
             mode="lines",
             line=dict(width=12, color="rgba(138, 43, 226, 0.30)"),
             name="Spindles 10-15 Hz",
+            showlegend=True
+        ))
+    if ripple_intervals:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="lines",
+            line=dict(width=12, color="rgba(220, 20, 60, 0.22)"),
+            name="Sharp-wave ripples",
             showlegend=True
         ))
     if pulse_times_1 is not None and len(pulse_times_1):
@@ -648,6 +714,501 @@ def export_interactive_dual_lfp_html(
     return out_html
 
 
+def export_interactive_two_channel_lfp_html(
+    base_tag, save_dir,
+    time_s, y_top, y_bottom,
+    pulse_times_1=None, pulse_times_2=None,
+    pulse_times_1_off=None, pulse_times_2_off=None,
+    pulse_intervals_1=None, pulse_intervals_2=None,
+    *,
+    max_points=300_000,
+    title="Two LFP channels (interaktiv)",
+    top_name="Channel top",
+    bottom_name="Channel bottom",
+    top_y_label="LFP",
+    bottom_y_label="LFP",
+    y_range_top=None,
+    y_range_bottom=None,
+    show_pulse_intervals=True,
+):
+    t = np.asarray(time_s, dtype=float).ravel()
+    x_top = np.asarray(y_top, dtype=float).ravel()
+    x_bottom = np.asarray(y_bottom, dtype=float).ravel()
+
+    m = min(t.size, x_top.size, x_bottom.size)
+    t = t[:m]
+    x_top = x_top[:m]
+    x_bottom = x_bottom[:m]
+
+    if t.size > max_points:
+        step = int(np.ceil(t.size / max_points))
+        t = t[::step]
+        x_top = x_top[::step]
+        x_bottom = x_bottom[::step]
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.50, 0.50],
+    )
+    fig.add_trace(go.Scatter(
+        x=t, y=x_top, mode="lines", name=str(top_name),
+        line=dict(color="#1f77b4", width=1.2),
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=t, y=x_bottom, mode="lines", name=str(bottom_name),
+        line=dict(color="#111111", width=1.0),
+    ), row=2, col=1)
+
+    shapes = []
+
+    def _add_pulse_intervals(intervals, fill):
+        if intervals is None or len(intervals) == 0:
+            return
+        if len(intervals) > 2000:
+            step = int(np.ceil(len(intervals) / 2000))
+            intervals = intervals[::step]
+        for (t0, t1) in intervals:
+            t0 = float(t0)
+            t1 = float(t1)
+            if t1 <= t0:
+                continue
+            if len(t) and (t1 < t[0] or t0 > t[-1]):
+                continue
+            shapes.append(dict(
+                type="rect",
+                x0=t0, x1=t1,
+                y0=0, y1=1,
+                xref="x", yref="paper",
+                line=dict(width=0),
+                fillcolor=fill,
+            ))
+
+    def _add_pulse_lines(ts, dash, opacity, xref):
+        if ts is None or len(ts) == 0:
+            return
+        tt = np.asarray(ts, float)
+        if tt.size > 1200:
+            tt = tt[::int(np.ceil(tt.size / 1200))]
+        for p in tt:
+            if len(t) and (p < t[0] or p > t[-1]):
+                continue
+            shapes.append(dict(
+                type="line",
+                x0=float(p), x1=float(p),
+                y0=0, y1=1,
+                xref=xref, yref="paper",
+                opacity=opacity,
+                line=dict(width=2, dash=dash, color="red"),
+            ))
+
+    if show_pulse_intervals:
+        _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.12)")
+        _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.12)")
+
+    for xref in ("x", "x2"):
+        _add_pulse_lines(pulse_times_1, "dot", 0.35, xref)
+        _add_pulse_lines(pulse_times_2, "dash", 0.35, xref)
+        _add_pulse_lines(pulse_times_1_off, "dot", 0.55, xref)
+        _add_pulse_lines(pulse_times_2_off, "dash", 0.55, xref)
+
+    if pulse_times_1 is not None and len(pulse_times_1):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dot", color="red"),
+            name="Pulse 1 ON",
+        ))
+    if pulse_times_2 is not None and len(pulse_times_2):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 ON",
+        ))
+    if pulse_times_1_off is not None and len(pulse_times_1_off):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dot", color="red"),
+            name="Pulse 1 OFF",
+        ))
+    if pulse_times_2_off is not None and len(pulse_times_2_off):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 OFF",
+        ))
+    if show_pulse_intervals and (
+        (pulse_intervals_1 is not None and len(pulse_intervals_1)) or
+        (pulse_intervals_2 is not None and len(pulse_intervals_2))
+    ):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
+            name="Pulse duration (ON→OFF)",
+        ))
+
+    fig.update_layout(
+        title=title,
+        shapes=shapes,
+        margin=dict(l=60, r=20, t=50, b=50),
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_xaxes(
+        title_text="Zeit (s)",
+        showline=True,
+        linewidth=2,
+        linecolor="black",
+        mirror="allticks",
+        tickfont=dict(size=16),
+        row=2, col=1,
+    )
+    fig.update_xaxes(
+        showline=True,
+        linewidth=2,
+        linecolor="black",
+        mirror="allticks",
+        tickfont=dict(size=16),
+        row=1, col=1,
+    )
+    fig.update_yaxes(
+        title_text=top_y_label,
+        showline=True,
+        linewidth=2,
+        linecolor="black",
+        mirror="allticks",
+        tickfont=dict(size=16),
+        title_font=dict(size=18),
+        row=1, col=1,
+    )
+    fig.update_yaxes(
+        title_text=bottom_y_label,
+        showline=True,
+        linewidth=2,
+        linecolor="black",
+        mirror="allticks",
+        tickfont=dict(size=12),
+        title_font=dict(size=14),
+        row=2, col=1,
+    )
+    fig.update_xaxes(rangeslider=dict(visible=True), row=2, col=1)
+
+    def _apply_y_range(range_vals, row, data=None, pad_frac=0.12):
+        if range_vals is not None:
+            yr = np.asarray(range_vals, dtype=float).ravel()
+            if yr.size >= 2 and np.isfinite(yr[0]) and np.isfinite(yr[1]) and yr[1] > yr[0]:
+                fig.update_yaxes(range=[float(yr[0]), float(yr[1])], autorange=False, row=row, col=1)
+            return
+        if data is None:
+            return
+        yy = np.asarray(data, dtype=float).ravel()
+        yy = yy[np.isfinite(yy)]
+        if yy.size == 0:
+            return
+        y0 = float(np.nanmin(yy))
+        y1 = float(np.nanmax(yy))
+        if not np.isfinite(y0) or not np.isfinite(y1):
+            return
+        if y1 <= y0:
+            pad = max(abs(y0) * 0.1, 1.0)
+            fig.update_yaxes(range=[y0 - pad, y1 + pad], autorange=False, row=row, col=1)
+            return
+        pad = (y1 - y0) * float(pad_frac)
+        fig.update_yaxes(range=[y0 - pad, y1 + pad], autorange=False, row=row, col=1)
+
+    _apply_y_range(y_range_top, 1, data=x_top, pad_frac=0.08)
+    _apply_y_range(y_range_bottom, 2, data=x_bottom, pad_frac=0.08)
+
+    out_html = os.path.join(save_dir, f"{base_tag}__dual_channel_no_spindle.html")
+    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    print(f"[HTML] dual channel (no spindle): {out_html}")
+
+    return out_html
+
+
+def export_interactive_three_channel_lfp_html(
+    base_tag, save_dir,
+    time_s, y_top, y_mid, y_bottom,
+    pulse_times_1=None, pulse_times_2=None,
+    pulse_times_1_off=None, pulse_times_2_off=None,
+    pulse_intervals_1=None, pulse_intervals_2=None,
+    *,
+    top_spont=None,
+    top_trig=None,
+    top_assoc=None,
+    mid_spont=None,
+    mid_trig=None,
+    mid_assoc=None,
+    bottom_spont=None,
+    bottom_trig=None,
+    bottom_assoc=None,
+    top_spont_label="SWR spontaneous",
+    top_trig_label="SWR triggered",
+    top_assoc_label="SWR associated",
+    mid_spont_label="UP spontaneous",
+    mid_trig_label="UP triggered",
+    mid_assoc_label="UP associated",
+    bottom_spont_label="Spindle spontaneous",
+    bottom_trig_label="Spindle triggered",
+    bottom_assoc_label="Spindle associated",
+    max_points=300_000,
+    title="Three-channel LFP (interaktiv)",
+    top_name="Channel top",
+    mid_name="Channel mid",
+    bottom_name="Channel bottom",
+    top_y_label="Top",
+    mid_y_label="Mid",
+    bottom_y_label="Bottom",
+    y_range_top=None,
+    y_range_mid=None,
+    y_range_bottom=None,
+    show_pulse_intervals=True,
+):
+    t = np.asarray(time_s, dtype=float).ravel()
+    x_top = np.asarray(y_top, dtype=float).ravel()
+    x_mid = np.asarray(y_mid, dtype=float).ravel()
+    x_bottom = np.asarray(y_bottom, dtype=float).ravel()
+
+    m = min(t.size, x_top.size, x_mid.size, x_bottom.size)
+    t = t[:m]
+    x_top = x_top[:m]
+    x_mid = x_mid[:m]
+    x_bottom = x_bottom[:m]
+
+    if t.size > max_points:
+        step = int(np.ceil(t.size / max_points))
+        t = t[::step]
+        x_top = x_top[::step]
+        x_mid = x_mid[::step]
+        x_bottom = x_bottom[::step]
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.34, 0.33, 0.33],
+    )
+    fig.add_trace(go.Scatter(
+        x=t, y=x_top, mode="lines", name=str(top_name),
+        line=dict(color="#8b0000", width=1.2),
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=t, y=x_mid, mode="lines", name=str(mid_name),
+        line=dict(color="#111111", width=1.0),
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=t, y=x_bottom, mode="lines", name=str(bottom_name),
+        line=dict(color="#cc00cc", width=1.0),
+    ), row=3, col=1)
+
+    shapes = []
+
+    def _mk_intervals(UP, DOWN):
+        if UP is None or DOWN is None:
+            return []
+        UP = np.asarray(UP, dtype=int)
+        DOWN = np.asarray(DOWN, dtype=int)
+        n = min(len(UP), len(DOWN))
+        if n == 0:
+            return []
+        out = []
+        for u, d in zip(UP[:n], DOWN[:n]):
+            if 0 <= u < len(time_s) and 0 < d <= len(time_s) and d > u:
+                out.append((float(time_s[u]), float(time_s[d - 1])))
+        return out
+
+    def _add_spans(groups, xref, yref):
+        for _, spans, fill in groups:
+            for (t0, t1) in spans:
+                if len(t) and (t1 < t[0] or t0 > t[-1]):
+                    continue
+                shapes.append(dict(
+                    type="rect",
+                    x0=t0, x1=t1,
+                    y0=0, y1=1,
+                    xref=xref, yref=yref,
+                    line=dict(width=0),
+                    fillcolor=fill,
+                ))
+
+    top_groups = []
+    if top_spont:
+        top_groups.append((str(top_spont_label), _mk_intervals(*top_spont), "rgba(46, 204, 113, 0.34)"))
+    if top_trig:
+        top_groups.append((str(top_trig_label), _mk_intervals(*top_trig), "rgba(31, 119, 180, 0.34)"))
+    if top_assoc:
+        top_groups.append((str(top_assoc_label), _mk_intervals(*top_assoc), "rgba(255, 127, 14, 0.34)"))
+
+    mid_groups = []
+    if mid_spont:
+        mid_groups.append((str(mid_spont_label), _mk_intervals(*mid_spont), "rgba(46, 204, 113, 0.22)"))
+    if mid_trig:
+        mid_groups.append((str(mid_trig_label), _mk_intervals(*mid_trig), "rgba(31, 119, 180, 0.22)"))
+    if mid_assoc:
+        mid_groups.append((str(mid_assoc_label), _mk_intervals(*mid_assoc), "rgba(255, 127, 14, 0.22)"))
+
+    bottom_groups = []
+    if bottom_spont:
+        bottom_groups.append((str(bottom_spont_label), _mk_intervals(*bottom_spont), "rgba(46, 204, 113, 0.34)"))
+    if bottom_trig:
+        bottom_groups.append((str(bottom_trig_label), _mk_intervals(*bottom_trig), "rgba(31, 119, 180, 0.34)"))
+    if bottom_assoc:
+        bottom_groups.append((str(bottom_assoc_label), _mk_intervals(*bottom_assoc), "rgba(255, 127, 14, 0.34)"))
+
+    _add_spans(top_groups, "x", "y domain")
+    _add_spans(mid_groups, "x2", "y2 domain")
+    _add_spans(bottom_groups, "x3", "y3 domain")
+
+    def _add_pulse_intervals(intervals, fill):
+        if intervals is None or len(intervals) == 0:
+            return
+        if len(intervals) > 2000:
+            step = int(np.ceil(len(intervals) / 2000))
+            intervals = intervals[::step]
+        for (t0, t1) in intervals:
+            t0 = float(t0)
+            t1 = float(t1)
+            if t1 <= t0:
+                continue
+            if len(t) and (t1 < t[0] or t0 > t[-1]):
+                continue
+            shapes.append(dict(
+                type="rect",
+                x0=t0, x1=t1,
+                y0=0, y1=1,
+                xref="x", yref="paper",
+                line=dict(width=0),
+                fillcolor=fill,
+            ))
+
+    def _add_pulse_lines(ts, dash, opacity, xref):
+        if ts is None or len(ts) == 0:
+            return
+        tt = np.asarray(ts, float)
+        if tt.size > 1200:
+            tt = tt[::int(np.ceil(tt.size / 1200))]
+        for p in tt:
+            if len(t) and (p < t[0] or p > t[-1]):
+                continue
+            shapes.append(dict(
+                type="line",
+                x0=float(p), x1=float(p),
+                y0=0, y1=1,
+                xref=xref, yref="paper",
+                opacity=opacity,
+                line=dict(width=2, dash=dash, color="red"),
+            ))
+
+    if show_pulse_intervals:
+        _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.10)")
+        _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.10)")
+
+    for xref in ("x", "x2", "x3"):
+        _add_pulse_lines(pulse_times_1, "dot", 0.35, xref)
+        _add_pulse_lines(pulse_times_2, "dash", 0.35, xref)
+        _add_pulse_lines(pulse_times_1_off, "dot", 0.55, xref)
+        _add_pulse_lines(pulse_times_2_off, "dash", 0.55, xref)
+
+    for label, _, fill in top_groups + mid_groups + bottom_groups:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="lines",
+            line=dict(width=12, color=fill),
+            name=label,
+        ))
+
+    if pulse_times_1 is not None and len(pulse_times_1):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dot", color="red"),
+            name="Pulse 1 ON",
+        ))
+    if pulse_times_2 is not None and len(pulse_times_2):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 ON",
+        ))
+    if pulse_times_1_off is not None and len(pulse_times_1_off):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dot", color="red"),
+            name="Pulse 1 OFF",
+        ))
+    if pulse_times_2_off is not None and len(pulse_times_2_off):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 OFF",
+        ))
+    if show_pulse_intervals and (
+        (pulse_intervals_1 is not None and len(pulse_intervals_1)) or
+        (pulse_intervals_2 is not None and len(pulse_intervals_2))
+    ):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=12, color="rgba(255, 0, 0, 0.10)"),
+            name="Pulse duration (ON→OFF)",
+        ))
+
+    fig.update_layout(
+        title=title,
+        shapes=shapes,
+        margin=dict(l=60, r=20, t=50, b=50),
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_xaxes(
+        title_text="Zeit (s)",
+        showline=True,
+        linewidth=2,
+        linecolor="black",
+        mirror="allticks",
+        tickfont=dict(size=14),
+        row=3, col=1,
+    )
+    fig.update_xaxes(showline=True, linewidth=2, linecolor="black", mirror="allticks", tickfont=dict(size=12), row=1, col=1)
+    fig.update_xaxes(showline=True, linewidth=2, linecolor="black", mirror="allticks", tickfont=dict(size=12), row=2, col=1)
+    fig.update_yaxes(title_text=top_y_label, showline=True, linewidth=2, linecolor="black", mirror="allticks", row=1, col=1)
+    fig.update_yaxes(title_text=mid_y_label, showline=True, linewidth=2, linecolor="black", mirror="allticks", row=2, col=1)
+    fig.update_yaxes(title_text=bottom_y_label, showline=True, linewidth=2, linecolor="black", mirror="allticks", row=3, col=1)
+    fig.update_xaxes(rangeslider=dict(visible=True), row=3, col=1)
+
+    def _apply_y_range(range_vals, row, data=None, pad_frac=0.10):
+        if range_vals is not None:
+            yr = np.asarray(range_vals, dtype=float).ravel()
+            if yr.size >= 2 and np.isfinite(yr[0]) and np.isfinite(yr[1]) and yr[1] > yr[0]:
+                fig.update_yaxes(range=[float(yr[0]), float(yr[1])], autorange=False, row=row, col=1)
+            return
+        if data is None:
+            return
+        yy = np.asarray(data, dtype=float).ravel()
+        yy = yy[np.isfinite(yy)]
+        if yy.size == 0:
+            return
+        y0 = float(np.nanmin(yy))
+        y1 = float(np.nanmax(yy))
+        if not np.isfinite(y0) or not np.isfinite(y1):
+            return
+        if y1 <= y0:
+            pad = max(abs(y0) * 0.1, 1.0)
+            fig.update_yaxes(range=[y0 - pad, y1 + pad], autorange=False, row=row, col=1)
+            return
+        pad = (y1 - y0) * float(pad_frac)
+        fig.update_yaxes(range=[y0 - pad, y1 + pad], autorange=False, row=row, col=1)
+
+    _apply_y_range(y_range_top, 1, data=x_top, pad_frac=0.10)
+    _apply_y_range(y_range_mid, 2, data=x_mid, pad_frac=0.08)
+    _apply_y_range(y_range_bottom, 3, data=x_bottom, pad_frac=0.10)
+
+    out_html = os.path.join(save_dir, f"{base_tag}__triple_lfp_interactive.html")
+    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    print(f"[HTML] triple interaktiver LFP-Plot: {out_html}")
+    return out_html
+
+
 def export_interactive_spectrogram_html(
     base_tag, save_dir, spect_dat,
     spindle_trace, spindle_time_s,
@@ -884,6 +1445,184 @@ def export_interactive_spectrogram_html(
     plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
     print(f"[HTML] interaktiver Spectrogramm-Plot: {out_html}")
 
+    return out_html
+
+
+def export_interactive_swr_scan_html(
+    base_tag,
+    save_dir,
+    time_s,
+    raw_signals,
+    bp_signals,
+    swr_intervals_by_channel,
+    *,
+    channel_indices=None,
+    pulse_times_1=None,
+    pulse_times_2=None,
+    max_points=60_000,
+    title="SWR scan (raw + ripple bandpass)",
+    y_label="Amplitude",
+):
+    t = np.asarray(time_s, dtype=float).ravel()
+    X_raw = np.asarray(raw_signals, dtype=float)
+    X_bp = np.asarray(bp_signals, dtype=float)
+
+    if X_raw.ndim != 2 or X_bp.ndim != 2:
+        raise ValueError("raw_signals and bp_signals must be 2D arrays [n_channels, n_time].")
+    if X_raw.shape != X_bp.shape:
+        raise ValueError("raw_signals and bp_signals must have the same shape.")
+    if X_raw.shape[1] != t.size:
+        raise ValueError("time_s length must match signal length.")
+
+    n_ch = int(X_raw.shape[0])
+    if n_ch <= 0:
+        raise ValueError("No channels provided for SWR scan HTML export.")
+
+    if channel_indices is None:
+        channel_indices = list(range(n_ch))
+    else:
+        channel_indices = [int(v) for v in channel_indices]
+        if len(channel_indices) != n_ch:
+            raise ValueError("channel_indices length must match number of channels.")
+
+    if t.size > max_points:
+        step = int(np.ceil(t.size / max_points))
+        t = t[::step]
+        X_raw = X_raw[:, ::step]
+        X_bp = X_bp[:, ::step]
+
+    def _robust_scale(y):
+        yy = np.asarray(y, float).ravel()
+        yy = yy[np.isfinite(yy)]
+        if yy.size == 0:
+            return 1.0
+        s = float(np.nanpercentile(np.abs(yy), 95))
+        if (not np.isfinite(s)) or s <= 1e-12:
+            return 1.0
+        return s
+
+    # Scale the bandpass for visibility while keeping raw in original units.
+    X_bp_vis = np.zeros_like(X_bp, dtype=float)
+    for i in range(n_ch):
+        s_raw = _robust_scale(X_raw[i])
+        s_bp = _robust_scale(X_bp[i])
+        gain = (0.75 * s_raw) / max(s_bp, 1e-12)
+        X_bp_vis[i] = np.asarray(X_bp[i], float) * float(gain)
+
+    fig = make_subplots(
+        rows=n_ch,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=max(0.002, 0.02 / max(n_ch, 1)),
+        row_heights=[1.0 / n_ch] * n_ch,
+    )
+
+    for i in range(n_ch):
+        ch = int(channel_indices[i])
+        show_leg = (i == 0)
+        fig.add_trace(
+            go.Scattergl(
+                x=t, y=X_raw[i], mode="lines",
+                name="Raw signal",
+                line=dict(color="#202020", width=1.0),
+                opacity=0.90,
+                legendgroup="raw",
+                showlegend=show_leg,
+            ),
+            row=i + 1, col=1
+        )
+        fig.add_trace(
+            go.Scattergl(
+                x=t, y=X_bp_vis[i], mode="lines",
+                name="Ripple bandpass (scaled)",
+                line=dict(color="#b30000", width=1.0),
+                opacity=0.75,
+                legendgroup="bp",
+                showlegend=show_leg,
+            ),
+            row=i + 1, col=1
+        )
+
+        spans = swr_intervals_by_channel[i] if i < len(swr_intervals_by_channel) else []
+        first_swr = True
+        for (t0, t1) in spans:
+            t0 = float(t0)
+            t1 = float(t1)
+            if (not np.isfinite(t0)) or (not np.isfinite(t1)) or (t1 <= t0):
+                continue
+            if len(t) and (t1 < t[0] or t0 > t[-1]):
+                continue
+            fig.add_vrect(
+                x0=t0, x1=t1,
+                fillcolor="rgba(220, 20, 60, 0.20)",
+                line_width=0,
+                row=i + 1, col=1,
+            )
+            if first_swr and show_leg:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[None], y=[None], mode="lines",
+                        line=dict(width=10, color="rgba(220, 20, 60, 0.30)"),
+                        name="SWR interval",
+                        showlegend=True,
+                    )
+                )
+                first_swr = False
+
+        fig.update_yaxes(title_text=f"pri_{ch}", row=i + 1, col=1)
+
+    def _add_pulse_lines(ts, dash):
+        if ts is None or len(ts) == 0:
+            return
+        tt = np.asarray(ts, float).ravel()
+        tt = tt[np.isfinite(tt)]
+        if tt.size > 1200:
+            tt = tt[::int(np.ceil(tt.size / 1200))]
+        for i in range(n_ch):
+            for p in tt:
+                if len(t) and (p < t[0] or p > t[-1]):
+                    continue
+                fig.add_vline(
+                    x=float(p),
+                    line=dict(color="red", width=1.1, dash=dash),
+                    opacity=0.30,
+                    row=i + 1, col=1,
+                )
+
+    _add_pulse_lines(pulse_times_1, "dot")
+    _add_pulse_lines(pulse_times_2, "dash")
+
+    if pulse_times_1 is not None and len(pulse_times_1):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dot", color="red"),
+            name="Pulse 1 ON",
+        ))
+    if pulse_times_2 is not None and len(pulse_times_2):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(width=2, dash="dash", color="red"),
+            name="Pulse 2 ON",
+        ))
+
+    fig.update_layout(
+        title=title,
+        margin=dict(l=70, r=20, t=55, b=50),
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(
+        title_text="Zeit (s)",
+        showline=True, linewidth=1.5, linecolor="black", mirror="allticks",
+        row=n_ch, col=1
+    )
+    fig.update_xaxes(rangeslider=dict(visible=True), row=n_ch, col=1)
+    fig.update_yaxes(showline=True, linewidth=1.2, linecolor="black", mirror="allticks")
+
+    out_html = os.path.join(save_dir, f"{base_tag}__SWR_CH00_17_SCAN.html")
+    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    print(f"[HTML] SWR scan interactive: {out_html}")
     return out_html
 
 

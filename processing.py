@@ -372,6 +372,10 @@ def compute_refractory_period(UP_indices, DOWN_indices, time_s):
     """
     UP   = np.asarray(UP_indices,   int)
     DOWN = np.asarray(DOWN_indices, int)
+    time_s = np.asarray(time_s, float)
+    n_time = int(time_s.size)
+    if n_time < 2:
+        return np.array([], float)
 
     m = min(len(UP), len(DOWN))
     if m < 2:
@@ -379,15 +383,29 @@ def compute_refractory_period(UP_indices, DOWN_indices, time_s):
 
     UP   = UP[:m]
     DOWN = DOWN[:m]
+    valid = (
+        np.isfinite(UP) & np.isfinite(DOWN) &
+        (UP >= 0) & (UP < n_time) &
+        (DOWN > UP) & (DOWN <= n_time)
+    )
+    UP = UP[valid]
+    DOWN = DOWN[valid]
+    if UP.size < 2:
+        return np.array([], float)
 
     # Sicherheit: nach Zeit sortieren
     order = np.argsort(time_s[UP])
     UP    = UP[order]
     DOWN  = DOWN[order]
+    dt_time = float(np.median(np.diff(time_s))) if n_time >= 2 else np.nan
 
     refrac = []
-    for i in range(m - 1):
-        t_off = time_s[DOWN[i]]      # Ende des aktuellen UP
+    for i in range(UP.size - 1):
+        d_i = int(DOWN[i])
+        d_clip = min(d_i, n_time - 1)
+        t_off = float(time_s[d_clip])      # Ende des aktuellen UP (DOWN ist exklusiver Rand)
+        if d_i == n_time and np.isfinite(dt_time):
+            t_off += dt_time
         t_on  = time_s[UP[i+1]]      # Beginn des nächsten UP
         dt_ref = t_on - t_off
         if dt_ref >= 0:

@@ -337,8 +337,8 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         return out
 
     # Zielbereich für UP-Anteil (Feature-Zeitachse)
-    target_min = 0.03
-    target_max = 0.30
+    target_min = float(os.environ.get("UP_TARGET_MIN_FRAC", "0.015"))
+    target_max = float(os.environ.get("UP_TARGET_MAX_FRAC", "0.45"))
 
     # Startwerte
     k_hi = 4.5
@@ -407,17 +407,18 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     up_state_binary = binary.astype(bool)
 
-    # 5) Transitions + Dauerfilter 
-    up_transitions = np.where(np.diff(up_state_binary.astype(int)) == 1)[0]
-    down_transitions = np.where(np.diff(up_state_binary.astype(int)) == -1)[0]
+    # 5) Transitions + Dauerfilter
+    # Edge-konform: UP onset ist inklusiv, DOWN ist exklusiv.
+    z_up = up_state_binary.astype(np.int8)
+    up_transitions = np.where(np.diff(z_up, prepend=0) == 1)[0]
+    down_transitions = np.where(np.diff(z_up, append=0) == -1)[0] + 1
 
-    if down_transitions.size and up_transitions.size and down_transitions[0] < up_transitions[0]:
-        down_transitions = down_transitions[1:]
-    if up_transitions.size > down_transitions.size:
-        up_transitions = up_transitions[:-1]
+    m_ud = min(up_transitions.size, down_transitions.size)
+    up_transitions = up_transitions[:m_ud]
+    down_transitions = down_transitions[:m_ud]
 
     # Keep short but valid UP states; 1.0 s was too strict for many sessions.
-    min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", "0.50"))
+    min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", "0.30"))
     if not up_transitions.size or not down_transitions.size:
         UP_start_i = np.array([], dtype=int)
         DOWN_start_i = np.array([], dtype=int)
@@ -426,7 +427,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         filtered_DOWN = []
         rejected_short = 0
         for u, d in zip(up_transitions, down_transitions):
-            duration = t_feat[d] - t_feat[u]
+            duration = float(d - u) * float(dt_feat)
             if duration < min_up_len_s:
                 rejected_short += 1
                 continue
@@ -442,9 +443,23 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
             f"(min_len={min_up_len_s:.2f}s)"
         )
 
+    def _feat_idx_to_time(idx_arr):
+        idx_arr = np.asarray(idx_arr, dtype=int)
+        if idx_arr.size == 0:
+            return np.array([], float)
+        if t_feat.size == 0:
+            return np.array([], float)
+        idx_clip = np.clip(idx_arr, 0, t_feat.size - 1)
+        out = np.asarray(t_feat[idx_clip], float)
+        over = idx_arr - idx_clip
+        if np.any(over):
+            # idx==len(t_feat) entspricht rechtem Bin-Rand -> +dt_feat.
+            out = out + over.astype(float) * float(dt_feat)
+        return out
+
     # 6) NO-UP Gate
-    min_up_fraction = 0.03
-    min_up_onsets = 2
+    min_up_fraction = float(os.environ.get("UP_MIN_FRAC", "0.01"))
+    min_up_onsets = int(os.environ.get("UP_MIN_ONSETS", "1"))
 
     print("[BAND] f_lo,f_hi =", f_lo, f_hi)
     #print("[THR] thr =", threshold, "smooth min/max =", Total_power_smooth.min(), Total_power_smooth.max())
@@ -525,8 +540,8 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     mask_trig = np.zeros(n_up, dtype=bool)
 
     if n_up:
-        up_times = np.asarray(t_feat[UP_start_i[:n_up]], float)
-        dn_times = np.asarray(t_feat[DOWN_start_i[:n_up]], float)
+        up_times = _feat_idx_to_time(UP_start_i[:n_up])
+        dn_times = _feat_idx_to_time(DOWN_start_i[:n_up])
 
         # Pulse-zentrierte Zuordnung:
         # Pro Puls max. ein triggered-UP (erstes UP im Pulsfenster),
@@ -602,10 +617,11 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     # 8) Dauer/Stats
     if len(Spontaneous_UP) > 1 and len(Pulse_triggered_UP) > 1:
-        # Duration_Spontaneous = time_s[Spontaneous_DOWN] - time_s[Spontaneous_UP]
-        Duration_Spontaneous = t_feat[Spontaneous_DOWN] - t_feat[Spontaneous_UP]
-        Duration_Pulse_Triggered = t_feat[Pulse_triggered_DOWN] - t_feat[Pulse_triggered_UP]
-        Duration_Pulse_Associated = t_feat[Pulse_associated_DOWN] - t_feat[Pulse_associated_UP] if len(Pulse_associated_UP) else np.array([])
+        Duration_Spontaneous = _feat_idx_to_time(Spontaneous_DOWN) - _feat_idx_to_time(Spontaneous_UP)
+        Duration_Pulse_Triggered = _feat_idx_to_time(Pulse_triggered_DOWN) - _feat_idx_to_time(Pulse_triggered_UP)
+        Duration_Pulse_Associated = (
+            _feat_idx_to_time(Pulse_associated_DOWN) - _feat_idx_to_time(Pulse_associated_UP)
+        ) if len(Pulse_associated_UP) else np.array([])
 
         # Duration_Pulse_Associated = time_s[Pulse_associated_DOWN] - time_s[Pulse_associated_UP] if len(Pulse_associated_UP) else np.array([])
         Dur_stat, Dur_p = stats.ttest_ind(Duration_Spontaneous, Duration_Pulse_Triggered)
@@ -725,42 +741,42 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
 
     UP_start_raw   = (
-        np.asarray(np.round((t_feat[UP_start_i] - t0_feat) / dt), int)
+        np.asarray(np.round((_feat_idx_to_time(UP_start_i) - t0_feat) / dt), int)
         if UP_start_i.size else np.array([], int)
     )
 
     DOWN_start_raw = (
-        np.asarray(np.round((t_feat[DOWN_start_i] - t0_feat) / dt), int)
+        np.asarray(np.round((_feat_idx_to_time(DOWN_start_i) - t0_feat) / dt), int)
         if DOWN_start_i.size else np.array([], int)
     )
 
     Spont_UP_raw = (
-        np.asarray(np.round((t_feat[Spontaneous_UP] - t0_feat) / dt), int)
+        np.asarray(np.round((_feat_idx_to_time(Spontaneous_UP) - t0_feat) / dt), int)
         if Spontaneous_UP.size else np.array([], int)
     )
 
     Spont_DN_raw = (
-        np.asarray(np.round((t_feat[Spontaneous_DOWN] - t0_feat) / dt), int)
+        np.asarray(np.round((_feat_idx_to_time(Spontaneous_DOWN) - t0_feat) / dt), int)
         if Spontaneous_DOWN.size else np.array([], int)
     )
 
     Trig_UP_raw  = (
-        np.asarray(np.round((t_feat[Pulse_triggered_UP] - t0_feat) / dt), int)
+        np.asarray(np.round((_feat_idx_to_time(Pulse_triggered_UP) - t0_feat) / dt), int)
         if Pulse_triggered_UP.size else np.array([], int)
     )
 
     Trig_DN_raw  = (
-        np.asarray(np.round((t_feat[Pulse_triggered_DOWN] - t0_feat) / dt), int)
+        np.asarray(np.round((_feat_idx_to_time(Pulse_triggered_DOWN) - t0_feat) / dt), int)
         if Pulse_triggered_DOWN.size else np.array([], int)
     )
 
     Assoc_UP_raw = (
-        np.asarray(np.round((t_feat[Pulse_associated_UP] - t0_feat) / dt), int)
+        np.asarray(np.round((_feat_idx_to_time(Pulse_associated_UP) - t0_feat) / dt), int)
         if Pulse_associated_UP.size else np.array([], int)
     )
 
     Assoc_DN_raw = (
-        np.asarray(np.round((t_feat[Pulse_associated_DOWN] - t0_feat) / dt), int)
+        np.asarray(np.round((_feat_idx_to_time(Pulse_associated_DOWN) - t0_feat) / dt), int)
         if Pulse_associated_DOWN.size else np.array([], int)
     )
 
@@ -948,13 +964,18 @@ def extract_upstate_windows(UP_indices, LFP_array, dt, window_s):
 
 def compute_spectra(windows, dt, ignore_start_s=0.0):
     spectra = []
+    freqs = None
     for trial in windows:
         trial = np.asarray(trial)
         if ignore_start_s > 0:
             start_idx = int(ignore_start_s / dt)
             trial = trial[start_idx:]
+        if trial.size < 2:
+            continue
         freqs, power = welch(trial, fs=1/dt, nperseg=min(256, len(trial)))
         spectra.append(power)
+    if freqs is None:
+        return np.empty((0, 0), float), np.array([], float)
     return np.array(spectra), freqs
 
 
