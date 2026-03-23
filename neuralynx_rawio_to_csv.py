@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import struct
 import sys, re
 from pathlib import Path
 from functools import reduce
@@ -54,6 +55,28 @@ def _get_chunk(rr, si, start, stop, chan_idx):
     return rr.get_analogsignal_chunk(block_index=0, seg_index=0,
                                      stream_index=si, i_start=start, i_stop=stop,
                                      channel_indexes=chan_idx)
+
+
+def _first_ncs_timestamp_us(session_dir: Path):
+    """
+    Read first timestamp tick (uint64, µs in Neuralynx) from each .ncs file and
+    return median start timestamp in µs.
+    """
+    hdr_bytes = 16 * 1024
+    vals = []
+    for fp in sorted(session_dir.glob("*.ncs")) + sorted(session_dir.glob("*.Ncs")) + sorted(session_dir.glob("*.NCS")):
+        try:
+            with open(fp, "rb") as f:
+                f.seek(hdr_bytes)
+                buf = f.read(8)
+            if len(buf) != 8:
+                continue
+            vals.append(int(struct.unpack("<Q", buf)[0]))
+        except Exception:
+            continue
+    if not vals:
+        return None
+    return int(np.median(np.asarray(vals, dtype=np.int64)))
 
 
 _hex_re = re.compile(r"ttl\s*value\s*:\s*0x([0-9a-fA-F]+)", flags=re.I)
@@ -410,14 +433,25 @@ def main(session_dir, out_csv=None):
                 _, best_bit, on_us, off_us = best
                 t = df_all["time"].to_numpy(dtype=np.float64)
                 t0 = float(t[0]) if t.size else 0.0
-                on_s = np.asarray(on_us, dtype=float) / 1e6
-                off_s = np.asarray(off_us, dtype=float) / 1e6
-                # align NEV to current timeline (if absolute mismatch)
-                if on_s.size and not ((np.nanmax(on_s) >= t0) and (np.nanmin(on_s) <= float(t[-1]))):
-                    ref0 = float(on_s[0])
-                    on_s = on_s - ref0 + t0
-                    if off_s.size:
-                        off_s = off_s - ref0 + t0
+
+                # Anchor NEV event times to NCS timeline using first NCS timestamp.
+                # This avoids the old ref0->t0 fallback that could place pulses wrongly.
+                ncs_t0_us = _first_ncs_timestamp_us(p)
+                if ncs_t0_us is not None:
+                    on_s = (np.asarray(on_us, dtype=np.float64) - float(ncs_t0_us)) / 1e6 + t0
+                    off_s = (np.asarray(off_us, dtype=np.float64) - float(ncs_t0_us)) / 1e6 + t0
+                    print(f"[NEV->CSV][T0] using NCS start timestamp: {ncs_t0_us}")
+                else:
+                    on_s = np.asarray(on_us, dtype=np.float64) / 1e6
+                    off_s = np.asarray(off_us, dtype=np.float64) / 1e6
+                    # Last-resort timeline alignment only when absolute scales clearly differ.
+                    if on_s.size and t.size:
+                        in_range = (np.nanmax(on_s) >= t[0]) and (np.nanmin(on_s) <= t[-1])
+                        if not in_range:
+                            on_s = on_s - float(on_s[0]) + t0
+                            if off_s.size:
+                                off_s = off_s - float(off_s[0]) + t0
+                            print("[NEV->CSV][T0][WARN] fallback alignment used (no NCS t0)")
                 df_all["stim"] = _build_stim_from_on_off(on_s, off_s, t)
                 df_all["stim_on"] = _build_stim_onset_impulses(on_s, t)
                 df_all["stim_off"] = _build_stim_onset_impulses(off_s, t) if off_s.size else np.zeros_like(df_all["stim"])

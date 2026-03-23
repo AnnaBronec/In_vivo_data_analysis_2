@@ -131,9 +131,14 @@ def main(session_dir: str, out_csv: str | None = None, *, fs_xdat: float | None 
     target_csv = Path(out_csv).expanduser().resolve() if out_csv else (sdir / f"{sdir.name}.csv")
 
     # 1) Fertige CSV schon da?
+    # Default: überschreiben (historisches Verhalten).
+    # Opt-out via ENV UNIVERSAL_KEEP_EXISTING_CSV=1
     if target_csv.is_file():
-        print(f"[SKIP] CSV existiert bereits: {target_csv.name}")
-        return
+        keep_existing = os.environ.get("UNIVERSAL_KEEP_EXISTING_CSV", "0") == "1"
+        if keep_existing:
+            print(f"[SKIP] CSV existiert bereits: {target_csv.name}")
+            return
+        print(f"[INFO] CSV wird überschrieben: {target_csv.name}")
 
     # 2) XDAT vorhanden?
     xpref = _find_xdat_prefix(sdir)
