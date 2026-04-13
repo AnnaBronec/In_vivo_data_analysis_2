@@ -417,8 +417,10 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     up_transitions = up_transitions[:m_ud]
     down_transitions = down_transitions[:m_ud]
 
-    # Strengeres Default gegen sehr kurze Fehl-Detektionen.
-    min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", "0.60"))
+    # Channel-aware default: pri_33 often benefits from a shorter minimum UP length.
+    req_up_ch_env = str(os.environ.get("MAIN_UP_CH", "33")).strip()
+    min_up_len_default = "0.30" if req_up_ch_env == "33" else "0.60"
+    min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", min_up_len_default))
     if not up_transitions.size or not down_transitions.size:
         UP_start_i = np.array([], dtype=int)
         DOWN_start_i = np.array([], dtype=int)

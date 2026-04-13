@@ -1460,6 +1460,8 @@ def export_interactive_swr_scan_html(
     pulse_times_1=None,
     pulse_times_2=None,
     max_points=60_000,
+    max_spans_per_channel=600,
+    max_pulses_per_channel=800,
     title="SWR scan (raw + ripple bandpass)",
     y_label="Amplitude",
 ):
@@ -1544,6 +1546,9 @@ def export_interactive_swr_scan_html(
         )
 
         spans = swr_intervals_by_channel[i] if i < len(swr_intervals_by_channel) else []
+        if len(spans) > int(max_spans_per_channel):
+            step_sp = int(np.ceil(len(spans) / max(1, int(max_spans_per_channel))))
+            spans = spans[::step_sp]
         first_swr = True
         for (t0, t1) in spans:
             t0 = float(t0)
@@ -1576,8 +1581,8 @@ def export_interactive_swr_scan_html(
             return
         tt = np.asarray(ts, float).ravel()
         tt = tt[np.isfinite(tt)]
-        if tt.size > 1200:
-            tt = tt[::int(np.ceil(tt.size / 1200))]
+        if tt.size > int(max_pulses_per_channel):
+            tt = tt[::int(np.ceil(tt.size / max(1, int(max_pulses_per_channel))))]
         for i in range(n_ch):
             for p in tt:
                 if len(t) and (p < t[0] or p > t[-1]):

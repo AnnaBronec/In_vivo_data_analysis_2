@@ -444,7 +444,19 @@ def main():
     ap.add_argument("root_dir")
     ap.add_argument("--recursive", action="store_true")
     ap.add_argument("--out-csv", default=None)
-    ap.add_argument("--skip-convert-if-exists", action="store_true")
+    ap.add_argument(
+        "--skip-convert-if-exists",
+        dest="skip_convert_if_exists",
+        action="store_true",
+        default=True,
+        help="Skip conversion when a suitable CSV already exists (default: on).",
+    )
+    ap.add_argument(
+        "--force-reconvert",
+        dest="skip_convert_if_exists",
+        action="store_false",
+        help="Force conversion even if a CSV already exists.",
+    )
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max-workers", type=int, default=1)
 

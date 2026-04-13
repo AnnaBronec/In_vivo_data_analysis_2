@@ -88,6 +88,7 @@ AUTO_PULSE_EDGE_SHIFT = os.environ.get("AUTO_PULSE_EDGE_SHIFT", "0") == "1"
 AUTO_CLEAR_TINY_OFFSETS = os.environ.get("AUTO_CLEAR_TINY_OFFSETS", "0") == "1"
 AUTO_PULSE_ARTIFACT_ALIGN = os.environ.get("AUTO_PULSE_ARTIFACT_ALIGN", "0") == "1"
 FORCE_ONSET_ONLY_PLOTS = os.environ.get("FORCE_ONSET_ONLY_PLOTS", "1") == "1"
+SHOW_COMMENT_PULSE_OFFSETS = os.environ.get("SHOW_COMMENT_PULSE_OFFSETS", "1") == "1"
 IGNORE_PULSE_2 = os.environ.get("IGNORE_PULSE_2", "0") == "1"
 SPINDLE_ZERO_PHASE = os.environ.get("SPINDLE_ZERO_PHASE", "1") == "1"
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
@@ -120,6 +121,8 @@ chan_cols_raw = []
 FLIP_DEPTH = False
 DEBUG_MAIN_SAFE = os.environ.get("DEBUG_MAIN_SAFE", "0") == "1"
 PART_CSV_RE = re.compile(r"\.part\d+\.csv$", re.IGNORECASE)
+_PULSE_MS_PAT = re.compile(r"onePulse\s*([0-9]+(?:\.[0-9]+)?)\s*ms", flags=re.I)
+_ANY_MS_PAT = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*ms", flags=re.I)
 
 
 def debug_log(*args, **kwargs):
@@ -129,6 +132,36 @@ def debug_log(*args, **kwargs):
 
 def _is_split_part_csv_name(name: str) -> bool:
     return bool(PART_CSV_RE.search(name))
+
+
+def _infer_pulse_ms_from_text(text):
+    if not text:
+        return None
+    s = str(text)
+    m = _PULSE_MS_PAT.search(s)
+    if m:
+        try:
+            v = float(m.group(1))
+            if np.isfinite(v) and 0.5 <= v <= 5000:
+                return v
+        except Exception:
+            pass
+    vals = []
+    for mm in _ANY_MS_PAT.finditer(s):
+        try:
+            v = float(mm.group(1))
+        except Exception:
+            continue
+        if np.isfinite(v) and 0.5 <= v <= 5000:
+            vals.append(v)
+    if not vals:
+        return None
+    mid = [v for v in vals if 10 <= v <= 1000]
+    if len(mid) == 1:
+        return mid[0]
+    if mid:
+        return sorted(mid)[0]
+    return sorted(vals)[0]
 
 
 def edges_from_parts_csv(parts_dir, col, time_col="time", thr=None):
@@ -1357,14 +1390,16 @@ print(f"[CHAN-FILTER] kept {NUM_CHANNELS_GOOD}/{NUM_CHANNELS} Kanäle:", ch_name
 
 log(f"Channel filter: kept={NUM_CHANNELS_GOOD}/{NUM_CHANNELS}, good_idx={good_idx}")
 
-# Kanal-Policy laut User:
-# - viele Kanäle (2 Elektroden): UP=ch15, SWR=ch9
-# - weniger Kanäle (1 Elektrode): UP=ch9, SWR deaktiviert
+# Kanal-Policy:
+# - LFP/UP/Spindle: pri_0 (per ENV MAIN_UP_CH überschreibbar)
+# - SWR:            immer pri_33 (explizit aus globalem LFP_array, unabhängig von good_idx)
+# Bei wenigen Kanälen bleibt SWR standardmäßig deaktiviert (wie bisher), außer ENABLE_SWR wird passend gesetzt.
 dual_probe_min_ch = int(os.environ.get("DUAL_PROBE_MIN_CHANNELS", "24"))
 is_dual_probe_mode = int(NUM_CHANNELS) >= dual_probe_min_ch
-req_up_ch = 15 if is_dual_probe_mode else 9
-req_swr_ch = 9
-enable_swr = bool(is_dual_probe_mode)
+req_up_ch = int(os.environ.get("MAIN_UP_CH", "0"))
+req_swr_ch = 33
+enable_swr_env = str(os.environ.get("ENABLE_SWR", "1")).strip().lower() not in ("0", "false", "no", "off")
+enable_swr = bool(is_dual_probe_mode) and bool(enable_swr_env)
 
 ch_idx_used = int(np.clip(req_up_ch, 0, int(NUM_CHANNELS) - 1))
 if ch_idx_used != int(req_up_ch):
@@ -1385,8 +1420,9 @@ if HTML_IN_uV:
     else:
         main_channel_uV = main_channel.copy()
 
-print(f"[MAIN-CH] using fixed UP channel: pri_{ch_idx_used}")
+print(f"[MAIN-CH] using fixed LFP/UP/SP channel: pri_{ch_idx_used}")
 swr_ch_idx_main = int(np.clip(req_swr_ch, 0, int(NUM_CHANNELS) - 1))
+# SWR always from global channel 33; this intentionally ignores channel-quality filtering.
 swr_channel = np.asarray(LFP_array[int(swr_ch_idx_main)], dtype=float) if enable_swr else None
 print(
     f"[CHAN-MODE] dual_probe={int(is_dual_probe_mode)} "
@@ -1831,8 +1867,15 @@ Up["DOWN_start_i"] = np.asarray([p[1] for p in _all_pairs], int) if _all_pairs e
 
 # Zusätzlicher robuster Dauerfilter auf Raw-Sample-Ebene:
 # verwirft sehr kurze UPs nach der Klassifikation in allen Klassen konsistent.
-up_min_dur_post_s = float(os.environ.get("UP_MIN_DUR_POST_S", os.environ.get("UP_MIN_LEN_S", "0.80")))
-up_min_dur_floor_s = float(os.environ.get("UP_MIN_DUR_POST_FLOOR_S", "0.60"))
+# Für den Standard-UP-Kanal pri_33 etwas sensitiver (kürzere Mindestdauer).
+if int(ch_idx_used) == 33:
+    _up_min_dur_post_default = "0.30"
+    _up_min_dur_floor_default = "0.25"
+else:
+    _up_min_dur_post_default = "0.80"
+    _up_min_dur_floor_default = "0.60"
+up_min_dur_post_s = float(os.environ.get("UP_MIN_DUR_POST_S", os.environ.get("UP_MIN_LEN_S", _up_min_dur_post_default)))
+up_min_dur_floor_s = float(os.environ.get("UP_MIN_DUR_POST_FLOOR_S", _up_min_dur_floor_default))
 up_min_dur_post_s = max(up_min_dur_post_s, up_min_dur_floor_s)
 if np.isfinite(up_min_dur_post_s) and up_min_dur_post_s > 0:
     def _filter_short_up_pairs(U, D, min_dur_s, dt_s, label):
@@ -2582,7 +2625,9 @@ require_up_overlap_main = bool(len(all_up_pairs))
 try:
     n_scan_default = int(os.environ.get("SWR_SCAN_N_CH", "8"))
     n_scan = min(max(1, n_scan_default), int(LFP_array.shape[0])) if (hasattr(LFP_array, "shape") and len(LFP_array.shape) >= 2) else 0
-    swr_scan_mode = str(os.environ.get("SWR_SCAN_MODE", "html")).strip().lower()  # html | pdf | qa | all | off
+    # Default "off": der Scan ist nur QA/Diagnostik und kann bei langen Sessions sehr teuer werden.
+    # Die eigentliche SWR-Analyse weiter unten bleibt davon unberührt.
+    swr_scan_mode = str(os.environ.get("SWR_SCAN_MODE", "off")).strip().lower()  # html | pdf | qa | all | off
     swr_enable = (swr_scan_mode not in ("off", "0", "false", "no")) and bool(enable_swr)
     swr_make_html = swr_scan_mode in ("html", "all")
     swr_make_pdf = swr_scan_mode in ("pdf", "all")
@@ -2671,6 +2716,7 @@ try:
                     })
 
         if swr_make_html:
+            print("[SWR-SCAN] exporting HTML …")
             swr_html_max_points = int(os.environ.get("SWR_SCAN_HTML_MAX_POINTS", "12000"))
             export_interactive_swr_scan_html(
                 BASE_TAG,
@@ -2686,7 +2732,10 @@ try:
                 title="SWR scan (channels 0-17): raw + ripple bandpass + pulses",
             )
 
+            print("[SWR-SCAN] HTML done")
+
         if swr_make_pdf:
+            print("[SWR-SCAN] exporting PDF …")
             fig_h = max(12.0, 1.35 * n_scan)
             fig, axs = plt.subplots(n_scan, 1, sharex=True, figsize=(13.0, fig_h), constrained_layout=True)
             if n_scan == 1:
@@ -2716,6 +2765,7 @@ try:
             print(f"[PDF] SWR channel scan saved: {out_pdf}")
 
         if swr_make_qa:
+            print("[SWR-SCAN] writing QA CSV …")
             qa_csv = os.path.join(SAVE_DIR, f"{BASE_TAG}__SWR_CH00_17_QA_events.csv")
             pd.DataFrame(swr_event_rows).to_csv(qa_csv, index=False)
             print(f"[QA] SWR QA CSV saved: {qa_csv}")
@@ -3132,6 +3182,25 @@ print("[HTML FINAL] p1_on/off:", len(pulse_times_1_html), len(pulse_times_1_off_
       "| ttl1/ttl2:", len(ttl1_intervals), len(ttl2_intervals))
 print("[HTML FINAL] time window:", tmin, "->", tmax)
 
+# Optional: draw pulse offsets from protocol/comment text (e.g. "onePulse150ms")
+# for visualization, even when raw OFF edges are tiny/unreliable.
+pulse_times_1_off_comment = np.array([], dtype=float)
+comment_pulse_ms = None
+if SHOW_COMMENT_PULSE_OFFSETS and pulse_times_1_html is not None and len(pulse_times_1_html):
+    comment_sources = [os.path.basename(os.path.normpath(BASE_PATH))]
+    if "LFP_FILENAME" in globals() and LFP_FILENAME:
+        comment_sources.append(str(LFP_FILENAME))
+    if nev_path:
+        comment_sources.append(os.path.basename(str(nev_path)))
+    for src in comment_sources:
+        comment_pulse_ms = _infer_pulse_ms_from_text(src)
+        if comment_pulse_ms is not None:
+            break
+    if comment_pulse_ms is not None:
+        pulse_times_1_off_comment = np.asarray(pulse_times_1_html, float) + (float(comment_pulse_ms) / 1000.0)
+        pulse_times_1_off_comment = _clip_to_window(pulse_times_1_off_comment, tmin, tmax)
+        print(f"[HTML-PULSE] using comment-derived pulse offsets: {comment_pulse_ms:.3f} ms")
+
 # If OFF edges are missing/unreliable, show only onset lines (no pulse-duration areas).
 PULSE_ONSET_ONLY = False
 if pulse_times_1_html is not None and len(pulse_times_1_html):
@@ -3154,7 +3223,13 @@ if FORCE_ONSET_ONLY_PLOTS:
     ttl2_intervals = []
     print("[PULSE-PLOT] FORCE_ONSET_ONLY_PLOTS=1 -> force onset-only pulse display")
 
-pulse_times_1_off_html_plot = np.array([], float) if PULSE_ONSET_ONLY else pulse_times_1_off_html
+# Comment-derived OFF offsets override onset-only rendering for pulse-1 visualization.
+if pulse_times_1_off_comment is not None and len(pulse_times_1_off_comment):
+    pulse_times_1_off_html_plot = pulse_times_1_off_comment
+    ttl1_intervals = _pair_on_off(pulse_times_1_html, pulse_times_1_off_html_plot, max_width_s=5.0)
+    print(f"[PULSE-PLOT] comment offsets enabled: drawing {len(ttl1_intervals)} pulse windows")
+else:
+    pulse_times_1_off_html_plot = np.array([], float) if PULSE_ONSET_ONLY else pulse_times_1_off_html
 pulse_times_2_off_html_plot = np.array([], float) if PULSE_ONSET_ONLY else pulse_times_2_off_html
 
 # Final export-level guard (prevents any Pulse 2 rendering in HTML when requested).
@@ -3370,7 +3445,7 @@ export_interactive_dual_lfp_html(
     show_pulse_intervals=(not PULSE_ONSET_ONLY),
 )
 
-# Zusatz-HTML: 3 Panels (ch9 SWR, ch40 UP, ch40 10-15Hz Spindles)
+# Zusatz-HTML: 3 Panels (SWR-Kanal, LFP/UP-Kanal, 10-15Hz auf LFP/UP-Kanal)
 try:
     if not enable_swr:
         raise RuntimeError("SWR disabled by channel policy")
@@ -3414,7 +3489,7 @@ try:
             f"mid trace is pri_{int(up_ch_idx)}."
         )
 
-    # SWR in channel 9 (UP-overlap required, gleiche Klassifikationslogik wie sonst).
+    # SWR im gewählten SWR-Kanal (UP-overlap required, gleiche Klassifikationslogik wie sonst).
     ch9_ripple_intervals_s = detect_sharp_wave_ripple_intervals_in_upstates(
         ch9_raw, time_s, dt, all_up_pairs,
         f_lo=float(os.environ.get("SWR_F_LO_HZ", "120.0")),
