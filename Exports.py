@@ -43,7 +43,7 @@ def export_interactive_lfp_html(
     ripple_trig_label="SWR triggered",
     ripple_assoc_label="SWR associated",
     ripple_intervals=None,  # list[(t0, t1)] in Sekunden
-    max_points=300_000,
+    max_points=600_000,
     title="LFP (interaktiv)",
     limit_to_last_pulse=False,
     y_label="LFP (µV)",
@@ -442,7 +442,7 @@ def export_interactive_dual_lfp_html(
     bottom_spont_label="UP spontaneous",
     bottom_trig_label="UP triggered",
     bottom_assoc_label="UP associated",
-    max_points=300_000,
+    max_points=600_000,
     title="Dual LFP (interaktiv)",
     top_y_label="10-15 Hz bandpass",
     bottom_y_label="LFP",
@@ -721,7 +721,7 @@ def export_interactive_two_channel_lfp_html(
     pulse_times_1_off=None, pulse_times_2_off=None,
     pulse_intervals_1=None, pulse_intervals_2=None,
     *,
-    max_points=300_000,
+    max_points=600_000,
     title="Two LFP channels (interaktiv)",
     top_name="Channel top",
     bottom_name="Channel bottom",
@@ -1459,11 +1459,16 @@ def export_interactive_swr_scan_html(
     channel_indices=None,
     pulse_times_1=None,
     pulse_times_2=None,
+    pulse_times_1_off=None,
+    pulse_times_2_off=None,
     max_points=60_000,
     max_spans_per_channel=600,
     max_pulses_per_channel=800,
     title="SWR scan (raw + ripple bandpass)",
     y_label="Amplitude",
+    out_suffix="SWR_CH00_17_SCAN",
+    bp_band_label=None,
+    slow_band_label=None,
 ):
     t = np.asarray(time_s, dtype=float).ravel()
     X_raw = np.asarray(raw_signals, dtype=float)
@@ -1487,67 +1492,83 @@ def export_interactive_swr_scan_html(
         if len(channel_indices) != n_ch:
             raise ValueError("channel_indices length must match number of channels.")
 
-    if t.size > max_points:
-        step = int(np.ceil(t.size / max_points))
+    n_rows = 2 * n_ch
+
+    # Adaptive caps for large stacked plots so HTML export remains responsive.
+    eff_max_points = int(max(1200, min(int(max_points), int(np.ceil(90_000 / max(n_ch, 1))))))
+    eff_max_spans_per_channel = int(
+        max(6, min(int(max_spans_per_channel), int(np.ceil(260 / max(n_ch, 1)))))
+    )
+    eff_max_pulses = int(max(24, min(int(max_pulses_per_channel), 80)))
+    if n_ch >= 16:
+        eff_max_points = int(max(1000, min(eff_max_points, 3500)))
+        eff_max_spans_per_channel = int(max(4, min(eff_max_spans_per_channel, 10)))
+        eff_max_pulses = int(max(16, min(eff_max_pulses, 40)))
+    print(
+        f"[HTML-SWR] n_ch={n_ch} points_cap={eff_max_points} "
+        f"spans_cap_per_ch={eff_max_spans_per_channel} pulses_cap={eff_max_pulses}"
+    )
+
+    if t.size > eff_max_points:
+        step = int(np.ceil(t.size / eff_max_points))
         t = t[::step]
         X_raw = X_raw[:, ::step]
         X_bp = X_bp[:, ::step]
 
-    def _robust_scale(y):
+    def _robust_ylim(y):
         yy = np.asarray(y, float).ravel()
         yy = yy[np.isfinite(yy)]
-        if yy.size == 0:
-            return 1.0
-        s = float(np.nanpercentile(np.abs(yy), 95))
-        if (not np.isfinite(s)) or s <= 1e-12:
-            return 1.0
-        return s
-
-    # Scale the bandpass for visibility while keeping raw in original units.
-    X_bp_vis = np.zeros_like(X_bp, dtype=float)
-    for i in range(n_ch):
-        s_raw = _robust_scale(X_raw[i])
-        s_bp = _robust_scale(X_bp[i])
-        gain = (0.75 * s_raw) / max(s_bp, 1e-12)
-        X_bp_vis[i] = np.asarray(X_bp[i], float) * float(gain)
+        if yy.size < 10:
+            return None
+        med = float(np.nanmedian(yy))
+        dev = np.abs(yy - med)
+        span = float(np.nanpercentile(dev, 99.0))
+        if (not np.isfinite(span)) or span <= 1e-12:
+            return None
+        pad = 1.25 * span
+        return [med - pad, med + pad]
 
     fig = make_subplots(
-        rows=n_ch,
+        rows=n_rows,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=max(0.002, 0.02 / max(n_ch, 1)),
-        row_heights=[1.0 / n_ch] * n_ch,
+        vertical_spacing=max(0.001, 0.02 / max(n_rows, 1)),
+        row_heights=[1.0 / n_rows] * n_rows,
     )
 
     for i in range(n_ch):
         ch = int(channel_indices[i])
         show_leg = (i == 0)
+        row_bp = 2 * i + 1
+        row_raw = 2 * i + 2
+        bp_name = f"Fast {bp_band_label}" if bp_band_label else "Fast component"
+        slow_name = f"Slow {slow_band_label}" if slow_band_label else "Slow component"
+        fig.add_trace(
+            go.Scattergl(
+                x=t, y=X_bp[i], mode="lines",
+                name=bp_name,
+                line=dict(color="#1f4fff", width=1.0),
+                opacity=0.85,
+                legendgroup="bp",
+                showlegend=show_leg,
+            ),
+            row=row_bp, col=1
+        )
         fig.add_trace(
             go.Scattergl(
                 x=t, y=X_raw[i], mode="lines",
-                name="Raw signal",
-                line=dict(color="#202020", width=1.0),
+                name=slow_name,
+                line=dict(color="#128a2e", width=1.0),
                 opacity=0.90,
                 legendgroup="raw",
                 showlegend=show_leg,
             ),
-            row=i + 1, col=1
-        )
-        fig.add_trace(
-            go.Scattergl(
-                x=t, y=X_bp_vis[i], mode="lines",
-                name="Ripple bandpass (scaled)",
-                line=dict(color="#b30000", width=1.0),
-                opacity=0.75,
-                legendgroup="bp",
-                showlegend=show_leg,
-            ),
-            row=i + 1, col=1
+            row=row_raw, col=1
         )
 
         spans = swr_intervals_by_channel[i] if i < len(swr_intervals_by_channel) else []
-        if len(spans) > int(max_spans_per_channel):
-            step_sp = int(np.ceil(len(spans) / max(1, int(max_spans_per_channel))))
+        if len(spans) > eff_max_spans_per_channel:
+            step_sp = int(np.ceil(len(spans) / max(1, eff_max_spans_per_channel)))
             spans = spans[::step_sp]
         first_swr = True
         for (t0, t1) in spans:
@@ -1561,7 +1582,13 @@ def export_interactive_swr_scan_html(
                 x0=t0, x1=t1,
                 fillcolor="rgba(220, 20, 60, 0.20)",
                 line_width=0,
-                row=i + 1, col=1,
+                row=row_bp, col=1,
+            )
+            fig.add_vrect(
+                x0=t0, x1=t1,
+                fillcolor="rgba(220, 20, 60, 0.20)",
+                line_width=0,
+                row=row_raw, col=1,
             )
             if first_swr and show_leg:
                 fig.add_trace(
@@ -1574,26 +1601,81 @@ def export_interactive_swr_scan_html(
                 )
                 first_swr = False
 
-        fig.update_yaxes(title_text=f"pri_{ch}", row=i + 1, col=1)
+        bp_ylim = _robust_ylim(X_bp[i])
+        raw_ylim = _robust_ylim(X_raw[i])
+        bp_axis = f"pri_{ch} {bp_band_label}" if bp_band_label else f"pri_{ch} BP"
+        fig.update_yaxes(title_text=bp_axis, row=row_bp, col=1, range=bp_ylim)
+        slow_axis = f"pri_{ch} {slow_band_label}" if slow_band_label else f"pri_{ch} Slow"
+        fig.update_yaxes(title_text=slow_axis, row=row_raw, col=1, range=raw_ylim)
+
+    def _pair_on_off(ts_on, ts_off):
+        if ts_on is None or ts_off is None:
+            return []
+        on = np.asarray(ts_on, float).ravel()
+        off = np.asarray(ts_off, float).ravel()
+        on = on[np.isfinite(on)]
+        off = off[np.isfinite(off)]
+        m = min(on.size, off.size)
+        if m <= 0:
+            return []
+        on = on[:m]
+        off = off[:m]
+        out = []
+        for a, b in zip(on, off):
+            a = float(a)
+            b = float(b)
+            if b <= a:
+                continue
+            if len(t) and (b < t[0] or a > t[-1]):
+                continue
+            out.append((a, b))
+        return out
 
     def _add_pulse_lines(ts, dash):
         if ts is None or len(ts) == 0:
             return
         tt = np.asarray(ts, float).ravel()
         tt = tt[np.isfinite(tt)]
-        if tt.size > int(max_pulses_per_channel):
-            tt = tt[::int(np.ceil(tt.size / max(1, int(max_pulses_per_channel))))]
-        for i in range(n_ch):
-            for p in tt:
-                if len(t) and (p < t[0] or p > t[-1]):
-                    continue
+        if tt.size > eff_max_pulses:
+            tt = tt[::int(np.ceil(tt.size / max(1, eff_max_pulses)))]
+        for p in tt:
+            if len(t) and (p < t[0] or p > t[-1]):
+                continue
+            for ri in range(1, n_rows + 1):
                 fig.add_vline(
                     x=float(p),
-                    line=dict(color="red", width=1.1, dash=dash),
-                    opacity=0.30,
-                    row=i + 1, col=1,
+                    line=dict(color="red", width=2.2, dash=dash),
+                    opacity=0.55,
+                    row=ri, col=1,
                 )
 
+    p1_intervals = _pair_on_off(pulse_times_1, pulse_times_1_off)
+    p2_intervals = _pair_on_off(pulse_times_2, pulse_times_2_off)
+    if len(p1_intervals) > eff_max_pulses:
+        step = int(np.ceil(len(p1_intervals) / max(1, eff_max_pulses)))
+        p1_intervals = p1_intervals[::step]
+    if len(p2_intervals) > eff_max_pulses:
+        step = int(np.ceil(len(p2_intervals) / max(1, eff_max_pulses)))
+        p2_intervals = p2_intervals[::step]
+
+    for a, b in p1_intervals:
+        for ri in range(1, n_rows + 1):
+            fig.add_vrect(
+                x0=float(a), x1=float(b),
+                fillcolor="rgba(255, 0, 0, 0.22)",
+                line_width=0,
+                row=ri, col=1,
+            )
+    for a, b in p2_intervals:
+        for ri in range(1, n_rows + 1):
+            fig.add_vrect(
+                x0=float(a), x1=float(b),
+                fillcolor="rgba(255, 0, 0, 0.14)",
+                line_width=0,
+                row=ri, col=1,
+            )
+
+    # Always draw ON lines for visibility, add ON->OFF duration as extra shading when available.
     _add_pulse_lines(pulse_times_1, "dot")
     _add_pulse_lines(pulse_times_2, "dash")
 
@@ -1601,13 +1683,13 @@ def export_interactive_swr_scan_html(
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="lines",
             line=dict(width=2, dash="dot", color="red"),
-            name="Pulse 1 ON",
+            name=("Pulse 1 ON->OFF" if p1_intervals else "Pulse 1 ON"),
         ))
     if pulse_times_2 is not None and len(pulse_times_2):
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="lines",
             line=dict(width=2, dash="dash", color="red"),
-            name="Pulse 2 ON",
+            name=("Pulse 2 ON->OFF" if p2_intervals else "Pulse 2 ON"),
         ))
 
     fig.update_layout(
@@ -1620,13 +1702,19 @@ def export_interactive_swr_scan_html(
     fig.update_xaxes(
         title_text="Zeit (s)",
         showline=True, linewidth=1.5, linecolor="black", mirror="allticks",
-        row=n_ch, col=1
+        row=n_rows, col=1
     )
-    fig.update_xaxes(rangeslider=dict(visible=True), row=n_ch, col=1)
+    fig.update_xaxes(rangeslider=dict(visible=(n_ch <= 5)), row=n_rows, col=1)
     fig.update_yaxes(showline=True, linewidth=1.2, linecolor="black", mirror="allticks")
 
-    out_html = os.path.join(save_dir, f"{base_tag}__SWR_CH00_17_SCAN.html")
-    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    out_html = os.path.join(save_dir, f"{base_tag}__{out_suffix}.html")
+    plotly_offline_plot(
+        fig,
+        filename=out_html,
+        auto_open=False,
+        include_plotlyjs="cdn",
+        validate=False,
+    )
     print(f"[HTML] SWR scan interactive: {out_html}")
     return out_html
 

@@ -1391,12 +1391,12 @@ print(f"[CHAN-FILTER] kept {NUM_CHANNELS_GOOD}/{NUM_CHANNELS} Kanäle:", ch_name
 log(f"Channel filter: kept={NUM_CHANNELS_GOOD}/{NUM_CHANNELS}, good_idx={good_idx}")
 
 # Kanal-Policy:
-# - LFP/UP/Spindle: pri_0 (per ENV MAIN_UP_CH überschreibbar)
+# - LFP/UP/Spindle: pri_38 (per ENV MAIN_UP_CH überschreibbar)
 # - SWR:            immer pri_33 (explizit aus globalem LFP_array, unabhängig von good_idx)
 # Bei wenigen Kanälen bleibt SWR standardmäßig deaktiviert (wie bisher), außer ENABLE_SWR wird passend gesetzt.
 dual_probe_min_ch = int(os.environ.get("DUAL_PROBE_MIN_CHANNELS", "24"))
 is_dual_probe_mode = int(NUM_CHANNELS) >= dual_probe_min_ch
-req_up_ch = int(os.environ.get("MAIN_UP_CH", "0"))
+req_up_ch = int(os.environ.get("MAIN_UP_CH", "38"))
 req_swr_ch = 33
 enable_swr_env = str(os.environ.get("ENABLE_SWR", "1")).strip().lower() not in ("0", "false", "no", "off")
 enable_swr = bool(is_dual_probe_mode) and bool(enable_swr_env)
@@ -1867,13 +1867,13 @@ Up["DOWN_start_i"] = np.asarray([p[1] for p in _all_pairs], int) if _all_pairs e
 
 # Zusätzlicher robuster Dauerfilter auf Raw-Sample-Ebene:
 # verwirft sehr kurze UPs nach der Klassifikation in allen Klassen konsistent.
-# Für den Standard-UP-Kanal pri_33 etwas sensitiver (kürzere Mindestdauer).
-if int(ch_idx_used) == 33:
-    _up_min_dur_post_default = "0.30"
-    _up_min_dur_floor_default = "0.25"
+# Für Standard-UP-Kanäle pri_33/pri_38 bewusst sensitiver (kürzere Mindestdauer).
+if int(ch_idx_used) in (33, 38):
+    _up_min_dur_post_default = "0.25"
+    _up_min_dur_floor_default = "0.18"
 else:
-    _up_min_dur_post_default = "0.80"
-    _up_min_dur_floor_default = "0.60"
+    _up_min_dur_post_default = "0.45"
+    _up_min_dur_floor_default = "0.30"
 up_min_dur_post_s = float(os.environ.get("UP_MIN_DUR_POST_S", os.environ.get("UP_MIN_LEN_S", _up_min_dur_post_default)))
 up_min_dur_floor_s = float(os.environ.get("UP_MIN_DUR_POST_FLOOR_S", _up_min_dur_floor_default))
 up_min_dur_post_s = max(up_min_dur_post_s, up_min_dur_floor_s)
@@ -2316,7 +2316,7 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     require_up_overlap=True,
     causal_filter=True,
 ):
-    return detect_spindle_intervals_in_upstates(
+    ripple_candidates = detect_spindle_intervals_in_upstates(
         signal_1d,
         time_s,
         dt,
@@ -2339,6 +2339,129 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
         use_psd_check=False,
         causal_filter=bool(causal_filter),
     )
+    if not ripple_candidates:
+        return []
+
+    # Optional SW gate to reduce false positives: require a time-locked low-frequency
+    # sharp-wave deflection around each ripple candidate.
+    sw_gate_on = str(os.environ.get("SWR_REQUIRE_SHARP_WAVE", "1")).strip().lower() not in ("0", "false", "no", "off")
+    if not sw_gate_on:
+        return ripple_candidates
+
+    x = np.asarray(signal_1d, float).reshape(-1)
+    t = np.asarray(time_s, float).reshape(-1)
+    if x.size < 10 or t.size != x.size or dt <= 0:
+        return []
+
+    sw_lo = float(os.environ.get("SWR_SW_F_LO_HZ", "2.0"))
+    sw_hi = float(os.environ.get("SWR_SW_F_HI_HZ", "40.0"))
+    sw_pad_s = float(os.environ.get("SWR_SW_PAD_S", "0.030"))
+    sw_amp_sigma = float(os.environ.get("SWR_SW_MIN_AMP_SIGMA", "1.0"))
+    sw_ptp_sigma = float(os.environ.get("SWR_SW_MIN_PTP_SIGMA", "2.0"))
+    sw_center_tol_s = float(os.environ.get("SWR_SW_CENTER_TOL_S", "0.040"))
+    sw_polarity = str(os.environ.get("SWR_SW_POLARITY", "auto")).strip().lower()  # auto|negative|positive|both
+    sw_require_overlap = str(os.environ.get("SWR_SW_REQUIRE_OVERLAP", "1")).strip().lower() not in ("0", "false", "no", "off")
+    sw_min_overlap_s = float(os.environ.get("SWR_SW_MIN_OVERLAP_S", "0.006"))
+    sw_overlap_pad_s = float(os.environ.get("SWR_SW_OVERLAP_PAD_S", "0.000"))
+    sw_require_center = str(os.environ.get("SWR_SW_REQUIRE_CENTER", "0")).strip().lower() not in ("0", "false", "no", "off")
+
+    sw_band = _bandpass_1d(x, dt, f_lo=sw_lo, f_hi=sw_hi, order=3, causal=bool(causal_filter))
+    sw_band = np.asarray(sw_band, float)
+    sw_med = float(np.nanmedian(sw_band))
+    sw_mad = float(np.nanmedian(np.abs(sw_band - sw_med)))
+    sw_sigma = max(1.4826 * sw_mad, 1e-12)
+    amp_thr = max(sw_amp_sigma * sw_sigma, 1e-12)
+    ptp_thr = max(sw_ptp_sigma * sw_sigma, 1e-12)
+    pad_n = max(1, int(round(sw_pad_s / dt)))
+    overlap_pad_n = max(0, int(round(sw_overlap_pad_s / dt)))
+    min_overlap_n = max(1, int(round(sw_min_overlap_s / dt)))
+
+    out = []
+    n_pass_amp_ptp = 0
+    n_pass_overlap = 0
+    n_pass_center = 0
+    for t0, t1 in ripple_candidates:
+        if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+            continue
+        s = int(np.searchsorted(t, float(t0), side="left"))
+        e = int(np.searchsorted(t, float(t1), side="right"))
+        if s < 0:
+            s = 0
+        if e > t.size:
+            e = t.size
+        if e <= s:
+            continue
+        c_idx = int(round(0.5 * (s + e - 1)))
+        a = max(0, s - pad_n)
+        b = min(t.size, e + pad_n)
+        seg = sw_band[a:b]
+        if seg.size < 3:
+            continue
+
+        i_min = int(np.argmin(seg))
+        i_max = int(np.argmax(seg))
+        v_min = float(seg[i_min])
+        v_max = float(seg[i_max])
+        neg_ok = abs(v_min) >= amp_thr
+        pos_ok = abs(v_max) >= amp_thr
+        ptp_ok = (v_max - v_min) >= ptp_thr
+
+        if sw_polarity == "negative":
+            pol_ok = neg_ok
+            sw_idx = a + i_min
+        elif sw_polarity == "positive":
+            pol_ok = pos_ok
+            sw_idx = a + i_max
+        elif sw_polarity == "both":
+            pol_ok = neg_ok and pos_ok
+            sw_idx = a + i_min if abs(v_min) >= abs(v_max) else a + i_max
+        else:
+            pol_ok = neg_ok or pos_ok
+            sw_idx = a + i_min if abs(v_min) >= abs(v_max) else a + i_max
+
+        if not pol_ok or not ptp_ok:
+            continue
+        n_pass_amp_ptp += 1
+
+        if sw_require_overlap:
+            s_ov = max(0, s - overlap_pad_n)
+            e_ov = min(t.size, e + overlap_pad_n)
+            if e_ov <= s_ov:
+                continue
+            ov_seg = sw_band[s_ov:e_ov]
+            if ov_seg.size == 0:
+                continue
+            if sw_polarity == "negative":
+                sw_mask = ov_seg <= -amp_thr
+            elif sw_polarity == "positive":
+                sw_mask = ov_seg >= amp_thr
+            elif sw_polarity == "both":
+                sw_mask = (ov_seg <= -amp_thr) | (ov_seg >= amp_thr)
+            else:
+                sw_mask = np.abs(ov_seg) >= amp_thr
+            if int(np.count_nonzero(sw_mask)) < int(min_overlap_n):
+                continue
+        n_pass_overlap += 1
+
+        if sw_require_center:
+            center_ok = abs(sw_idx - c_idx) * float(dt) <= sw_center_tol_s
+            if not center_ok:
+                continue
+        n_pass_center += 1
+        out.append((float(t0), float(t1)))
+
+    if DEBUG_MAIN_SAFE:
+        print(
+            "[SWR-SW-GATE] "
+            f"cand={len(ripple_candidates)} keep={len(out)} "
+            f"sw_band={sw_lo:.1f}-{sw_hi:.1f}Hz "
+            f"amp_sigma={sw_amp_sigma:.2f} ptp_sigma={sw_ptp_sigma:.2f} "
+            f"pol={sw_polarity} require_overlap={int(sw_require_overlap)} "
+            f"min_overlap_s={sw_min_overlap_s:.4f} overlap_pad_s={sw_overlap_pad_s:.4f} "
+            f"require_center={int(sw_require_center)} center_tol_s={sw_center_tol_s:.3f} "
+            f"pass_amp_ptp={n_pass_amp_ptp} pass_overlap={n_pass_overlap} pass_center={n_pass_center}"
+        )
+    return out
 
 
 def _bandpass_1d(signal_1d, dt, f_lo=10.0, f_hi=15.0, order=3, causal=True):
@@ -2621,10 +2744,18 @@ all_up_pairs += trig_up_pairs
 all_up_pairs += assoc_up_pairs
 require_up_overlap_main = bool(len(all_up_pairs))
 
-# --- SWR trust-check: channels 0..17 (fast default: HTML only) ---
+# --- SWR trust-check: default channels 33..49 (stacked HTML/PDF/QA) ---
 try:
-    n_scan_default = int(os.environ.get("SWR_SCAN_N_CH", "8"))
-    n_scan = min(max(1, n_scan_default), int(LFP_array.shape[0])) if (hasattr(LFP_array, "shape") and len(LFP_array.shape) >= 2) else 0
+    n_total_ch = int(LFP_array.shape[0]) if (hasattr(LFP_array, "shape") and len(LFP_array.shape) >= 2) else 0
+    scan_ch_start_req = int(os.environ.get("SWR_SCAN_CH_START", "33"))
+    scan_ch_end_req = int(os.environ.get("SWR_SCAN_CH_END", "49"))
+    lo_req = min(scan_ch_start_req, scan_ch_end_req)
+    hi_req = max(scan_ch_start_req, scan_ch_end_req)
+    lo = max(0, lo_req)
+    hi = min(max(0, n_total_ch - 1), hi_req)
+    scan_channels = list(range(lo, hi + 1)) if (n_total_ch > 0 and lo <= hi) else []
+    n_scan = len(scan_channels)
+
     # Default "off": der Scan ist nur QA/Diagnostik und kann bei langen Sessions sehr teuer werden.
     # Die eigentliche SWR-Analyse weiter unten bleibt davon unberührt.
     swr_scan_mode = str(os.environ.get("SWR_SCAN_MODE", "off")).strip().lower()  # html | pdf | qa | all | off
@@ -2633,12 +2764,22 @@ try:
     swr_make_pdf = swr_scan_mode in ("pdf", "all")
     swr_make_qa = swr_scan_mode in ("qa", "all")
 
+    scan_f_lo = float(os.environ.get("SWR_SCAN_F_LO_HZ", "100.0"))
+    scan_f_hi = float(os.environ.get("SWR_SCAN_F_HI_HZ", "200.0"))
+    scan_slow_f_lo = float(os.environ.get("SWR_SCAN_SLOW_F_LO_HZ", "1.0"))
+    scan_slow_f_hi = float(os.environ.get("SWR_SCAN_SLOW_F_HI_HZ", "30.0"))
+
     if n_scan > 0 and swr_enable:
-        print(f"[SWR-SCAN] mode={swr_scan_mode} n_ch={n_scan} (set SWR_SCAN_N_CH / SWR_SCAN_MODE to adjust)")
+        print(
+            f"[SWR-SCAN] mode={swr_scan_mode} ch={scan_channels[0]}..{scan_channels[-1]} "
+            f"n_ch={n_scan} fast={scan_f_lo:.1f}-{scan_f_hi:.1f}Hz "
+            f"slow={scan_slow_f_lo:.1f}-{scan_slow_f_hi:.1f}Hz "
+            "(set SWR_SCAN_MODE / SWR_SCAN_CH_START / SWR_SCAN_CH_END)"
+        )
         swr_event_rows = []
         swr_counts = np.zeros(n_scan, dtype=int)
         swr_durations_ms = []
-        swr_scan_raw = []
+        swr_scan_slow = []
         swr_scan_bp = []
         swr_scan_intervals = []
 
@@ -2649,9 +2790,9 @@ try:
             pulse_on_all.append(np.asarray(pulse_times_2, float))
         pulse_on_all = np.unique(np.concatenate(pulse_on_all)) if pulse_on_all else np.array([], dtype=float)
 
-        for ch_idx in range(n_scan):
-            if (ch_idx == 0) or ((ch_idx + 1) % 2 == 0) or ((ch_idx + 1) == n_scan):
-                print(f"[SWR-SCAN] channel {ch_idx+1}/{n_scan}")
+        for i_scan, ch_idx in enumerate(scan_channels):
+            if (i_scan == 0) or ((i_scan + 1) % 2 == 0) or ((i_scan + 1) == n_scan):
+                print(f"[SWR-SCAN] channel pri_{ch_idx} ({i_scan+1}/{n_scan})")
             sig_raw = np.asarray(LFP_array[ch_idx], dtype=float)
             sig_plot = sig_raw
             if HTML_IN_uV:
@@ -2666,8 +2807,8 @@ try:
 
             swr_int = detect_sharp_wave_ripple_intervals_in_upstates(
                 sig_raw, time_s, dt, all_up_pairs,
-                f_lo=float(os.environ.get("SWR_F_LO_HZ", "120.0")),
-                f_hi=float(os.environ.get("SWR_F_HI_HZ", "250.0")),
+                f_lo=scan_f_lo,
+                f_hi=scan_f_hi,
                 thr_k_on=float(os.environ.get("SWR_SCAN_THR_ON", "0.90")),
                 thr_k_off=float(os.environ.get("SWR_SCAN_THR_OFF", "0.30")),
                 min_dur_s=float(os.environ.get("SWR_SCAN_MIN_DUR_S", "0.015")),
@@ -2685,13 +2826,21 @@ try:
             sig_bp_plot = _bandpass_1d(
                 sig_plot,
                 dt,
-                f_lo=float(os.environ.get("SWR_F_LO_HZ", "120.0")),
-                f_hi=float(os.environ.get("SWR_F_HI_HZ", "250.0")),
+                f_lo=scan_f_lo,
+                f_hi=scan_f_hi,
                 order=3,
                 causal=(not SPINDLE_ZERO_PHASE),
             )
-            swr_counts[ch_idx] = int(len(swr_int))
-            swr_scan_raw.append(np.asarray(sig_plot, float))
+            sig_slow_plot = _bandpass_1d(
+                sig_plot,
+                dt,
+                f_lo=scan_slow_f_lo,
+                f_hi=scan_slow_f_hi,
+                order=3,
+                causal=(not SPINDLE_ZERO_PHASE),
+            )
+            swr_counts[i_scan] = int(len(swr_int))
+            swr_scan_slow.append(np.asarray(sig_slow_plot, float))
             swr_scan_bp.append(np.asarray(sig_bp_plot, float))
             swr_scan_intervals.append(list(swr_int))
 
@@ -2715,23 +2864,36 @@ try:
                         "nearest_pulse_on_abs_dt_ms": float(dt_near_ms),
                     })
 
+        scan_suffix = f"SWR_CH{scan_channels[0]:02d}_{scan_channels[-1]:02d}"
         if swr_make_html:
             print("[SWR-SCAN] exporting HTML …")
             swr_html_max_points = int(os.environ.get("SWR_SCAN_HTML_MAX_POINTS", "12000"))
+            swr_html_max_spans = int(os.environ.get("SWR_SCAN_HTML_MAX_SPANS_PER_CH", "260"))
+            swr_html_max_pulses = int(os.environ.get("SWR_SCAN_HTML_MAX_PULSES", "300"))
             export_interactive_swr_scan_html(
                 BASE_TAG,
                 SAVE_DIR,
                 time_s,
-                np.vstack(swr_scan_raw) if swr_scan_raw else np.zeros((0, len(time_s))),
+                np.vstack(swr_scan_slow) if swr_scan_slow else np.zeros((0, len(time_s))),
                 np.vstack(swr_scan_bp) if swr_scan_bp else np.zeros((0, len(time_s))),
                 swr_scan_intervals,
-                channel_indices=list(range(n_scan)),
+                channel_indices=scan_channels,
                 pulse_times_1=pulse_times_1,
                 pulse_times_2=pulse_times_2,
+                pulse_times_1_off=pulse_times_1_off,
+                pulse_times_2_off=pulse_times_2_off,
                 max_points=swr_html_max_points,
-                title="SWR scan (channels 0-17): raw + ripple bandpass + pulses",
+                max_spans_per_channel=swr_html_max_spans,
+                max_pulses_per_channel=swr_html_max_pulses,
+                title=(
+                    f"SWR scan (channels {scan_channels[0]}-{scan_channels[-1]}): "
+                    f"fast {scan_f_lo:.0f}-{scan_f_hi:.0f} Hz + "
+                    f"slow {scan_slow_f_lo:.0f}-{scan_slow_f_hi:.0f} Hz + pulses"
+                ),
+                out_suffix=f"{scan_suffix}_SCAN",
+                bp_band_label=f"{scan_f_lo:.0f}-{scan_f_hi:.0f}Hz",
+                slow_band_label=f"{scan_slow_f_lo:.0f}-{scan_slow_f_hi:.0f}Hz",
             )
-
             print("[SWR-SCAN] HTML done")
 
         if swr_make_pdf:
@@ -2740,11 +2902,11 @@ try:
             fig, axs = plt.subplots(n_scan, 1, sharex=True, figsize=(13.0, fig_h), constrained_layout=True)
             if n_scan == 1:
                 axs = [axs]
-            for ch_idx in range(n_scan):
-                ax = axs[ch_idx]
-                ax.plot(time_s, swr_scan_raw[ch_idx], lw=0.55, color="black")
+            for i_scan, ch_idx in enumerate(scan_channels):
+                ax = axs[i_scan]
+                ax.plot(time_s, swr_scan_slow[i_scan], lw=0.55, color="black")
                 first = True
-                for t0, t1 in swr_scan_intervals[ch_idx]:
+                for t0, t1 in swr_scan_intervals[i_scan]:
                     if np.isfinite(t0) and np.isfinite(t1) and t1 > t0:
                         ax.axvspan(float(t0), float(t1), color="#dc143c", alpha=0.22, lw=0,
                                    label=("SWR" if first else None))
@@ -2754,11 +2916,15 @@ try:
                 if pulse_times_2 is not None and len(pulse_times_2):
                     ax.vlines(np.asarray(pulse_times_2, float), *ax.get_ylim(), lw=0.6, color="red", alpha=0.28, linestyles="--")
                 ax.set_ylabel(f"pri_{ch_idx}", fontsize=8)
-                ax.set_title(f"Channel pri_{ch_idx} — SWR n={len(swr_scan_intervals[ch_idx])}", fontsize=9, loc="left")
+                ax.set_title(f"Channel pri_{ch_idx} — SWR n={len(swr_scan_intervals[i_scan])}", fontsize=9, loc="left")
                 ax.tick_params(axis="y", labelsize=7)
             axs[-1].set_xlabel("Zeit (s)")
-            fig.suptitle("Sharp-wave ripple scan (channels 0–17) with pulses", fontsize=12, y=1.002)
-            out_pdf = os.path.join(SAVE_DIR, f"{BASE_TAG}__SWR_CH00_17_OVERVIEW.pdf")
+            fig.suptitle(
+                f"Sharp-wave ripple scan (channels {scan_channels[0]}–{scan_channels[-1]}) with pulses",
+                fontsize=12,
+                y=1.002,
+            )
+            out_pdf = os.path.join(SAVE_DIR, f"{BASE_TAG}__{scan_suffix}_OVERVIEW.pdf")
             with PdfPages(out_pdf) as pdf:
                 pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
@@ -2766,7 +2932,7 @@ try:
 
         if swr_make_qa:
             print("[SWR-SCAN] writing QA CSV …")
-            qa_csv = os.path.join(SAVE_DIR, f"{BASE_TAG}__SWR_CH00_17_QA_events.csv")
+            qa_csv = os.path.join(SAVE_DIR, f"{BASE_TAG}__{scan_suffix}_QA_events.csv")
             pd.DataFrame(swr_event_rows).to_csv(qa_csv, index=False)
             print(f"[QA] SWR QA CSV saved: {qa_csv}")
 
@@ -2859,6 +3025,16 @@ if enable_swr:
         f"min_cycles={os.environ.get('SWR_MIN_CYCLES', '3')} "
         f"min_env_sigma={os.environ.get('SWR_MIN_ENV_SIGMA', '0.80')} "
         f"off_below_s={os.environ.get('SWR_OFF_BELOW_S', '0.008')} "
+        f"require_sharp_wave={os.environ.get('SWR_REQUIRE_SHARP_WAVE', '1')} "
+        f"sw_band={os.environ.get('SWR_SW_F_LO_HZ', '2.0')}-{os.environ.get('SWR_SW_F_HI_HZ', '40.0')}Hz "
+        f"sw_amp_sigma={os.environ.get('SWR_SW_MIN_AMP_SIGMA', '1.0')} "
+        f"sw_ptp_sigma={os.environ.get('SWR_SW_MIN_PTP_SIGMA', '2.0')} "
+        f"sw_require_overlap={os.environ.get('SWR_SW_REQUIRE_OVERLAP', '1')} "
+        f"sw_min_overlap_s={os.environ.get('SWR_SW_MIN_OVERLAP_S', '0.006')} "
+        f"sw_overlap_pad_s={os.environ.get('SWR_SW_OVERLAP_PAD_S', '0.000')} "
+        f"sw_require_center={os.environ.get('SWR_SW_REQUIRE_CENTER', '0')} "
+        f"sw_center_tol_s={os.environ.get('SWR_SW_CENTER_TOL_S', '0.040')} "
+        f"sw_polarity={os.environ.get('SWR_SW_POLARITY', 'auto')} "
         f"only_in_upstates=0 "
         f"require_up_overlap={int(require_up_overlap_main)} "
         f"filter_mode={'zero_phase' if SPINDLE_ZERO_PHASE else 'causal'}"
@@ -3242,63 +3418,68 @@ else:
     pulse_times_2_off_html_export = pulse_times_2_off_html_plot
     ttl2_intervals_export = ttl2_intervals
 
-# Einheitliche y-Achse eine Ebene höher (Parent-Ordner) für alle HTML-Exports.
-# Datei liegt im Parent von BASE_PATH, damit mehrere Experimente dieselbe Skala teilen.
+# Y-Skalierung für HTML:
+# Standard: pro Plot/Channel autoskalieren (robuster bei einzelnen Noisy-Kanälen).
+# Optional kann per HTML_SHARED_Y_RANGE=1 eine gemeinsame Parent-Skalierung erzwungen werden.
 html_sig_src = main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel
 html_y_range = None
-try:
-    _yy = np.asarray(html_sig_src, float)
-    _yy = _yy[np.isfinite(_yy)]
-    if _yy.size:
-        _ymin = float(np.min(_yy))
-        _ymax = float(np.max(_yy))
-        if _ymax <= _ymin:
-            _delta = max(abs(_ymin), 1.0) * 0.05
-            _ymin -= _delta
-            _ymax += _delta
-        else:
-            _pad = 0.05 * (_ymax - _ymin)
-            _ymin -= _pad
-            _ymax += _pad
-        html_y_range = [_ymin, _ymax]
+use_shared_html_y = str(os.environ.get("HTML_SHARED_Y_RANGE", "0")).strip().lower() in ("1", "true", "yes", "on")
+if use_shared_html_y:
+    try:
+        _yy = np.asarray(html_sig_src, float)
+        _yy = _yy[np.isfinite(_yy)]
+        if _yy.size:
+            _ymin = float(np.min(_yy))
+            _ymax = float(np.max(_yy))
+            if _ymax <= _ymin:
+                _delta = max(abs(_ymin), 1.0) * 0.05
+                _ymin -= _delta
+                _ymax += _delta
+            else:
+                _pad = 0.05 * (_ymax - _ymin)
+                _ymin -= _pad
+                _ymax += _pad
+            html_y_range = [_ymin, _ymax]
 
-        _parent_dir = os.path.dirname(os.path.normpath(BASE_PATH))
-        _range_path = os.path.join(_parent_dir, "_html_y_range_parent.json")
-        _parent_min, _parent_max = _ymin, _ymax
+            _parent_dir = os.path.dirname(os.path.normpath(BASE_PATH))
+            _range_path = os.path.join(_parent_dir, "_html_y_range_parent.json")
+            _parent_min, _parent_max = _ymin, _ymax
 
-        if os.path.isfile(_range_path):
+            if os.path.isfile(_range_path):
+                try:
+                    with open(_range_path, "r", encoding="utf-8") as f:
+                        _saved = json.load(f)
+                    _smin = float(_saved.get("ymin"))
+                    _smax = float(_saved.get("ymax"))
+                    if np.isfinite(_smin) and np.isfinite(_smax) and _smax > _smin:
+                        _parent_min = min(_parent_min, _smin)
+                        _parent_max = max(_parent_max, _smax)
+                except Exception as _e_load:
+                    print(f"[HTML] parent y-range load skipped: {_e_load}")
+
+            html_y_range = [float(_parent_min), float(_parent_max)]
             try:
-                with open(_range_path, "r", encoding="utf-8") as f:
-                    _saved = json.load(f)
-                _smin = float(_saved.get("ymin"))
-                _smax = float(_saved.get("ymax"))
-                if np.isfinite(_smin) and np.isfinite(_smax) and _smax > _smin:
-                    _parent_min = min(_parent_min, _smin)
-                    _parent_max = max(_parent_max, _smax)
-            except Exception as _e_load:
-                print(f"[HTML] parent y-range load skipped: {_e_load}")
+                with open(_range_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "ymin": float(_parent_min),
+                            "ymax": float(_parent_max),
+                            "updated_from": os.path.basename(os.path.normpath(BASE_PATH)),
+                        },
+                        f,
+                        indent=2,
+                    )
+            except Exception as _e_save:
+                print(f"[HTML] parent y-range save skipped: {_e_save}")
 
-        html_y_range = [float(_parent_min), float(_parent_max)]
-        try:
-            with open(_range_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "ymin": float(_parent_min),
-                        "ymax": float(_parent_max),
-                        "updated_from": os.path.basename(os.path.normpath(BASE_PATH)),
-                    },
-                    f,
-                    indent=2,
-                )
-        except Exception as _e_save:
-            print(f"[HTML] parent y-range save skipped: {_e_save}")
-
-        print(
-            f"[HTML] fixed y-range (parent): "
-            f"[{html_y_range[0]:.3f}, {html_y_range[1]:.3f}]"
-        )
-except Exception as e:
-    print(f"[WARN] fixed HTML y-range failed: {e}")
+            print(
+                f"[HTML] fixed y-range (parent): "
+                f"[{html_y_range[0]:.3f}, {html_y_range[1]:.3f}]"
+            )
+    except Exception as e:
+        print(f"[WARN] fixed HTML y-range failed: {e}")
+else:
+    print("[HTML] per-channel autoscale enabled (HTML_SHARED_Y_RANGE=0)")
 
 
 
