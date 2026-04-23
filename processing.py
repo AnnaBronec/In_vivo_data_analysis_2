@@ -1216,6 +1216,81 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             plt.close(fig)
         print(f"[SUMMARY][GROUP][PDF] {out_pdf}")
 
+    def _up_rate_overview_ax(ax, rate_per_min, rate_hz, title):
+        vals = np.array([rate_per_min, rate_hz], dtype=float)
+        labels = ["total [/min]", "total [Hz]"]
+        x = np.arange(2, dtype=float)
+        if not np.isfinite(vals).any():
+            ax.text(0.5, 0.5, "no valid UP-rate values", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return
+        ax.bar(x, vals, color=["#4C78A8", "#59A14F"])
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=0)
+        ax.set_ylabel("value")
+        ax.set_title(title)
+        for xi, v in zip(x, vals):
+            if np.isfinite(v):
+                ax.text(float(xi), float(v), f"{float(v):.3g}", ha="center", va="bottom", fontsize=8)
+        ax.grid(axis="y", alpha=0.25, ls=":")
+
+    def _write_parent_up_rate_overview_pdf(parent_dir, summary_files):
+        def _nat_session_key(path_str):
+            sess = os.path.basename(os.path.dirname(path_str))
+            m = re.match(r"^\s*(\d+)", str(sess))
+            if m:
+                return (0, int(m.group(1)), str(sess).lower())
+            return (1, str(sess).lower())
+
+        rows = []
+        for sp in sorted(summary_files, key=_nat_session_key):
+            sess_dir = os.path.dirname(sp)
+            sess_name = os.path.basename(sess_dir)
+            df_one = _read_any(sp)
+            if df_one is None or df_one.empty:
+                rows.append({
+                    "session_dir": sess_dir,
+                    "session_name": sess_name,
+                    "rate_per_min": np.nan,
+                    "rate_hz": np.nan,
+                })
+                continue
+            r = df_one.iloc[-1].to_dict()
+            rate_hz = pd.to_numeric(pd.Series([r.get("UP rate total [Hz]", np.nan)]), errors="coerce").iloc[0]
+            rate_pm = pd.to_numeric(pd.Series([r.get("UP rate total [/min]", np.nan)]), errors="coerce").iloc[0]
+            rows.append({
+                "session_dir": sess_dir,
+                "session_name": sess_name,
+                "rate_per_min": float(rate_pm) if np.isfinite(rate_pm) else np.nan,
+                "rate_hz": float(rate_hz) if np.isfinite(rate_hz) else np.nan,
+            })
+
+        if not rows:
+            print("[SUMMARY][UP-RATE][PDF] skipped: no summary files")
+            return
+
+        out_pdf = os.path.join(parent_dir, "upstate_summary_ALL_parent__up_rate_panels.pdf")
+        n = len(rows)
+        ncols = 2
+        nrows_page = 3
+        per_page = ncols * nrows_page
+
+        with PdfPages(out_pdf) as pdf:
+            for start in range(0, n, per_page):
+                chunk = rows[start:start + per_page]
+                fig, axs = plt.subplots(nrows_page, ncols, figsize=(11, 12))
+                axs = np.asarray(axs).reshape(-1)
+                for ax, row in zip(axs, chunk):
+                    title = f"{row['session_name']} — UP rate (total): [/min] vs [Hz]"
+                    _up_rate_overview_ax(ax, row["rate_per_min"], row["rate_hz"], title)
+                for ax in axs[len(chunk):]:
+                    ax.axis("off")
+                fig.suptitle("UP-rate overview per subfolder", y=0.995)
+                fig.tight_layout(rect=[0, 0, 1, 0.98])
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+        print(f"[SUMMARY][UP-RATE][PDF] {out_pdf}")
+
     exp_dir       = os.path.dirname(summary_path)
     parent_dir    = os.path.dirname(exp_dir)        
     for_david_dir = os.path.dirname(parent_dir)     
@@ -1231,6 +1306,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         print(f"[SUMMARY][ROLLUP Parent] {out_parent}  (Quellen: {len(files_parent)})")
         _write_group_compare(r, parent_dir, "upstate_summary_ALL_parent")
         _write_parent_group_compare_pdf(parent_dir, files_parent)
+        _write_parent_up_rate_overview_pdf(parent_dir, files_parent)
     else:
         print("[SUMMARY][ROLLUP Parent] keine Quellen gefunden")
 
