@@ -1291,6 +1291,64 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 plt.close(fig)
         print(f"[SUMMARY][UP-RATE][PDF] {out_pdf}")
 
+    def _write_parent_up_amplitude_overview_pdf(parent_dir, summary_files):
+        def _nat_session_key(path_str):
+            sess = os.path.basename(os.path.dirname(path_str))
+            m = re.match(r"^\s*(\d+)", str(sess))
+            if m:
+                return (0, int(m.group(1)), str(sess).lower())
+            return (1, str(sess).lower())
+
+        rows = []
+        for sp in sorted(summary_files, key=_nat_session_key):
+            sess_dir = os.path.dirname(sp)
+            sess_name = os.path.basename(sess_dir)
+            amp_files = sorted(glob.glob(os.path.join(sess_dir, "*__upstate_amplitudes.csv")))
+            spont = np.array([], dtype=float)
+            trig = np.array([], dtype=float)
+            if amp_files:
+                try:
+                    dfm = pd.read_csv(amp_files[-1])
+                    st = dfm.get("group", pd.Series([], dtype=str)).astype(str).str.lower().str.strip()
+                    st = st.replace({"spont": "spontaneous", "trig": "triggered", "trigger": "triggered"})
+                    amp = pd.to_numeric(dfm.get("amplitude", pd.Series([], dtype=float)), errors="coerce").to_numpy(float)
+                    spont = amp[(st.to_numpy() == "spontaneous") & np.isfinite(amp)]
+                    trig = amp[(st.to_numpy() == "triggered") & np.isfinite(amp)]
+                except Exception:
+                    spont = np.array([], dtype=float)
+                    trig = np.array([], dtype=float)
+            rows.append({
+                "session_name": sess_name,
+                "spont_amp": np.asarray(spont, dtype=float),
+                "trig_amp": np.asarray(trig, dtype=float),
+            })
+
+        if not rows:
+            print("[SUMMARY][UP-AMP][PDF] skipped: no summary files")
+            return
+
+        out_pdf = os.path.join(parent_dir, "upstate_summary_ALL_parent__up_amplitude_panels.pdf")
+        n = len(rows)
+        ncols = 2
+        nrows_page = 3
+        per_page = ncols * nrows_page
+
+        with PdfPages(out_pdf) as pdf:
+            for start in range(0, n, per_page):
+                chunk = rows[start:start + per_page]
+                fig, axs = plt.subplots(nrows_page, ncols, figsize=(11, 12))
+                axs = np.asarray(axs).reshape(-1)
+                for ax, row in zip(axs, chunk):
+                    title = f"{row['session_name']} — UP Amplitude (max-min, mean): Spontan vs. Getriggert"
+                    upstate_amplitude_compare_ax(row["spont_amp"], row["trig_amp"], ax=ax, title=title)
+                for ax in axs[len(chunk):]:
+                    ax.axis("off")
+                fig.suptitle("UP-amplitude overview per subfolder", y=0.995)
+                fig.tight_layout(rect=[0, 0, 1, 0.98])
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+        print(f"[SUMMARY][UP-AMP][PDF] {out_pdf}")
+
     exp_dir       = os.path.dirname(summary_path)
     parent_dir    = os.path.dirname(exp_dir)        
     for_david_dir = os.path.dirname(parent_dir)     
@@ -1307,6 +1365,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         _write_group_compare(r, parent_dir, "upstate_summary_ALL_parent")
         _write_parent_group_compare_pdf(parent_dir, files_parent)
         _write_parent_up_rate_overview_pdf(parent_dir, files_parent)
+        _write_parent_up_amplitude_overview_pdf(parent_dir, files_parent)
     else:
         print("[SUMMARY][ROLLUP Parent] keine Quellen gefunden")
 
