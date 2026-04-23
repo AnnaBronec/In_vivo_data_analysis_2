@@ -300,7 +300,7 @@ def read_nev_timestamps_and_ttl(nev_path: str):
         )
 
     nrec = len(data) // rec_size
-    ts = np.empty(nrec, dtype=np.uint64)
+    ts = np.empty(nrec, dtype=np.int64)
     ttl = np.empty(nrec, dtype=np.int32)
     estr = []
 
@@ -325,7 +325,7 @@ def read_nev_timestamps_and_ttl(nev_path: str):
         # Event string is often last 128 bytes
         s = rec[-128:].split(b"\x00", 1)[0].decode("latin-1", errors="ignore")
 
-        ts[i] = ts_us
+        ts[i] = int(ts_us)
         estr.append(s)
 
         # store temporary (we'll fix TTL below)
@@ -361,7 +361,7 @@ def read_nev_timestamps_and_ttl(nev_path: str):
     if np.nanmedian(np.diff(ts.astype(np.float64))) <= 0:
         raise ValueError("NEV timestamps do not look monotonic. Parser offsets likely wrong.")
 
-    return ts, ttl, estr
+    return np.asarray(ts, dtype=np.int64), np.asarray(ttl, dtype=np.int64), estr
 
 
 def ttl_to_on_off(ts_us: np.ndarray, ttl: np.ndarray, bit: int = 0):
@@ -369,7 +369,8 @@ def ttl_to_on_off(ts_us: np.ndarray, ttl: np.ndarray, bit: int = 0):
     Convert TTL words to rising/falling edges for a given bit index.
     Returns onset_us, offset_us.
     """
-    ts_us = np.asarray(ts_us, dtype=np.uint64)
+    # int64 statt uint64 vermeidet Underflow/Overflow-Artefakte bei Offsets/Pairing.
+    ts_us = np.asarray(ts_us, dtype=np.int64)
     ttl = np.asarray(ttl, dtype=np.int64)
 
     # bit mask
@@ -380,12 +381,12 @@ def ttl_to_on_off(ts_us: np.ndarray, ttl: np.ndarray, bit: int = 0):
     on_idx = np.where(d == 1)[0] + 1
     off_idx = np.where(d == -1)[0] + 1
 
-    onset = ts_us[on_idx]
-    offset = ts_us[off_idx]
+    onset = np.asarray(ts_us[on_idx], dtype=np.int64)
+    offset = np.asarray(ts_us[off_idx], dtype=np.int64)
 
     # pair them safely
     if onset.size and offset.size:
-        if offset[0] < onset[0]:
+        if int(offset[0]) < int(onset[0]):
             offset = offset[1:]
         n = min(onset.size, offset.size)
         onset = onset[:n]

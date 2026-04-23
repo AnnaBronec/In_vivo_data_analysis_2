@@ -215,19 +215,21 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
 
 
-    print("Spect_dat lens/types:",
-        type(Spect_dat), len(Spect_dat),
-        type(Spect_dat[0]), type(Spect_dat[1]), type(Spect_dat[2]))
+    print(
+        "Spect_dat:",
+        f"type={type(Spect_dat).__name__}",
+        f"len={len(Spect_dat)}",
+        f"S_shape={np.shape(Spect_dat[0])}",
+        f"t_shape={np.shape(Spect_dat[1])}",
+        f"f_shape={np.shape(Spect_dat[2])}",
+    )
 
-    print("S shape:", np.shape(Spect_dat[0]))
-    print("t entry:", Spect_dat[1])
-    print("t shape:", np.shape(Spect_dat[1]))
-    print("f shape:", np.shape(Spect_dat[2]))
-
-    # falls t ein Array ist:
-    if np.ndim(Spect_dat[1]) == 1 and len(Spect_dat[1]) > 3:
-        print("t[0:5]=", Spect_dat[1][:5], "t[-1]=", Spect_dat[1][-1],
-            "dt~", np.median(np.diff(Spect_dat[1])))
+    if np.ndim(Spect_dat[1]) == 1 and len(Spect_dat[1]) > 1:
+        t_arr = np.asarray(Spect_dat[1], float)
+        print(
+            f"[SPEC-T] {float(t_arr[0]):.3f}->{float(t_arr[-1]):.3f}s "
+            f"(n={len(t_arr)}, dt~{float(np.median(np.diff(t_arr))):.6f}s)"
+        )
 
 
 
@@ -256,7 +258,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     # 2) Smooth 
     # 2) Smooth in *Sekunden* (weil t_feat ~ dt ist)
     # Ziel: 100 ms Glättung (passt oft gut für UP/DOWN)
-    smooth_s = 0.05
+    smooth_s = float(os.environ.get("UP_SMOOTH_S", "0.12"))
     sigma_bins = max(1, int(round(smooth_s / dt_feat)))  # dt_feat später gesetzt? -> siehe unten
     # Falls dt_feat hier noch nicht existiert, nimm median diff von t_feat:
     # dt_feat_tmp = float(np.median(np.diff(t_feat))) if (t_feat.size > 1) else float(dt)
@@ -272,6 +274,15 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     # z = (Total_power_smooth - med) / robust_std
     x = Total_power_smooth
 
+    # Robust gegen einzelne extreme Bins/Artefakte:
+    # Winsorize vor z-Normierung, damit die Auto-Schwelle nicht von Ausreißern getrieben wird.
+    x_lo_q = float(os.environ.get("UP_X_LO_Q", "0.01"))
+    x_hi_q = float(os.environ.get("UP_X_HI_Q", "0.99"))
+    x_lo = float(np.nanquantile(x, x_lo_q))
+    x_hi = float(np.nanquantile(x, x_hi_q))
+    if np.isfinite(x_lo) and np.isfinite(x_hi) and (x_hi > x_lo):
+        x = np.clip(x, x_lo, x_hi)
+
     # baseline = "untere" Zustände (ruhig / DOWN-lastig)
     q = np.quantile(x, 0.15)
     base = x[x <= q]
@@ -280,9 +291,16 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
     mu = np.median(base)
     mad = np.median(np.abs(base - mu)) + 1e-30
-    robust_std = 1.4826 * mad
+    robust_std_mad = 1.4826 * mad
+    iqr = float(np.nanpercentile(x, 75) - np.nanpercentile(x, 25))
+    robust_std_iqr = iqr / 1.349 if np.isfinite(iqr) and iqr > 0 else 0.0
+    robust_std_floor = float(os.environ.get("UP_Z_STD_FLOOR", "1e-3"))
+    robust_std = max(float(robust_std_mad), float(robust_std_iqr), robust_std_floor)
 
     z = (x - mu) / robust_std
+    z_abs_cap = float(os.environ.get("UP_Z_ABS_CAP", "25.0"))
+    if np.isfinite(z_abs_cap) and z_abs_cap > 0:
+        z = np.clip(z, -z_abs_cap, z_abs_cap)
 
 
     # k_hi = 3.0   # Start-Schwelle (strenger)
@@ -337,12 +355,12 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         return out
 
     # Zielbereich für UP-Anteil (Feature-Zeitachse)
-    target_min = float(os.environ.get("UP_TARGET_MIN_FRAC", "0.015"))
-    target_max = float(os.environ.get("UP_TARGET_MAX_FRAC", "0.45"))
+    target_min = float(os.environ.get("UP_TARGET_MIN_FRAC", "0.05"))
+    target_max = float(os.environ.get("UP_TARGET_MAX_FRAC", "0.55"))
 
     # Startwerte
-    k_hi = 4.5
-    k_lo = 4.0
+    k_hi = float(os.environ.get("UP_K_HI_START", "3.5"))
+    k_lo = float(os.environ.get("UP_K_LO_START", "3.0"))
 
     # Wir passen k an (hoch -> weniger UP, runter -> mehr UP)
     for _ in range(20):
@@ -382,7 +400,8 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     # else:
     #     dt_feat = float(dt)  # fallback
 
-    min_gap_s = 0.02
+    # Kleineres Gap-Closing verhindert, dass Rausch-Inseln zu langen UPs verschmelzen.
+    min_gap_s = float(os.environ.get("UP_MIN_GAP_S", "0.05"))
     min_gap = max(1, int(round(min_gap_s / dt_feat)))
 
     binary = up_state_binary.astype(np.int8)
@@ -417,10 +436,35 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     up_transitions = up_transitions[:m_ud]
     down_transitions = down_transitions[:m_ud]
 
+    # Events mit sehr kurzem Zwischen-Gap als ein UP zusammenfassen.
+    merge_gap_s = float(os.environ.get("UP_MERGE_GAP_S", "0.80"))
+    merged_count = 0
+    if up_transitions.size > 1 and merge_gap_s > 0:
+        merged_up = [int(up_transitions[0])]
+        merged_dn = [int(down_transitions[0])]
+        merge_gap_bins = max(1, int(round(merge_gap_s / dt_feat)))
+        for u, d in zip(up_transitions[1:], down_transitions[1:]):
+            u_i = int(u)
+            d_i = int(d)
+            prev_d = int(merged_dn[-1])
+            if (u_i - prev_d) <= merge_gap_bins:
+                merged_dn[-1] = max(prev_d, d_i)
+                merged_count += 1
+            else:
+                merged_up.append(u_i)
+                merged_dn.append(d_i)
+        up_transitions = np.asarray(merged_up, dtype=int)
+        down_transitions = np.asarray(merged_dn, dtype=int)
+
     # Channel-aware default: pri_33/pri_38 often benefit from shorter minimum UP lengths.
     req_up_ch_env = str(os.environ.get("MAIN_UP_CH", "38")).strip()
-    min_up_len_default = "0.25" if req_up_ch_env in ("33", "38") else "0.45"
+    min_up_len_default = "0.10" if req_up_ch_env in ("33", "38") else "0.12"
     min_up_len_s = float(os.environ.get("UP_MIN_LEN_S", min_up_len_default))
+    min_up_peak_z = float(os.environ.get("UP_MIN_PEAK_Z", "3.2"))
+    min_up_mean_z = float(os.environ.get("UP_MIN_MEAN_Z", "2.2"))
+    min_up_p90_z = float(os.environ.get("UP_MIN_P90_Z", "2.8"))
+    min_up_strong_frac = float(os.environ.get("UP_MIN_STRONG_FRAC", "0.08"))
+    require_z_shape_filter = os.environ.get("UP_REQUIRE_Z_SHAPE_FILTER", "0") == "1"
     if not up_transitions.size or not down_transitions.size:
         UP_start_i = np.array([], dtype=int)
         DOWN_start_i = np.array([], dtype=int)
@@ -428,21 +472,97 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         filtered_UP = []
         filtered_DOWN = []
         rejected_short = 0
+        rejected_lowpeak = 0
+        rejected_lowmean = 0
+        rejected_lowp90 = 0
+        rejected_lowsustain = 0
         for u, d in zip(up_transitions, down_transitions):
             duration = float(d - u) * float(dt_feat)
             if duration < min_up_len_s:
                 rejected_short += 1
                 continue
+            if require_z_shape_filter:
+                seg = z[u:d]
+                if seg.size == 0 or not np.isfinite(np.nanmax(seg)) or float(np.nanmax(seg)) < min_up_peak_z:
+                    rejected_lowpeak += 1
+                    continue
+                if not np.isfinite(np.nanmean(seg)) or float(np.nanmean(seg)) < min_up_mean_z:
+                    rejected_lowmean += 1
+                    continue
+                if not np.isfinite(np.nanpercentile(seg, 90)) or float(np.nanpercentile(seg, 90)) < min_up_p90_z:
+                    rejected_lowp90 += 1
+                    continue
+                strong_frac = float(np.mean(seg >= min_up_mean_z))
+                if strong_frac < min_up_strong_frac:
+                    rejected_lowsustain += 1
+                    continue
 
             filtered_UP.append(u)
             filtered_DOWN.append(d)
 
         UP_start_i = np.array(filtered_UP, dtype=int)
         DOWN_start_i = np.array(filtered_DOWN, dtype=int)
+        auto_relax_if_empty = os.environ.get("UP_AUTO_RELAX_IF_EMPTY", "1") == "1"
+        min_keep_for_relax = int(os.environ.get("UP_MIN_KEEP_COUNT_FOR_RELAX", "80"))
+        if auto_relax_if_empty and len(UP_start_i) < min_keep_for_relax and len(up_transitions) > 0:
+            z95 = float(np.nanpercentile(z, 95))
+            z99 = float(np.nanpercentile(z, 99))
+            relax_min_up_len_s = min(float(min_up_len_s), float(os.environ.get("UP_RELAX_MIN_LEN_S", "0.10")))
+            relax_peak = min(float(min_up_peak_z), max(2.2, 0.70 * z99))
+            relax_mean = min(float(min_up_mean_z), max(1.2, 0.45 * z95))
+            relax_p90 = min(float(min_up_p90_z), max(1.8, 0.60 * z95))
+            relax_frac = min(float(min_up_strong_frac), float(os.environ.get("UP_RELAX_STRONG_FRAC", "0.05")))
+
+            relaxed_up = []
+            relaxed_dn = []
+            rejected_short = rejected_lowpeak = rejected_lowmean = rejected_lowp90 = rejected_lowsustain = 0
+            for u, d in zip(up_transitions, down_transitions):
+                duration = float(d - u) * float(dt_feat)
+                if duration < relax_min_up_len_s:
+                    rejected_short += 1
+                    continue
+                if require_z_shape_filter:
+                    seg = z[u:d]
+                    if seg.size == 0 or not np.isfinite(np.nanmax(seg)) or float(np.nanmax(seg)) < relax_peak:
+                        rejected_lowpeak += 1
+                        continue
+                    if not np.isfinite(np.nanmean(seg)) or float(np.nanmean(seg)) < relax_mean:
+                        rejected_lowmean += 1
+                        continue
+                    if not np.isfinite(np.nanpercentile(seg, 90)) or float(np.nanpercentile(seg, 90)) < relax_p90:
+                        rejected_lowp90 += 1
+                        continue
+                    strong_frac = float(np.mean(seg >= relax_mean))
+                    if strong_frac < relax_frac:
+                        rejected_lowsustain += 1
+                        continue
+                relaxed_up.append(u)
+                relaxed_dn.append(d)
+
+            UP_start_i = np.array(relaxed_up, dtype=int)
+            DOWN_start_i = np.array(relaxed_dn, dtype=int)
+            min_up_len_s = relax_min_up_len_s
+            min_up_peak_z = relax_peak
+            min_up_mean_z = relax_mean
+            min_up_p90_z = relax_p90
+            min_up_strong_frac = relax_frac
+            print(
+                f"[UP-FILTER][RELAX] empty->retry kept={len(UP_start_i)} "
+                f"(min_len={min_up_len_s:.2f}s, min_peak_z={min_up_peak_z:.2f}, "
+                f"min_mean_z={min_up_mean_z:.2f}, min_p90_z={min_up_p90_z:.2f}, "
+                f"min_strong_frac={min_up_strong_frac:.2f})"
+            )
         print(
             f"[UP-FILTER] kept={len(UP_start_i)} "
+            f"shape_filter={'1' if require_z_shape_filter else '0'} "
+            f"merged_close={merged_count} "
             f"drop_short={rejected_short} "
-            f"(min_len={min_up_len_s:.2f}s)"
+            f"drop_lowpeak={rejected_lowpeak} "
+            f"drop_lowmean={rejected_lowmean} "
+            f"drop_lowp90={rejected_lowp90} "
+            f"drop_lowsustain={rejected_lowsustain} "
+            f"(min_len={min_up_len_s:.2f}s, min_peak_z={min_up_peak_z:.2f}, min_mean_z={min_up_mean_z:.2f}, "
+            f"min_p90_z={min_up_p90_z:.2f}, min_strong_frac={min_up_strong_frac:.2f})"
         )
 
     def _feat_idx_to_time(idx_arr):
@@ -460,15 +580,18 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         return out
 
     # 6) NO-UP Gate
-    min_up_fraction = float(os.environ.get("UP_MIN_FRAC", "0.01"))
+    min_up_fraction = float(os.environ.get("UP_MIN_FRAC", "0.002"))
     min_up_onsets = int(os.environ.get("UP_MIN_ONSETS", "1"))
 
     print("[BAND] f_lo,f_hi =", f_lo, f_hi)
     #print("[THR] thr =", threshold, "smooth min/max =", Total_power_smooth.min(), Total_power_smooth.max())
     print("[UP%] frac UP =", up_state_binary.mean(), "| dt_feat =", dt_feat, "min_gap_bins =", min_gap)
     print("[UP] onsets =", len(UP_start_i))
-    print("[time_s] = ", time_s)
-    print("t_feat = ", t_feat)
+    if len(time_s) and len(t_feat):
+        print(
+            f"[TIME] raw={float(time_s[0]):.3f}->{float(time_s[-1]):.3f}s (n={len(time_s)}) | "
+            f"feat={float(t_feat[0]):.3f}->{float(t_feat[-1]):.3f}s (n={len(t_feat)})"
+        )
 
     if (up_state_binary.mean() < min_up_fraction) or (len(UP_start_i) < min_up_onsets):
         print("[STATES] no reliable UP states -> return empty dict")
@@ -609,11 +732,34 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     Spontaneous_UP = UP_start_i[:n_up][mask_sp]
     Spontaneous_DOWN = DOWN_start_i[:n_up][mask_sp]
 
+    # Refraktaer-Filter gegen "post-UP Fragmente":
+    # Wenn ein spontaner Kandidat kurz nach dem Ende des vorherigen UPs startet,
+    # ist das oft Restaktivitaet/Noise statt eines echten neuen UP-States.
+    spont_post_up_refractory_s = float(os.environ.get("SPONT_POST_UP_REFRACTORY_S", "0.0"))
+    dropped_post_up_fragments = 0
+    if n_up and spont_post_up_refractory_s > 0:
+        keep_sp = mask_sp.copy()
+        up_times_all = _feat_idx_to_time(UP_start_i[:n_up])
+        dn_times_all = _feat_idx_to_time(DOWN_start_i[:n_up])
+        for i in np.flatnonzero(mask_sp):
+            if i <= 0:
+                continue
+            prev_dn = float(dn_times_all[i - 1])
+            cur_up = float(up_times_all[i])
+            if np.isfinite(prev_dn) and np.isfinite(cur_up):
+                if (cur_up - prev_dn) < spont_post_up_refractory_s:
+                    keep_sp[i] = False
+                    dropped_post_up_fragments += 1
+        mask_sp = keep_sp
+        Spontaneous_UP = UP_start_i[:n_up][mask_sp]
+        Spontaneous_DOWN = DOWN_start_i[:n_up][mask_sp]
+
     print(
         f"[CLASSIFY] total={n_up} spont={len(Spontaneous_UP)} "
         f"trig={len(Pulse_triggered_UP)} assoc={len(Pulse_associated_UP)} "
         f"(trig_win={trig_win_s:.2f}s, assoc_delay={assoc_min_delay_s:.2f}s, "
         f"assoc_enable={assoc_enable}, intervals={len(Pulse_intervals)}, "
+        f"drop_postup_frag={dropped_post_up_fragments}, "
         f"intervals_reliable={intervals_reliable})"
     )
 

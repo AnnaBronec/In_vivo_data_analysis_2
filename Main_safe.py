@@ -6,6 +6,7 @@ import json
 import numpy as np
 import numpy as _np 
 import re
+import importlib
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  
@@ -93,6 +94,112 @@ IGNORE_PULSE_2 = os.environ.get("IGNORE_PULSE_2", "0") == "1"
 SPINDLE_ZERO_PHASE = os.environ.get("SPINDLE_ZERO_PHASE", "1") == "1"
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
+
+
+def _load_simple_env_file(path_obj, override=False):
+    p = Path(path_obj)
+    if not p.is_file():
+        return False
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return False
+    for raw in lines:
+        s = raw.strip()
+        if (not s) or s.startswith("#"):
+            continue
+        if s.startswith("export "):
+            s = s[len("export "):].strip()
+        if "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            continue
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        if override or (k not in os.environ):
+            os.environ[k] = v
+    return True
+
+
+def _bootstrap_analysis_config(base_path):
+    loaded_paths = []
+    candidates = []
+    cfg_env = os.environ.get("ANALYSIS_CONFIG_FILE", "").strip()
+    if cfg_env:
+        candidates.append(Path(cfg_env).expanduser())
+    candidates.append(Path(base_path) / "analysis_config.env")
+    candidates.append(Path(__file__).resolve().with_name("analysis_config.env"))
+
+    seen = set()
+    for c in candidates:
+        try:
+            r = c.resolve()
+        except Exception:
+            r = c
+        key = str(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _load_simple_env_file(r, override=False):
+            loaded_paths.append(str(r))
+
+    force_coarse = str(os.environ.get("UP_FORCE_COARSE", "1")).strip().lower() not in ("0", "false", "no", "off")
+    if force_coarse:
+        coarse = {
+            "UP_SMOOTH_S": "0.10",
+            "UP_TARGET_MIN_FRAC": "0.20",
+            "UP_TARGET_MAX_FRAC": "0.85",
+            "UP_K_HI_START": "1.9",
+            "UP_K_LO_START": "1.5",
+            "UP_MIN_GAP_S": "0.005",
+            "UP_MERGE_GAP_S": "0.05",
+            "UP_MIN_LEN_S": "0.03",
+            "UP_MIN_PEAK_Z": "3.2",
+            "UP_MIN_MEAN_Z": "2.2",
+            "UP_MIN_P90_Z": "2.8",
+            "UP_MIN_STRONG_FRAC": "0.08",
+            "UP_MIN_KEEP_COUNT_FOR_RELAX": "120",
+            "UP_RELAX_MIN_LEN_S": "0.03",
+            "UP_RELAX_STRONG_FRAC": "0.05",
+            "UP_MIN_FRAC": "0.002",
+            "UP_REQUIRE_Z_SHAPE_FILTER": "0",
+            "UP_MIN_DUR_POST_S": "0.03",
+            "UP_MIN_DUR_POST_FLOOR_S": "0.00",
+            "SPONT_POST_UP_REFRACTORY_S": "0.10",
+            "UP_AUTO_RELAX_IF_EMPTY": "1",
+        }
+        for k, v in coarse.items():
+            os.environ.setdefault(k, str(v))
+
+    state_det_path = "?"
+    try:
+        _mod = importlib.import_module(classify_states.__module__)
+        state_det_path = str(getattr(_mod, "__file__", "?"))
+    except Exception:
+        pass
+
+    print(f"[CONFIG] Main_safe file: {Path(__file__).resolve()}")
+    print(f"[CONFIG] state_detection file: {state_det_path}")
+    if loaded_paths:
+        print("[CONFIG] loaded env:", " | ".join(loaded_paths))
+    else:
+        print("[CONFIG] loaded env: none")
+    print(f"[CONFIG] UP_FORCE_COARSE={'1' if force_coarse else '0'}")
+    print(
+        "[CONFIG][UP] "
+        f"smooth={os.environ.get('UP_SMOOTH_S')} "
+        f"k_hi={os.environ.get('UP_K_HI_START')} "
+        f"k_lo={os.environ.get('UP_K_LO_START')} "
+        f"min_len={os.environ.get('UP_MIN_LEN_S')} "
+        f"min_peak={os.environ.get('UP_MIN_PEAK_Z')} "
+        f"min_mean={os.environ.get('UP_MIN_MEAN_Z')}"
+    )
+
+
+_bootstrap_analysis_config(BASE_PATH)
 
 
 if "LFP_FILENAME" in globals():
@@ -6999,7 +7106,7 @@ layout_rows = [
         Pulse_associated_UP, Pulse_associated_DOWN,
         pulse_times_1=pulse_times_1,
         pulse_times_2=pulse_times_2,
-        spindle_intervals=spindle_intervals_s,
+        spindle_intervals=None,
         ax=ax
     )],
 
