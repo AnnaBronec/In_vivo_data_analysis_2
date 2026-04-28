@@ -543,7 +543,8 @@ def pulse_to_up_latencies(pulse_times, up_indices, time_s, max_win_s=1.0):
 def upstate_amplitude_compare_ax(
     spont_amp, trig_amp,
     ax=None,
-    title="UP Amplitude (max-min, mean): Spontan vs. Getriggert"
+    title="UP Amplitude (max-min, mean): Spontan vs. Getriggert",
+    y_limits=None,
 ):
 
     spont_amp = np.asarray(spont_amp, float)
@@ -602,6 +603,8 @@ def upstate_amplitude_compare_ax(
     )
     if sp_valid.size and tr_valid.size and np.isfinite(st["p"]):
         _annotate_sig_2groups(ax, 1, 2, st["p"], alpha=0.05)
+    if y_limits is not None:
+        ax.set_ylim(y_limits)
     return fig
 
 
@@ -1216,7 +1219,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             plt.close(fig)
         print(f"[SUMMARY][GROUP][PDF] {out_pdf}")
 
-    def _up_rate_overview_ax(ax, rate_per_min, rate_hz, title):
+    def _up_rate_overview_ax(ax, rate_per_min, rate_hz, title, y_limits=None):
         vals = np.array([rate_per_min, rate_hz], dtype=float)
         labels = ["total [/min]", "total [Hz]"]
         x = np.arange(2, dtype=float)
@@ -1233,6 +1236,8 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             if np.isfinite(v):
                 ax.text(float(xi), float(v), f"{float(v):.3g}", ha="center", va="bottom", fontsize=8)
         ax.grid(axis="y", alpha=0.25, ls=":")
+        if y_limits is not None:
+            ax.set_ylim(y_limits)
 
     def _write_parent_up_rate_overview_pdf(parent_dir, summary_files):
         def _nat_session_key(path_str):
@@ -1269,6 +1274,29 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             print("[SUMMARY][UP-RATE][PDF] skipped: no summary files")
             return
 
+        # Einheitliche Y-Achse fuer alle Panels berechnen (sessionuebergreifend).
+        all_rates = []
+        for row in rows:
+            vals = np.array([row["rate_per_min"], row["rate_hz"]], dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                all_rates.append(vals)
+        global_ylim = None
+        if all_rates:
+            vals = np.concatenate(all_rates)
+            if vals.size:
+                vmin = float(np.nanmin(vals))
+                vmax = float(np.nanmax(vals))
+                if np.isfinite(vmin) and np.isfinite(vmax):
+                    if np.isclose(vmin, vmax):
+                        pad = max(1e-6, abs(vmax) * 0.1)
+                        global_ylim = (vmin - pad, vmax + pad)
+                    else:
+                        span = vmax - vmin
+                        y_lo = min(0.0, vmin - 0.05 * span)
+                        y_hi = vmax + 0.15 * span
+                        global_ylim = (y_lo, y_hi)
+
         out_pdf = os.path.join(parent_dir, "upstate_summary_ALL_parent__up_rate_panels.pdf")
         n = len(rows)
         ncols = 2
@@ -1282,7 +1310,9 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 axs = np.asarray(axs).reshape(-1)
                 for ax, row in zip(axs, chunk):
                     title = f"{row['session_name']} — UP rate (total): [/min] vs [Hz]"
-                    _up_rate_overview_ax(ax, row["rate_per_min"], row["rate_hz"], title)
+                    _up_rate_overview_ax(
+                        ax, row["rate_per_min"], row["rate_hz"], title, y_limits=global_ylim
+                    )
                 for ax in axs[len(chunk):]:
                     ax.axis("off")
                 fig.suptitle("UP-rate overview per subfolder", y=0.995)
@@ -1327,6 +1357,30 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             print("[SUMMARY][UP-AMP][PDF] skipped: no summary files")
             return
 
+        # Einheitliche Y-Achse fuer alle Panels berechnen (sessionuebergreifend).
+        all_amp = []
+        for row in rows:
+            if row["spont_amp"].size:
+                all_amp.append(row["spont_amp"])
+            if row["trig_amp"].size:
+                all_amp.append(row["trig_amp"])
+        global_ylim = None
+        if all_amp:
+            vals = np.concatenate(all_amp)
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                vmin = float(np.nanmin(vals))
+                vmax = float(np.nanmax(vals))
+                if np.isfinite(vmin) and np.isfinite(vmax):
+                    if np.isclose(vmin, vmax):
+                        pad = max(1e-6, abs(vmax) * 0.1)
+                        global_ylim = (vmin - pad, vmax + pad)
+                    else:
+                        span = vmax - vmin
+                        y_lo = min(0.0, vmin - 0.05 * span)
+                        y_hi = vmax + 0.15 * span
+                        global_ylim = (y_lo, y_hi)
+
         out_pdf = os.path.join(parent_dir, "upstate_summary_ALL_parent__up_amplitude_panels.pdf")
         n = len(rows)
         ncols = 2
@@ -1340,7 +1394,9 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 axs = np.asarray(axs).reshape(-1)
                 for ax, row in zip(axs, chunk):
                     title = f"{row['session_name']} — UP Amplitude (max-min, mean): Spontan vs. Getriggert"
-                    upstate_amplitude_compare_ax(row["spont_amp"], row["trig_amp"], ax=ax, title=title)
+                    upstate_amplitude_compare_ax(
+                        row["spont_amp"], row["trig_amp"], ax=ax, title=title, y_limits=global_ylim
+                    )
                 for ax in axs[len(chunk):]:
                     ax.axis("off")
                 fig.suptitle("UP-amplitude overview per subfolder", y=0.995)
