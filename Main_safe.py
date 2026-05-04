@@ -43,6 +43,7 @@ from Exports import (
     export_interactive_dual_lfp_html,
     export_interactive_two_channel_lfp_html,
     export_interactive_three_channel_lfp_html,
+    export_interactive_four_channel_lfp_html,
     export_interactive_swr_scan_html,
     log,
      _nan_stats,
@@ -2502,6 +2503,8 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     sw_pad_s = float(os.environ.get("SWR_SW_PAD_S", "0.030"))
     sw_amp_sigma = float(os.environ.get("SWR_SW_MIN_AMP_SIGMA", "1.0"))
     sw_ptp_sigma = float(os.environ.get("SWR_SW_MIN_PTP_SIGMA", "2.0"))
+    sw_slope_sigma = float(os.environ.get("SWR_SW_MIN_SLOPE_SIGMA", "1.0"))
+    sw_min_abs_amp = float(os.environ.get("SWR_SW_MIN_ABS_AMP", "0.0"))
     sw_center_tol_s = float(os.environ.get("SWR_SW_CENTER_TOL_S", "0.040"))
     sw_polarity = str(os.environ.get("SWR_SW_POLARITY", "auto")).strip().lower()  # auto|negative|positive|both
     sw_require_overlap = str(os.environ.get("SWR_SW_REQUIRE_OVERLAP", "1")).strip().lower() not in ("0", "false", "no", "off")
@@ -2515,13 +2518,21 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     sw_mad = float(np.nanmedian(np.abs(sw_band - sw_med)))
     sw_sigma = max(1.4826 * sw_mad, 1e-12)
     amp_thr = max(sw_amp_sigma * sw_sigma, 1e-12)
+    if sw_min_abs_amp > 0:
+        amp_thr = max(amp_thr, sw_min_abs_amp)
     ptp_thr = max(sw_ptp_sigma * sw_sigma, 1e-12)
+    sw_d = np.diff(sw_band) / float(dt)
+    sw_d_med = float(np.nanmedian(sw_d)) if sw_d.size else 0.0
+    sw_d_mad = float(np.nanmedian(np.abs(sw_d - sw_d_med))) if sw_d.size else 0.0
+    sw_d_sigma = max(1.4826 * sw_d_mad, 1e-12)
+    slope_thr = max(float(sw_slope_sigma) * sw_d_sigma, 0.0)
     pad_n = max(1, int(round(sw_pad_s / dt)))
     overlap_pad_n = max(0, int(round(sw_overlap_pad_s / dt)))
     min_overlap_n = max(1, int(round(sw_min_overlap_s / dt)))
 
     out = []
     n_pass_amp_ptp = 0
+    n_pass_slope = 0
     n_pass_overlap = 0
     n_pass_center = 0
     for t0, t1 in ripple_candidates:
@@ -2549,6 +2560,10 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
         neg_ok = abs(v_min) >= amp_thr
         pos_ok = abs(v_max) >= amp_thr
         ptp_ok = (v_max - v_min) >= ptp_thr
+        seg_d = np.diff(seg) / float(dt)
+        slope_ok = True
+        if slope_thr > 0:
+            slope_ok = bool(seg_d.size and float(np.nanmax(np.abs(seg_d))) >= slope_thr)
 
         if sw_polarity == "negative":
             pol_ok = neg_ok
@@ -2566,6 +2581,9 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
         if not pol_ok or not ptp_ok:
             continue
         n_pass_amp_ptp += 1
+        if not slope_ok:
+            continue
+        n_pass_slope += 1
 
         if sw_require_overlap:
             s_ov = max(0, s - overlap_pad_n)
@@ -2600,10 +2618,12 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
             f"cand={len(ripple_candidates)} keep={len(out)} "
             f"sw_band={sw_lo:.1f}-{sw_hi:.1f}Hz "
             f"amp_sigma={sw_amp_sigma:.2f} ptp_sigma={sw_ptp_sigma:.2f} "
+            f"slope_sigma={sw_slope_sigma:.2f} min_abs_amp={sw_min_abs_amp:.4g} "
             f"pol={sw_polarity} require_overlap={int(sw_require_overlap)} "
             f"min_overlap_s={sw_min_overlap_s:.4f} overlap_pad_s={sw_overlap_pad_s:.4f} "
             f"require_center={int(sw_require_center)} center_tol_s={sw_center_tol_s:.3f} "
-            f"pass_amp_ptp={n_pass_amp_ptp} pass_overlap={n_pass_overlap} pass_center={n_pass_center}"
+            f"pass_amp_ptp={n_pass_amp_ptp} pass_slope={n_pass_slope} "
+            f"pass_overlap={n_pass_overlap} pass_center={n_pass_center}"
         )
     return out
 
@@ -3175,6 +3195,8 @@ if enable_swr:
         f"sw_band={os.environ.get('SWR_SW_F_LO_HZ', '2.0')}-{os.environ.get('SWR_SW_F_HI_HZ', '40.0')}Hz "
         f"sw_amp_sigma={os.environ.get('SWR_SW_MIN_AMP_SIGMA', '1.0')} "
         f"sw_ptp_sigma={os.environ.get('SWR_SW_MIN_PTP_SIGMA', '2.0')} "
+        f"sw_slope_sigma={os.environ.get('SWR_SW_MIN_SLOPE_SIGMA', '1.0')} "
+        f"sw_min_abs_amp={os.environ.get('SWR_SW_MIN_ABS_AMP', '0.0')} "
         f"sw_require_overlap={os.environ.get('SWR_SW_REQUIRE_OVERLAP', '1')} "
         f"sw_min_overlap_s={os.environ.get('SWR_SW_MIN_OVERLAP_S', '0.006')} "
         f"sw_overlap_pad_s={os.environ.get('SWR_SW_OVERLAP_PAD_S', '0.000')} "
@@ -3772,7 +3794,7 @@ export_interactive_dual_lfp_html(
     show_pulse_intervals=(not PULSE_ONSET_ONLY),
 )
 
-# Zusatz-HTML: 3 Panels (SWR-Kanal, LFP/UP-Kanal, 10-15Hz auf LFP/UP-Kanal)
+# Zusatz-HTML: 4 Panels (Ripple-Band, Sharp-Wave-Band, LFP/UP-Kanal, 10-15Hz auf LFP/UP-Kanal)
 try:
     if not enable_swr:
         raise RuntimeError("SWR disabled by channel policy")
@@ -3809,8 +3831,13 @@ try:
     up_plot = _channel_signal_for_html(up_ch_idx)
     swr_f_lo = float(os.environ.get("SWR_F_LO_HZ", "120.0"))
     swr_f_hi = float(os.environ.get("SWR_F_HI_HZ", "270.0"))
+    swr_sw_f_lo = float(os.environ.get("SWR_SW_F_LO_HZ", "2.0"))
+    swr_sw_f_hi = float(os.environ.get("SWR_SW_F_HI_HZ", "40.0"))
     swr_bp_plot = _bandpass_1d(
         swr_plot, dt, f_lo=swr_f_lo, f_hi=swr_f_hi, order=3, causal=(not SPINDLE_ZERO_PHASE)
+    )
+    swr_sw_plot = _bandpass_1d(
+        swr_plot, dt, f_lo=swr_sw_f_lo, f_hi=swr_sw_f_hi, order=3, causal=(not SPINDLE_ZERO_PHASE)
     )
     up_bp_10_15_plot = _bandpass_1d(
         up_plot, dt, f_lo=10.0, f_hi=15.0, order=3, causal=(not SPINDLE_ZERO_PHASE)
@@ -3907,7 +3934,7 @@ try:
     UP_Sp_Assoc_UP, UP_Sp_Assoc_DOWN = _time_intervals_to_idx_pairs(up_sp_assoc_s, time_s)
 
     print(
-        f"[HTML-3P] ch{swr_ch_idx}_swr:",
+        f"[HTML-4P] ch{swr_ch_idx}_swr:",
         f"sp={len(SWR_Ripple_Spont_UP)}",
         f"tr={len(SWR_Ripple_Trig_UP)}",
         f"as={len(SWR_Ripple_Assoc_UP)}",
@@ -3921,11 +3948,12 @@ try:
         f"as={len(UP_Sp_Assoc_UP)}",
     )
 
-    export_interactive_three_channel_lfp_html(
-        f"{BASE_TAG}__ch{swr_ch_idx}_swr_ch{up_ch_idx}_up_spindle",
+    export_interactive_four_channel_lfp_html(
+        f"{BASE_TAG}__ch{swr_ch_idx}_ripple_sharpwave_ch{up_ch_idx}_up_spindle",
         SAVE_DIR,
         time_s,
         swr_bp_plot,
+        swr_sw_plot,
         up_plot,
         up_bp_10_15_plot,
         pulse_times_1=pulse_times_1_html,
@@ -3934,6 +3962,9 @@ try:
         pulse_times_2_off=pulse_times_2_off_html_export,
         pulse_intervals_1=ttl1_intervals,
         pulse_intervals_2=ttl2_intervals_export,
+        raw_top_spont=(SWR_Ripple_Spont_UP, SWR_Ripple_Spont_DOWN),
+        raw_top_trig=(SWR_Ripple_Trig_UP, SWR_Ripple_Trig_DOWN),
+        raw_top_assoc=(SWR_Ripple_Assoc_UP, SWR_Ripple_Assoc_DOWN),
         top_spont=(SWR_Ripple_Spont_UP, SWR_Ripple_Spont_DOWN),
         top_trig=(SWR_Ripple_Trig_UP, SWR_Ripple_Trig_DOWN),
         top_assoc=(SWR_Ripple_Assoc_UP, SWR_Ripple_Assoc_DOWN),
@@ -3944,15 +3975,19 @@ try:
         bottom_trig=(UP_Sp_Trig_UP, UP_Sp_Trig_DOWN),
         bottom_assoc=(UP_Sp_Assoc_UP, UP_Sp_Assoc_DOWN),
         title=(
-            f"{BASE_TAG} — ch{swr_ch_idx} SWR {swr_f_lo:g}-{swr_f_hi:g} Hz | ch{up_ch_idx} UP "
+            f"{BASE_TAG} — ch{swr_ch_idx} ripple {swr_f_lo:g}-{swr_f_hi:g} Hz "
+            f"+ sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz | ch{up_ch_idx} UP "
             f"| ch{up_ch_idx} 10-15 Hz Spindles"
         ),
-        top_name=f"pri_{swr_ch_idx} (SWR {swr_f_lo:g}-{swr_f_hi:g} Hz bandpass)",
+        raw_top_name=f"pri_{swr_ch_idx} (ripple {swr_f_lo:g}-{swr_f_hi:g} Hz bandpass)",
+        top_name=f"pri_{swr_ch_idx} (sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz bandpass)",
         mid_name=f"pri_{up_ch_idx} (UP)",
         bottom_name=f"pri_{up_ch_idx} (10-15 Hz bandpass)",
-        top_y_label=(f"ch{swr_ch_idx} SWR {swr_f_lo:g}-{swr_f_hi:g} Hz (µV)" if HTML_IN_uV else f"ch{swr_ch_idx} SWR {swr_f_lo:g}-{swr_f_hi:g} Hz ({UNIT_LABEL})"),
+        raw_top_y_label=(f"ch{swr_ch_idx} ripple {swr_f_lo:g}-{swr_f_hi:g} Hz (µV)" if HTML_IN_uV else f"ch{swr_ch_idx} ripple {swr_f_lo:g}-{swr_f_hi:g} Hz ({UNIT_LABEL})"),
+        top_y_label=(f"ch{swr_ch_idx} sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz (µV)" if HTML_IN_uV else f"ch{swr_ch_idx} sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz ({UNIT_LABEL})"),
         mid_y_label=(f"ch{up_ch_idx} LFP (µV)" if HTML_IN_uV else f"ch{up_ch_idx} LFP ({UNIT_LABEL})"),
         bottom_y_label=(f"ch{up_ch_idx} 10-15 Hz (µV)" if HTML_IN_uV else f"ch{up_ch_idx} 10-15 Hz ({UNIT_LABEL})"),
+        y_range_raw_top=None,
         y_range_top=None,
         y_range_mid=html_y_range,
         y_range_bottom=None,
