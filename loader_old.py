@@ -70,9 +70,13 @@ def load_LFP_new(BASE_PATH: str, LFP_FILENAME: str) -> Tuple[pd.DataFrame, List[
 
     # --- Fall A: neues Layout (time + Kanäle) ---
     if "time" in df.columns:
-        # Kanalspalten: alles außer 'time' und ggf. 'stim'
-                # --- DROP-IN: Meta-Spalten NICHT als Kanäle behandeln ---
-        NON_CH = {"time", "stim", "timestamps", "timesamples"}
+        # Kanalspalten: Meta-/TTL-/Edge-Spalten nicht als LFP behandeln.
+        NON_CH = {
+            "time", "timestamps", "timesamples",
+            "stim", "stim_on", "stim_off",
+            "din_1", "din_2", "din1", "din2",
+            "StartStop", "TTL", "DI0", "DI1",
+        }
         ch_names = [c for c in df.columns if c not in NON_CH]
 
         # Sicherstellen: numeric

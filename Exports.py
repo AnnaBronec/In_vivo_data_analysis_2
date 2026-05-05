@@ -3,9 +3,12 @@ import plotly.graph_objects as go
 from plotly.offline import plot as plotly_offline_plot
 from plotly.subplots import make_subplots
 from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import SymLogNorm
 import os
 import sys, os
+import html
 
 
 ANALYSE_IN_AU = True
@@ -964,6 +967,7 @@ def export_interactive_three_channel_lfp_html(
     y_range_mid=None,
     y_range_bottom=None,
     show_pulse_intervals=True,
+    trace_time_shifts_s=None,
 ):
     t = np.asarray(time_s, dtype=float).ravel()
     x_top = np.asarray(y_top, dtype=float).ravel()
@@ -1255,6 +1259,7 @@ def export_interactive_four_channel_lfp_html(
     y_range_mid=None,
     y_range_bottom=None,
     show_pulse_intervals=True,
+    trace_time_shifts_s=None,
 ):
     t = np.asarray(time_s, dtype=float).ravel()
     x_raw_top = np.asarray(y_raw_top, dtype=float).ravel()
@@ -1492,6 +1497,378 @@ def export_interactive_four_channel_lfp_html(
     out_html = os.path.join(save_dir, f"{base_tag}__four_lfp_interactive.html")
     plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
     print(f"[HTML] four interaktiver LFP-Plot: {out_html}")
+    return out_html
+
+
+def export_pulse_qa_four_channel_html(
+    base_tag, save_dir,
+    time_s, y_ripple, y_sharp, y_up, y_spindle,
+    pulse_times_1=None, pulse_times_2=None,
+    pulse_times_1_off=None, pulse_times_2_off=None,
+    *,
+    swr_spont=None,
+    swr_trig=None,
+    swr_assoc=None,
+    up_spont=None,
+    up_trig=None,
+    up_assoc=None,
+    spindle_spont=None,
+    spindle_trig=None,
+    spindle_assoc=None,
+    pre_s=0.25,
+    post_s=0.75,
+    max_pulses=0,
+    max_points_per_panel=2500,
+    title="Pulse QA: SWR / Sharp-wave / UP / Spindle",
+    ripple_name="Ripple band",
+    sharp_name="Sharp-wave band",
+    up_name="UP channel",
+    spindle_name="Spindle band",
+    ripple_y_label="Ripple",
+    sharp_y_label="Sharp-wave",
+    up_y_label="UP",
+    spindle_y_label="Spindle",
+    show_pulse_durations=True,
+    require_full_window=True,
+    trace_time_shifts_s=None,
+):
+    t_all = np.asarray(time_s, dtype=float).ravel()
+    traces = [
+        np.asarray(y_ripple, dtype=float).ravel(),
+        np.asarray(y_sharp, dtype=float).ravel(),
+        np.asarray(y_up, dtype=float).ravel(),
+        np.asarray(y_spindle, dtype=float).ravel(),
+    ]
+    m = min([t_all.size] + [x.size for x in traces])
+    if m < 3:
+        raise ValueError("Not enough points for pulse QA export.")
+    t_all = t_all[:m]
+    traces = [x[:m] for x in traces]
+    shifts = np.zeros(4, dtype=float)
+
+    def _clean_times(ts):
+        if ts is None:
+            return np.array([], dtype=float)
+        tt = np.asarray(ts, dtype=float).ravel()
+        tt = tt[np.isfinite(tt)]
+        return tt
+
+    p1 = _clean_times(pulse_times_1)
+    p2 = _clean_times(pulse_times_2)
+    p1_off = _clean_times(pulse_times_1_off)
+    p2_off = _clean_times(pulse_times_2_off)
+
+    pulses = []
+    for i, p in enumerate(p1):
+        off = float(p1_off[i]) if i < p1_off.size and np.isfinite(p1_off[i]) and p1_off[i] > p else None
+        pulses.append((float(p), "Pulse 1", i + 1, off))
+    for i, p in enumerate(p2):
+        off = float(p2_off[i]) if i < p2_off.size and np.isfinite(p2_off[i]) and p2_off[i] > p else None
+        pulses.append((float(p), "Pulse 2", i + 1, off))
+    if require_full_window:
+        pulses = [p for p in pulses if (p[0] - float(pre_s) >= t_all[0]) and (p[0] + float(post_s) <= t_all[-1])]
+    else:
+        pulses = [p for p in pulses if (p[0] + float(post_s) >= t_all[0]) and (p[0] - float(pre_s) <= t_all[-1])]
+    pulses.sort(key=lambda z: z[0])
+    if int(max_pulses) > 0 and len(pulses) > int(max_pulses):
+        pulses = pulses[:int(max_pulses)]
+    if not pulses:
+        os.makedirs(save_dir, exist_ok=True)
+        out_html = os.path.join(save_dir, f"{base_tag}__pulse_qa_4panel.html")
+        out_pdf = os.path.join(save_dir, f"{base_tag}__pulse_qa_4panel.pdf")
+        msg = (
+            "No pulses with a complete pre/post window found for pulse QA export."
+            if require_full_window
+            else "No pulses found in current time window for pulse QA export."
+        )
+        with open(out_html, "w", encoding="utf-8") as f:
+            f.write("<!doctype html><html><head><meta charset='utf-8'>")
+            f.write(f"<title>{html.escape(str(title))}</title></head><body>")
+            f.write(f"<h1>{html.escape(str(title))}</h1>")
+            f.write(f"<p>{html.escape(msg)}</p>")
+            f.write("</body></html>")
+        with PdfPages(out_pdf) as pdf:
+            fig, ax = plt.subplots(figsize=(11.0, 8.5))
+            ax.axis("off")
+            ax.text(0.5, 0.55, str(title), ha="center", va="center", fontsize=13, transform=ax.transAxes)
+            ax.text(0.5, 0.45, msg, ha="center", va="center", fontsize=11, transform=ax.transAxes)
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+        print(f"[HTML] pulse QA 4-panel placeholder: {out_html}")
+        print(f"[PDF] pulse QA 4-panel placeholder: {out_pdf}")
+        return out_html
+
+    def _mk_intervals(pair):
+        if not pair:
+            return []
+        up, down = pair
+        up = np.asarray(up, dtype=int).ravel()
+        down = np.asarray(down, dtype=int).ravel()
+        out = []
+        for u, d in zip(up[:min(up.size, down.size)], down[:min(up.size, down.size)]):
+            if 0 <= u < t_all.size and 0 < d <= t_all.size and d > u:
+                out.append((float(t_all[u]), float(t_all[d - 1])))
+        return out
+
+    swr_groups = [
+        ("SWR spontaneous", _mk_intervals(swr_spont), "rgba(39, 174, 96, 0.32)"),
+        ("SWR triggered", _mk_intervals(swr_trig), "rgba(39, 174, 96, 0.42)"),
+        ("SWR associated", _mk_intervals(swr_assoc), "rgba(39, 174, 96, 0.52)"),
+    ]
+    up_groups = [
+        ("UP spontaneous", _mk_intervals(up_spont), "rgba(52, 152, 219, 0.22)"),
+        ("UP triggered", _mk_intervals(up_trig), "rgba(52, 152, 219, 0.34)"),
+        ("UP associated", _mk_intervals(up_assoc), "rgba(52, 152, 219, 0.46)"),
+    ]
+    spindle_groups = [
+        ("Spindle spontaneous", _mk_intervals(spindle_spont), "rgba(214, 51, 132, 0.28)"),
+        ("Spindle triggered", _mk_intervals(spindle_trig), "rgba(214, 51, 132, 0.40)"),
+        ("Spindle associated", _mk_intervals(spindle_assoc), "rgba(214, 51, 132, 0.52)"),
+    ]
+
+    def _axis_ref(row):
+        return "x" if row == 1 else f"x{row}"
+
+    def _y_domain_ref(row):
+        return "y domain" if row == 1 else f"y{row} domain"
+
+    def _add_event_spans(shapes, groups, row, p, w0, w1):
+        for _, spans, fill in groups:
+            for t0, t1 in spans:
+                if t1 < w0 or t0 > w1:
+                    continue
+                shapes.append(dict(
+                    type="rect",
+                    x0=max(t0, w0) - p,
+                    x1=min(t1, w1) - p,
+                    y0=0,
+                    y1=1,
+                    xref=_axis_ref(row),
+                    yref=_y_domain_ref(row),
+                    line=dict(width=0),
+                    fillcolor=fill,
+                ))
+
+    def _apply_local_y(fig, row, y):
+        yy = np.asarray(y, dtype=float)
+        yy = yy[np.isfinite(yy)]
+        if yy.size == 0:
+            return
+        y0 = float(np.nanmin(yy))
+        y1 = float(np.nanmax(yy))
+        if y1 <= y0:
+            pad = max(abs(y0) * 0.1, 1.0)
+        else:
+            pad = 0.08 * (y1 - y0)
+        fig.update_yaxes(range=[y0 - pad, y1 + pad], autorange=False, row=row, col=1)
+
+    pulse_pages = []
+    snippets = []
+    for i_pulse, (p, label, ordinal, off) in enumerate(pulses):
+        w0 = p - float(pre_s)
+        w1 = p + float(post_s)
+        i0 = int(np.searchsorted(t_all, w0, side="left"))
+        i1 = int(np.searchsorted(t_all, w1, side="right"))
+        i0 = max(0, min(i0, t_all.size - 1))
+        i1 = max(i0 + 2, min(i1, t_all.size))
+        tt = t_all[i0:i1] - p
+        local = [x[i0:i1] for x in traces]
+        max_pts = max(100, int(max_points_per_panel))
+        if tt.size > max_pts:
+            step = int(np.ceil(tt.size / max_pts))
+            tt = tt[::step]
+            local = [x[::step] for x in local]
+        pulse_pages.append((tt.copy(), [np.asarray(x, float).copy() for x in local], p, label, ordinal, off, w0, w1))
+
+        fig = make_subplots(
+            rows=4,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.025,
+            row_heights=[0.25, 0.25, 0.25, 0.25],
+        )
+        names = [ripple_name, sharp_name, up_name, spindle_name]
+        colors = ["#444444", "#8b0000", "#111111", "#cc00cc"]
+        widths = [0.9, 1.1, 1.0, 1.0]
+        for row, yy in enumerate(local, start=1):
+            fig.add_trace(go.Scatter(
+                x=tt,
+                y=yy,
+                mode="lines",
+                name=str(names[row - 1]),
+                line=dict(color=colors[row - 1], width=widths[row - 1]),
+                showlegend=(i_pulse == 0),
+            ), row=row, col=1)
+            _apply_local_y(fig, row, yy)
+
+        shapes = []
+        for row in range(1, 5):
+            shapes.append(dict(
+                type="line",
+                x0=0,
+                x1=0,
+                y0=0,
+                y1=1,
+                xref=_axis_ref(row),
+                yref=_y_domain_ref(row),
+                line=dict(width=2, dash="dot", color="red"),
+            ))
+            if show_pulse_durations and off is not None and off > p:
+                off_rel = min(float(off), w1) - p
+                shapes.append(dict(
+                    type="rect",
+                    x0=0,
+                    x1=off_rel,
+                    y0=0,
+                    y1=1,
+                    xref=_axis_ref(row),
+                    yref=_y_domain_ref(row),
+                    line=dict(width=0),
+                    fillcolor="rgba(255, 0, 0, 0.08)",
+                ))
+                shapes.append(dict(
+                    type="line",
+                    x0=off_rel,
+                    x1=off_rel,
+                    y0=0,
+                    y1=1,
+                    xref=_axis_ref(row),
+                    yref=_y_domain_ref(row),
+                    line=dict(width=2, dash="dash", color="red"),
+                ))
+        _add_event_spans(shapes, swr_groups, 1, p, w0, w1)
+        _add_event_spans(shapes, swr_groups, 2, p, w0, w1)
+        _add_event_spans(shapes, up_groups, 3, p, w0, w1)
+        _add_event_spans(shapes, spindle_groups, 4, p, w0, w1)
+
+        if i_pulse == 0:
+            for legend_label, _, fill in swr_groups + up_groups + spindle_groups:
+                fig.add_trace(go.Scatter(
+                    x=[None], y=[None],
+                    mode="lines",
+                    line=dict(width=12, color=fill),
+                    name=legend_label,
+                ))
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode="lines",
+                line=dict(width=2, dash="dot", color="red"),
+                name="Pulse onset",
+            ))
+            if show_pulse_durations:
+                fig.add_trace(go.Scatter(
+                    x=[None], y=[None],
+                    mode="lines",
+                    line=dict(width=2, dash="dash", color="red"),
+                    name="Pulse offset",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=[None], y=[None],
+                    mode="lines",
+                    line=dict(width=12, color="rgba(255, 0, 0, 0.08)"),
+                    name="Pulse duration",
+                ))
+
+        fig.update_layout(
+            title=(
+                f"{label} #{ordinal} at {p:.3f}s"
+                + (f" | offset +{(float(off) - p):.3f}s" if show_pulse_durations and off is not None and off > p else "")
+            ),
+            shapes=shapes,
+            margin=dict(l=68, r=20, t=42, b=42),
+            template="plotly_white",
+            height=640,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        )
+        fig.update_yaxes(title_text=ripple_y_label, row=1, col=1)
+        fig.update_yaxes(title_text=sharp_y_label, row=2, col=1)
+        fig.update_yaxes(title_text=up_y_label, row=3, col=1)
+        fig.update_yaxes(title_text=spindle_y_label, row=4, col=1)
+        fig.update_xaxes(title_text="Time from pulse onset (s)", row=4, col=1)
+        for row in range(1, 5):
+            fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror="allticks", row=row, col=1)
+            fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror="allticks", row=row, col=1)
+
+        snippets.append(fig.to_html(
+            full_html=False,
+            include_plotlyjs=("cdn" if i_pulse == 0 else False),
+            config={"responsive": True, "displaylogo": False},
+        ))
+
+    out_html = os.path.join(save_dir, f"{base_tag}__pulse_qa_4panel.html")
+    css = """
+    body { font-family: Arial, sans-serif; margin: 20px; color: #222; }
+    h1 { font-size: 22px; margin: 0 0 6px; }
+    .meta { color: #555; margin-bottom: 18px; }
+    .pulse-block { border-top: 1px solid #ddd; padding-top: 14px; margin-top: 18px; }
+    """
+    with open(out_html, "w", encoding="utf-8") as f:
+        f.write("<!doctype html><html><head><meta charset='utf-8'>")
+        f.write(f"<title>{html.escape(str(title))}</title><style>{css}</style></head><body>")
+        f.write(f"<h1>{html.escape(str(title))}</h1>")
+        f.write(
+            "<div class='meta'>"
+            f"n_pulses={len(pulses)} | window=-{float(pre_s):.3f}s..+{float(post_s):.3f}s | "
+            "Panel 1: ripple, Panel 2: sharp-wave, Panel 3: UP, Panel 4: spindle"
+            "</div>"
+        )
+        for snip in snippets:
+            f.write("<div class='pulse-block'>")
+            f.write(snip)
+            f.write("</div>")
+        f.write("</body></html>")
+    print(f"[HTML] pulse QA 4-panel: {out_html}")
+    out_pdf = os.path.join(save_dir, f"{base_tag}__pulse_qa_4panel.pdf")
+
+    def _rgba_to_mpl(c):
+        if isinstance(c, str) and c.startswith("rgba(") and c.endswith(")"):
+            vals = [v.strip() for v in c[5:-1].split(",")]
+            if len(vals) == 4:
+                return (float(vals[0]) / 255.0, float(vals[1]) / 255.0, float(vals[2]) / 255.0, float(vals[3]))
+        return c
+
+    def _shade_pdf_groups(ax, groups, p, w0, w1):
+        for _, spans, fill in groups:
+            color = _rgba_to_mpl(fill)
+            for t0, t1 in spans:
+                if t1 < w0 or t0 > w1:
+                    continue
+                ax.axvspan(max(t0, w0) - p, min(t1, w1) - p, color=color, linewidth=0)
+
+    with PdfPages(out_pdf) as pdf:
+        for tt, local, p, label, ordinal, off, w0, w1 in pulse_pages:
+            fig_pdf, axes = plt.subplots(4, 1, figsize=(11.0, 8.5), sharex=True)
+            fig_pdf.suptitle(
+                f"{label} #{ordinal} at {p:.3f}s"
+                + (f" | offset +{(float(off) - p):.3f}s" if show_pulse_durations and off is not None and off > p else ""),
+                fontsize=11,
+            )
+            names = [ripple_y_label, sharp_y_label, up_y_label, spindle_y_label]
+            colors = ["#444444", "#8b0000", "#111111", "#cc00cc"]
+            group_sets = [swr_groups, swr_groups, up_groups, spindle_groups]
+            for i_row, (ax, yy, ylab, line_color, groups) in enumerate(zip(axes, local, names, colors, group_sets)):
+                _shade_pdf_groups(ax, groups, p, w0, w1)
+                ax.axvline(0.0, color="red", linestyle=":", linewidth=1.2)
+                if show_pulse_durations and off is not None and off > p:
+                    off_rel = min(float(off), w1) - p
+                    ax.axvspan(0.0, off_rel, color=(1.0, 0.0, 0.0, 0.08), linewidth=0)
+                    ax.axvline(off_rel, color="red", linestyle="--", linewidth=1.2)
+                ax.plot(tt, yy, color=line_color, linewidth=0.8)
+                ax.set_ylabel(ylab, fontsize=8)
+                ax.grid(True, alpha=0.18, linewidth=0.5)
+                finite = np.asarray(yy, float)
+                finite = finite[np.isfinite(finite)]
+                if finite.size:
+                    y0 = float(np.nanmin(finite))
+                    y1 = float(np.nanmax(finite))
+                    pad = max(abs(y0) * 0.1, 1.0) if y1 <= y0 else 0.08 * (y1 - y0)
+                    ax.set_ylim(y0 - pad, y1 + pad)
+            axes[-1].set_xlabel("Time from pulse onset (s)")
+            axes[-1].set_xlim(-float(pre_s), float(post_s))
+            fig_pdf.tight_layout(rect=[0, 0, 1, 0.97])
+            pdf.savefig(fig_pdf)
+            plt.close(fig_pdf)
+    print(f"[PDF] pulse QA 4-panel: {out_pdf}")
     return out_html
 
 

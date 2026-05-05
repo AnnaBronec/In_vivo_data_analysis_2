@@ -116,6 +116,10 @@ def _is_good_csv_file(p: Path, session_dir: Path) -> bool:
         return False
     if "summary" in name:   # <- wichtig für upstate_summary_ALL.csv
         return False
+    if "__" in p.stem:
+        return False
+    if name.startswith(("spectrum_", "rollup_", "group_")):
+        return False
     return True
 
 def _has_any_good_csv(p: Path) -> bool:
@@ -205,7 +209,7 @@ def _process_one_session(
 ) -> tuple[str, bool, str]:
     try:
         csv_path = Path(out_csv).expanduser().resolve() if out_csv else _default_csv_for_session(session_dir)
-        if skip_convert_if_exists and not csv_path.exists():
+        if skip_convert_if_exists and not csv_path.exists() and not (_has_xdat_pair(session_dir) or _has_neuralynx_raw(session_dir)):
             csvs = sorted([f for f in session_dir.iterdir() if _is_good_csv_file(f, session_dir)])
             preferred = [f for f in csvs if f.name == f"{session_dir.name}.csv"]
             if preferred:
@@ -270,7 +274,7 @@ def _process_one_session_subproc(
                 f"Insufficient free space before conversion: {_format_gb(free_b)} available, need >= {min_free_gb:.2f} GB"
             )
 
-        if skip_convert_if_exists and not csv_path.exists():
+        if skip_convert_if_exists and not csv_path.exists() and not (_has_xdat_pair(session_dir) or _has_neuralynx_raw(session_dir)):
             csvs = sorted([f for f in session_dir.iterdir() if _is_good_csv_file(f, session_dir)])
             preferred = [f for f in csvs if f.name == f"{session_dir.name}.csv"]
             if preferred:

@@ -11,6 +11,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
+import struct
 from scipy import stats
 from scipy import signal
 from matplotlib.colors import TwoSlopeNorm
@@ -44,6 +45,7 @@ from Exports import (
     export_interactive_two_channel_lfp_html,
     export_interactive_three_channel_lfp_html,
     export_interactive_four_channel_lfp_html,
+    export_pulse_qa_four_channel_html,
     export_interactive_swr_scan_html,
     log,
      _nan_stats,
@@ -92,7 +94,7 @@ CLUSTER_ENABLE = os.environ.get("CLUSTER_ENABLE", "0") == "1"
 AUTO_PULSE_EDGE_SHIFT = os.environ.get("AUTO_PULSE_EDGE_SHIFT", "0") == "1"
 AUTO_CLEAR_TINY_OFFSETS = os.environ.get("AUTO_CLEAR_TINY_OFFSETS", "0") == "1"
 AUTO_PULSE_ARTIFACT_ALIGN = os.environ.get("AUTO_PULSE_ARTIFACT_ALIGN", "0") == "1"
-FORCE_ONSET_ONLY_PLOTS = os.environ.get("FORCE_ONSET_ONLY_PLOTS", "1") == "1"
+FORCE_ONSET_ONLY_PLOTS = os.environ.get("FORCE_ONSET_ONLY_PLOTS", "0") == "1"
 SHOW_COMMENT_PULSE_OFFSETS = os.environ.get("SHOW_COMMENT_PULSE_OFFSETS", "1") == "1"
 IGNORE_PULSE_2 = os.environ.get("IGNORE_PULSE_2", "0") == "1"
 SPINDLE_ZERO_PHASE = os.environ.get("SPINDLE_ZERO_PHASE", "1") == "1"
@@ -234,11 +236,70 @@ DEBUG_MAIN_SAFE = os.environ.get("DEBUG_MAIN_SAFE", "0") == "1"
 PART_CSV_RE = re.compile(r"\.part\d+\.csv$", re.IGNORECASE)
 _PULSE_MS_PAT = re.compile(r"onePulse\s*([0-9]+(?:\.[0-9]+)?)\s*ms", flags=re.I)
 _ANY_MS_PAT = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*ms", flags=re.I)
+TIME_COL_NAMES = {"time", "timesamples", "timestamps", "timestamp", "t"}
+STIM_COL_NAMES = {
+    "stim", "stim_on", "stim_off",
+    "din_1", "din_2", "din1", "din2",
+    "startstop", "ttl", "di0", "di1",
+}
 
 
 def debug_log(*args, **kwargs):
     if DEBUG_MAIN_SAFE:
         print(*args, **kwargs)
+
+
+def _is_time_col_name(col):
+    return str(col).strip().lower() in TIME_COL_NAMES
+
+
+def _is_stim_col_name(col):
+    name = str(col).strip().lower()
+    return name in STIM_COL_NAMES or name.startswith(("stim_", "ttl_", "din_", "di_"))
+
+
+def _key_num(s):
+    m = re.findall(r"\d+", str(s))
+    return int(m[-1]) if m else 0
+
+
+def _lfp_channel_candidates(columns, time_col_name=None):
+    out = []
+    for col in columns:
+        if time_col_name is not None and col == time_col_name:
+            continue
+        if _is_time_col_name(col) or _is_stim_col_name(col):
+            continue
+        out.append(col)
+    return out
+
+
+def _sort_lfp_channel_cols(columns):
+    return sorted(list(columns), key=_key_num)
+
+
+def _first_ncs_timestamp_us(session_dir: Path):
+    """
+    Read the first Neuralynx CSC timestamp so NEV events can be placed on the
+    same rescaled time axis as the LFP CSV.
+    """
+    vals = []
+    for fp in (
+        sorted(session_dir.glob("*.ncs"))
+        + sorted(session_dir.glob("*.Ncs"))
+        + sorted(session_dir.glob("*.NCS"))
+    ):
+        try:
+            with open(fp, "rb") as f:
+                f.seek(16 * 1024)
+                buf = f.read(8)
+            if len(buf) == 8:
+                vals.append(int(struct.unpack("<Q", buf)[0]))
+        except Exception:
+            continue
+    if not vals:
+        return None
+    return int(np.median(np.asarray(vals, dtype=np.int64)))
 
 
 def _is_split_part_csv_name(name: str) -> bool:
@@ -421,7 +482,7 @@ def _edges_stateful_internal(t, x, thr, prev_b):
 def load_parts_to_array_streaming_with_ttl(
     base_path: str,
     ds_factor: int = 50,
-    stim_cols=("stim", "din_1", "din_2", "StartStop", "TTL", "DI0", "DI1"),
+    stim_cols=("stim", "stim_on", "stim_off", "din_1", "din_2", "StartStop", "TTL", "DI0", "DI1"),
     dtype=np.float32,
 ):
     """
@@ -488,10 +549,6 @@ def load_parts_to_array_streaming_with_ttl(
 
 
 
-    def _key_num(s):
-        m = re.findall(r"\d+", str(s))
-        return int(m[-1]) if m else 0
-
     for pf in part_files:
         df = pd.read_csv(pf, low_memory=False)
 
@@ -504,11 +561,8 @@ def load_parts_to_array_streaming_with_ttl(
             if time_col_name is None:
                 raise KeyError(f"Keine Zeitspalte in {pf.name} gefunden (erwartet: time/timesamples/timestamps)")
             stim_cols_in_file = [c for c in stim_cols if c in df.columns]
-            raw_chan_cols = [
-                c for c in df.columns
-                if c not in (time_col_name, "time", "timesamples", "timestamps", *stim_cols_in_file)
-            ]
-            chan_cols = sorted(raw_chan_cols, key=_key_num)
+            raw_chan_cols = _lfp_channel_candidates(df.columns, time_col_name=time_col_name)
+            chan_cols = _sort_lfp_channel_cols(raw_chan_cols)
 
             # Fallback wie im Non-Stream-Pfad:
             # wenn keine bekannten TTL-Spalten vorhanden sind, nimm einen quasi-binären Kanal mit den meisten Rising-Edges.
@@ -726,6 +780,7 @@ if USE_STREAM:
 
 else:
     LFP_df, chan_cols, lfp_meta = load_LFP_new(BASE_PATH, LFP_FILENAME)
+    chan_cols = _sort_lfp_channel_cols(_lfp_channel_candidates(chan_cols, time_col_name="time"))
     time_s = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
     LFP_array = LFP_df[chan_cols].to_numpy(dtype=np.float32).T
     print(f"[INFO] Non-stream load OK: time={time_s.shape}, LFP_array={LFP_array.shape}, chans={len(chan_cols)}")
@@ -871,13 +926,27 @@ if nev_path is not None and os.path.exists(nev_path):
                     break
 
         if t0_us is None:
-            # Fallback: verankere NEV an der **vollen** LFP-Zeitbasis (vor Crop/DS),
-            # nicht an time_s (bereits beschnitten). So vermeiden wir späte Pulse.
-            try:
-                t_ref = float(time_full[0]) if 'time_full' in locals() else float(time_s[0])
-            except Exception:
-                t_ref = float(time_s[0])
-            t0_us = int(ts_us[0] - t_ref * 1e6)
+            # Anchor NEV events to the NCS/CSC start timestamp, matching
+            # neuralynx_rawio_to_csv.py. The old ref0->time_start fallback added
+            # the LFP start offset again and shifted HTML pulse markers right.
+            ncs_t0_us = _first_ncs_timestamp_us(Path(BASE_PATH))
+            if ncs_t0_us is not None:
+                try:
+                    t_ref = float(time_full[0]) if 'time_full' in locals() else float(time_s[0])
+                except Exception:
+                    t_ref = float(time_s[0])
+                t0_us = int(float(ncs_t0_us) - t_ref * 1e6)
+                print(f"[NEV][T0] using NCS start timestamp: {ncs_t0_us} (time_ref={t_ref:.6f}s)")
+            else:
+                # Last-resort fallback for sessions where raw NCS files are not
+                # available. Keep the previous behavior only when we cannot infer
+                # the shared Neuralynx timebase.
+                try:
+                    t_ref = float(time_full[0]) if 'time_full' in locals() else float(time_s[0])
+                except Exception:
+                    t_ref = float(time_s[0])
+                t0_us = int(ts_us[0] - t_ref * 1e6)
+                print("[NEV][T0][WARN] NCS start timestamp missing; using legacy fallback")
 
         pulse_times_1_full     = (on_us  - t0_us) / 1e6
         pulse_times_1_off_full = (off_us - t0_us) / 1e6
@@ -913,7 +982,7 @@ if LFP_df is not None:
     # alter Weg: wir haben ein DataFrame aus einer einzelnen CSV
     time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
 
-    chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
+    chan_cols_raw = _lfp_channel_candidates(LFP_df.columns, time_col_name="time")
     
     LFP_df_ds = pd.DataFrame({"timesamples": time_full})
     for i, col in enumerate(chan_cols):
@@ -964,13 +1033,25 @@ else:
 
         time_full = pd.to_numeric(LFP_df["time"], errors="coerce").to_numpy(dtype=float)
 
+        def _edge_threshold_from_values(x):
+            x = np.asarray(x, dtype=float)
+            x = x[np.isfinite(x)]
+            if x.size == 0:
+                return 0.0
+            vals = np.unique(np.round(x, 6))
+            if vals.size >= 2 and vals.size <= 8:
+                return float((np.nanmin(vals) + np.nanmax(vals)) * 0.5)
+            lo, hi = np.nanpercentile(x, [10, 90])
+            if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                return float((np.nanmin(x) + np.nanmax(x)) * 0.5)
+            return float((lo + hi) * 0.5)
+
         def _edges_from_col(col, rising_only=True, thr=None):
             x = pd.to_numeric(LFP_df[col], errors="coerce").to_numpy(dtype=float)
             if not np.isfinite(x).any():
                 return np.array([], dtype=float)
             if thr is None:
-                lo, hi = np.nanpercentile(x, [10, 90])
-                thr = (lo + hi) * 0.5
+                thr = _edge_threshold_from_values(x)
             b = (x > thr).astype(np.int8)
             idx = (np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1) if rising_only \
                   else (np.flatnonzero(b[1:] != b[:-1]) + 1)
@@ -983,8 +1064,7 @@ else:
                 return np.array([], float), np.array([], float)
 
             if thr is None:
-                lo, hi = np.nanpercentile(x, [10, 90])
-                thr = (lo + hi) * 0.5
+                thr = _edge_threshold_from_values(x)
 
             b = (x > thr).astype(np.int8)
             rising_idx  = np.flatnonzero((b[1:] == 1) & (b[:-1] == 0)) + 1
@@ -1066,6 +1146,11 @@ debug_log("[PULSE SOURCE CHECK] HAVE_NEV =", (pulse_times_1_full is not None and
           "| p1_on =", 0 if pulse_times_1_full is None else len(pulse_times_1_full),
           "| p1_off =", 0 if pulse_times_1_off_full is None else len(pulse_times_1_off_full))
 
+html_pulse_times_1_full_src = np.asarray(pulse_times_1_full, dtype=float).copy()
+html_pulse_times_1_off_full_src = np.asarray(pulse_times_1_off_full, dtype=float).copy()
+html_pulse_times_2_full_src = np.asarray(pulse_times_2_full, dtype=float).copy()
+html_pulse_times_2_off_full_src = np.asarray(pulse_times_2_off_full, dtype=float).copy()
+
 
 # --- HARD GUARANTEE: if we detected a stim column, compute OFF too ---
 if (pulse_times_1_full is not None and len(pulse_times_1_full) > 0):
@@ -1089,16 +1174,15 @@ if (pulse_times_1_full is not None and len(pulse_times_1_full) > 0):
                 pulse_times_1_off_full = t_off
                 print(f"[FORCE-OFF] from '{stim_col_used}': on={len(t_on)} off={len(t_off)}")
 
+html_pulse_times_1_full_src = np.asarray(pulse_times_1_full, dtype=float).copy()
+html_pulse_times_1_off_full_src = np.asarray(pulse_times_1_off_full, dtype=float).copy()
+html_pulse_times_2_full_src = np.asarray(pulse_times_2_full, dtype=float).copy()
+html_pulse_times_2_off_full_src = np.asarray(pulse_times_2_off_full, dtype=float).copy()
+
 
 if not FROM_STREAM:
-    chan_cols_raw = [c for c in LFP_df.columns if c not in ("time","stim","din_1","din_2")]
-    # 2) Numerische Schlüssel aus Spaltennamen ziehen (z.B. "CSC10_values" -> 10, "8" -> 8)
-    def _key_num(s):
-        import re
-        m = re.findall(r"\d+", s)
-        return int(m[-1]) if m else 0
-
-    # 3) Sortierte Reihenfolge (flach -> tief). Wenn du tief->flach willst: am Ende [::-1].
+    chan_cols_raw = _lfp_channel_candidates(LFP_df.columns, time_col_name="time")
+    # Sortierte Reihenfolge (flach -> tief). Wenn du tief->flach willst: am Ende [::-1].
     order_idx = sorted(range(len(chan_cols_raw)), key=lambda i: _key_num(chan_cols_raw[i]))
     FLIP_DEPTH = False   # <- bei Bedarf flippen
     if FLIP_DEPTH:
@@ -1804,8 +1888,6 @@ try:
                 pulse_times_1_off = _clip_events_to_bounds(_shift_times(pulse_times_1_off, best_shift), time_s, align_pre_s, align_post_s)
                 pulse_times_1_full = _shift_times(pulse_times_1_full, best_shift)
                 pulse_times_1_off_full = _shift_times(pulse_times_1_off_full, best_shift)
-                pulse_times_1_html = _shift_times(pulse_times_1_html, best_shift)
-                pulse_times_1_off_html = _shift_times(pulse_times_1_off_html, best_shift)
                 Up = best_up
 
         # Always-on lightweight sanity check:
@@ -1842,8 +1924,6 @@ try:
                         pulse_times_1_off = po_try
                         pulse_times_1_full = _shift_times(pulse_times_1_full, -sh)
                         pulse_times_1_off_full = _shift_times(pulse_times_1_off_full, -sh)
-                        pulse_times_1_html = _shift_times(pulse_times_1_html, -sh)
-                        pulse_times_1_off_html = _shift_times(pulse_times_1_off_html, -sh)
                         Up = up_try
     except Exception as _e_shift:
         print(f"[PULSE-EDGE][WARN] auto-shift skipped: {_e_shift}")
@@ -3408,10 +3488,10 @@ debug_log("[DBG before pair] off head:",
 
 
 # --- HTML pulses must be in SECONDS and within plotted time range ---
-pulse_times_1_html     = _ensure_seconds(pulse_times_1_full,     time_s, DEFAULT_FS_XDAT)
-pulse_times_1_off_html = _ensure_seconds(pulse_times_1_off_full, time_s, DEFAULT_FS_XDAT)
-pulse_times_2_html     = _ensure_seconds(pulse_times_2_full,     time_s, DEFAULT_FS_XDAT)
-pulse_times_2_off_html = _ensure_seconds(pulse_times_2_off_full, time_s, DEFAULT_FS_XDAT)
+pulse_times_1_html     = _ensure_seconds(html_pulse_times_1_full_src,     time_s, DEFAULT_FS_XDAT)
+pulse_times_1_off_html = _ensure_seconds(html_pulse_times_1_off_full_src, time_s, DEFAULT_FS_XDAT)
+pulse_times_2_html     = _ensure_seconds(html_pulse_times_2_full_src,     time_s, DEFAULT_FS_XDAT)
+pulse_times_2_off_html = _ensure_seconds(html_pulse_times_2_off_full_src, time_s, DEFAULT_FS_XDAT)
 
 # Safety guard: ensure Pulse 2 is really absent in HTML exports when disabled.
 if IGNORE_PULSE_2:
@@ -3842,6 +3922,8 @@ try:
     up_bp_10_15_plot = _bandpass_1d(
         up_plot, dt, f_lo=10.0, f_hi=15.0, order=3, causal=(not SPINDLE_ZERO_PHASE)
     )
+    html_filter_trace_shifts_s = [0.0, 0.0, 0.0, 0.0]
+    print("[HTML-ALIGN] trace shifts disabled: all HTML traces use the original time_s axis")
     if int(up_ch_idx) != int(ch_idx_used):
         print(
             f"[WARN] UP intervals are from main channel pri_{int(ch_idx_used)}; "
@@ -3992,12 +4074,80 @@ try:
         y_range_mid=html_y_range,
         y_range_bottom=None,
         show_pulse_intervals=(not PULSE_ONSET_ONLY),
+        trace_time_shifts_s=html_filter_trace_shifts_s,
     )
+
 except Exception as e:
     if "SWR disabled by channel policy" in str(e):
-        print("[INFO] 3-panel HTML export skipped: SWR disabled in single-electrode mode.")
+        print("[INFO] 4-panel HTML exports skipped: SWR disabled in single-electrode mode.")
     else:
         print(f"[WARN] 3-panel HTML export skipped: {e}")
+
+try:
+    pulse_qa_enabled = str(os.environ.get("PULSE_QA_4P_ENABLE", "1")).strip().lower() not in ("0", "false", "no", "off")
+    pulse_qa_scope = globals()
+    pulse_qa_required = (
+        "swr_ch_idx", "up_ch_idx", "swr_bp_plot", "swr_sw_plot",
+        "up_plot", "up_bp_10_15_plot",
+        "pulse_times_1_html", "pulse_times_2_html_export",
+        "pulse_times_1_off_html_plot", "pulse_times_2_off_html_export",
+        "SWR_Ripple_Spont_UP", "SWR_Ripple_Spont_DOWN",
+        "SWR_Ripple_Trig_UP", "SWR_Ripple_Trig_DOWN",
+        "SWR_Ripple_Assoc_UP", "SWR_Ripple_Assoc_DOWN",
+        "UP_Sp_Spont_UP", "UP_Sp_Spont_DOWN",
+        "UP_Sp_Trig_UP", "UP_Sp_Trig_DOWN",
+        "UP_Sp_Assoc_UP", "UP_Sp_Assoc_DOWN",
+    )
+    if pulse_qa_enabled and all(name in pulse_qa_scope for name in pulse_qa_required):
+        export_pulse_qa_four_channel_html(
+            f"{BASE_TAG}__ch{swr_ch_idx}_ripple_sharpwave_ch{up_ch_idx}_up_spindle",
+            SAVE_DIR,
+            time_s,
+            swr_bp_plot,
+            swr_sw_plot,
+            up_plot,
+            up_bp_10_15_plot,
+            pulse_times_1=pulse_times_1_html,
+            pulse_times_2=pulse_times_2_html_export,
+            pulse_times_1_off=pulse_times_1_off_html_plot,
+            pulse_times_2_off=pulse_times_2_off_html_export,
+            swr_spont=(SWR_Ripple_Spont_UP, SWR_Ripple_Spont_DOWN),
+            swr_trig=(SWR_Ripple_Trig_UP, SWR_Ripple_Trig_DOWN),
+            swr_assoc=(SWR_Ripple_Assoc_UP, SWR_Ripple_Assoc_DOWN),
+            up_spont=(Spontaneous_UP, Spontaneous_DOWN),
+            up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
+            up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
+            spindle_spont=(UP_Sp_Spont_UP, UP_Sp_Spont_DOWN),
+            spindle_trig=(UP_Sp_Trig_UP, UP_Sp_Trig_DOWN),
+            spindle_assoc=(UP_Sp_Assoc_UP, UP_Sp_Assoc_DOWN),
+            pre_s=float(os.environ.get("PULSE_QA_4P_PRE_S", "0.25")),
+            post_s=float(os.environ.get("PULSE_QA_4P_POST_S", "0.75")),
+            max_pulses=int(os.environ.get("PULSE_QA_4P_MAX_PULSES", "0")),
+            max_points_per_panel=int(os.environ.get("PULSE_QA_4P_MAX_POINTS_PER_PANEL", "2500")),
+            require_full_window=str(os.environ.get("PULSE_QA_4P_REQUIRE_FULL_WINDOW", "1")).strip().lower() not in ("0", "false", "no", "off"),
+            title=(
+                f"{BASE_TAG} pulse QA -- ch{swr_ch_idx} ripple/sharp-wave | "
+                f"ch{up_ch_idx} UP/spindle"
+            ),
+            ripple_name=f"pri_{swr_ch_idx} ripple {swr_f_lo:g}-{swr_f_hi:g} Hz",
+            sharp_name=f"pri_{swr_ch_idx} sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz",
+            up_name=f"pri_{up_ch_idx} UP/LFP",
+            spindle_name=f"pri_{up_ch_idx} spindle 10-15 Hz",
+            ripple_y_label=(f"ch{swr_ch_idx} ripple (uV)" if HTML_IN_uV else f"ch{swr_ch_idx} ripple ({UNIT_LABEL})"),
+            sharp_y_label=(f"ch{swr_ch_idx} sharp-wave (uV)" if HTML_IN_uV else f"ch{swr_ch_idx} sharp-wave ({UNIT_LABEL})"),
+            up_y_label=(f"ch{up_ch_idx} LFP (uV)" if HTML_IN_uV else f"ch{up_ch_idx} LFP ({UNIT_LABEL})"),
+            spindle_y_label=(f"ch{up_ch_idx} spindle (uV)" if HTML_IN_uV else f"ch{up_ch_idx} spindle ({UNIT_LABEL})"),
+            show_pulse_durations=bool(
+                (pulse_times_1_off_html_plot is not None and len(pulse_times_1_off_html_plot)) or
+                (pulse_times_2_off_html_export is not None and len(pulse_times_2_off_html_export))
+            ),
+            trace_time_shifts_s=html_filter_trace_shifts_s,
+        )
+    elif pulse_qa_enabled:
+        missing = [name for name in pulse_qa_required if name not in pulse_qa_scope]
+        print(f"[INFO] pulse QA 4-panel skipped: missing prerequisites {missing}")
+except Exception as e:
+    print(f"[WARN] pulse QA 4-panel export skipped: {e}")
 
 # Zusatz-HTML: zwei "gute" Channels übereinander (ohne Spindle)
 try:
