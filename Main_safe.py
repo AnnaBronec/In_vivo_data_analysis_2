@@ -98,6 +98,7 @@ FORCE_ONSET_ONLY_PLOTS = os.environ.get("FORCE_ONSET_ONLY_PLOTS", "0") == "1"
 SHOW_COMMENT_PULSE_OFFSETS = os.environ.get("SHOW_COMMENT_PULSE_OFFSETS", "1") == "1"
 IGNORE_PULSE_2 = os.environ.get("IGNORE_PULSE_2", "0") == "1"
 SPINDLE_ZERO_PHASE = os.environ.get("SPINDLE_ZERO_PHASE", "1") == "1"
+ENABLE_SVG_OUTPUT = str(os.environ.get("ENABLE_SVG_OUTPUT", "0")).strip().lower() not in ("0", "false", "no", "off")
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
 
@@ -1333,15 +1334,6 @@ print(f"[DS] time {time_s[0]:.3f}->{time_s[-1]:.3f}s, N={len(time_s)}, dt={dt:.6
       f"LFP_array={LFP_array.shape}, p1={len(pulse_times_1)}, p2={len(pulse_times_2)}")
 
 
-
-# Kanalnamen ableiten 
-ch_names_for_plot = [f"pri_{i}" for i in range(LFP_array.shape[0])]
-svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_STACKED.svg")
-
-
-
-
-
 # safety normalize (nur falls irgendwas noch samples war)
 pulse_times_1 = _ensure_seconds(pulse_times_1, time_s, DEFAULT_FS_XDAT)
 pulse_times_2 = _ensure_seconds(pulse_times_2, time_s, DEFAULT_FS_XDAT)
@@ -2298,18 +2290,19 @@ amp_df.to_csv(amp_csv_path, index=False)
 print(f"[CSV] UP-Amplituden geschrieben: {amp_csv_path}  (spont={len(spont_amp)}, trig={len(trig_amp)})")
 
 
-# --- separate SVG mit dem Amplitudenvergleich ---
-amp_svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_amplitude_compare.svg")
-fig_amp, ax_amp = plt.subplots(figsize=(6.5, 3.4))
-upstate_amplitude_compare_ax(
-    spont_amp, trig_amp, ax=ax_amp,
-    title="UP Amplitude (max-min, mean): Spontan vs. Getriggert"
-)
-fig_amp.tight_layout()
-fig_amp.savefig(amp_svg_path, format="svg", bbox_inches="tight")
-plt.close(fig_amp)
-print("[SVG] amplitude compare:", amp_svg_path)
-del fig_amp
+if ENABLE_SVG_OUTPUT:
+    # --- separate SVG mit dem Amplitudenvergleich ---
+    amp_svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_amplitude_compare.svg")
+    fig_amp, ax_amp = plt.subplots(figsize=(6.5, 3.4))
+    upstate_amplitude_compare_ax(
+        spont_amp, trig_amp, ax=ax_amp,
+        title="UP Amplitude (max-min, mean): Spontan vs. Getriggert"
+    )
+    fig_amp.tight_layout()
+    fig_amp.savefig(amp_svg_path, format="svg", bbox_inches="tight")
+    plt.close(fig_amp)
+    print("[SVG] amplitude compare:", amp_svg_path)
+    del fig_amp
 
 
 def _pair_up_down_indices(up_idx, down_idx, n_time):
@@ -2580,10 +2573,13 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
 
     sw_lo = float(os.environ.get("SWR_SW_F_LO_HZ", "2.0"))
     sw_hi = float(os.environ.get("SWR_SW_F_HI_HZ", "40.0"))
-    sw_pad_s = float(os.environ.get("SWR_SW_PAD_S", "0.030"))
-    sw_amp_sigma = float(os.environ.get("SWR_SW_MIN_AMP_SIGMA", "1.0"))
-    sw_ptp_sigma = float(os.environ.get("SWR_SW_MIN_PTP_SIGMA", "2.0"))
-    sw_slope_sigma = float(os.environ.get("SWR_SW_MIN_SLOPE_SIGMA", "1.0"))
+    sw_pad_s = float(os.environ.get("SWR_SW_PAD_S", "0.080"))
+    sw_amp_sigma = float(os.environ.get("SWR_SW_MIN_AMP_SIGMA", "2.5"))
+    sw_ptp_sigma = float(os.environ.get("SWR_SW_MIN_PTP_SIGMA", "4.5"))
+    sw_slope_sigma = float(os.environ.get("SWR_SW_MIN_SLOPE_SIGMA", "0.8"))
+    sw_prom_sigma = float(os.environ.get("SWR_SW_MIN_PROM_SIGMA", "3.0"))
+    sw_min_width_s = float(os.environ.get("SWR_SW_MIN_WIDTH_S", "0.012"))
+    sw_max_width_s = float(os.environ.get("SWR_SW_MAX_WIDTH_S", "0.120"))
     sw_min_abs_amp = float(os.environ.get("SWR_SW_MIN_ABS_AMP", "0.0"))
     sw_center_tol_s = float(os.environ.get("SWR_SW_CENTER_TOL_S", "0.040"))
     sw_polarity = str(os.environ.get("SWR_SW_POLARITY", "auto")).strip().lower()  # auto|negative|positive|both
@@ -2591,6 +2587,8 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     sw_min_overlap_s = float(os.environ.get("SWR_SW_MIN_OVERLAP_S", "0.006"))
     sw_overlap_pad_s = float(os.environ.get("SWR_SW_OVERLAP_PAD_S", "0.000"))
     sw_require_center = str(os.environ.get("SWR_SW_REQUIRE_CENTER", "0")).strip().lower() not in ("0", "false", "no", "off")
+    return_combined_interval = str(os.environ.get("SWR_RETURN_COMBINED_INTERVAL", "1")).strip().lower() not in ("0", "false", "no", "off")
+    combined_pad_n = max(0, int(round(float(os.environ.get("SWR_COMBINED_PAD_S", "0.015")) / float(dt))))
 
     sw_band = _bandpass_1d(x, dt, f_lo=sw_lo, f_hi=sw_hi, order=3, causal=bool(causal_filter))
     sw_band = np.asarray(sw_band, float)
@@ -2601,6 +2599,7 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     if sw_min_abs_amp > 0:
         amp_thr = max(amp_thr, sw_min_abs_amp)
     ptp_thr = max(sw_ptp_sigma * sw_sigma, 1e-12)
+    prom_thr = max(sw_prom_sigma * sw_sigma, 1e-12)
     sw_d = np.diff(sw_band) / float(dt)
     sw_d_med = float(np.nanmedian(sw_d)) if sw_d.size else 0.0
     sw_d_mad = float(np.nanmedian(np.abs(sw_d - sw_d_med))) if sw_d.size else 0.0
@@ -2615,6 +2614,7 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     n_pass_slope = 0
     n_pass_overlap = 0
     n_pass_center = 0
+    n_pass_prom_width = 0
     for t0, t1 in ripple_candidates:
         if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
             continue
@@ -2648,19 +2648,51 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
         if sw_polarity == "negative":
             pol_ok = neg_ok
             sw_idx = a + i_min
+            sw_rel_idx = i_min
+            prom_trace = -seg
         elif sw_polarity == "positive":
             pol_ok = pos_ok
             sw_idx = a + i_max
+            sw_rel_idx = i_max
+            prom_trace = seg
         elif sw_polarity == "both":
             pol_ok = neg_ok and pos_ok
             sw_idx = a + i_min if abs(v_min) >= abs(v_max) else a + i_max
+            sw_rel_idx = i_min if abs(v_min) >= abs(v_max) else i_max
+            prom_trace = -seg if abs(v_min) >= abs(v_max) else seg
         else:
             pol_ok = neg_ok or pos_ok
             sw_idx = a + i_min if abs(v_min) >= abs(v_max) else a + i_max
+            sw_rel_idx = i_min if abs(v_min) >= abs(v_max) else i_max
+            prom_trace = -seg if abs(v_min) >= abs(v_max) else seg
 
         if not pol_ok or not ptp_ok:
             continue
         n_pass_amp_ptp += 1
+        prom_ok = True
+        width_ok = True
+        width_left_idx = sw_rel_idx
+        width_right_idx = sw_rel_idx
+        if prom_thr > 0 or sw_min_width_s > 0 or sw_max_width_s > 0:
+            try:
+                prom = float(signal.peak_prominences(prom_trace, [int(sw_rel_idx)])[0][0])
+                width_res = signal.peak_widths(prom_trace, [int(sw_rel_idx)], rel_height=0.5)
+                width_samples = float(width_res[0][0])
+                width_left_idx = int(np.floor(float(width_res[2][0])))
+                width_right_idx = int(np.ceil(float(width_res[3][0])))
+                width_s = width_samples * float(dt)
+                prom_ok = bool(prom >= prom_thr)
+                width_ok = bool(
+                    (float(sw_min_width_s) <= 0 or width_s >= float(sw_min_width_s))
+                    and
+                    (float(sw_max_width_s) <= 0 or width_s <= float(sw_max_width_s))
+                )
+            except Exception:
+                prom_ok = False
+                width_ok = False
+        if not (prom_ok and width_ok):
+            continue
+        n_pass_prom_width += 1
         if not slope_ok:
             continue
         n_pass_slope += 1
@@ -2690,7 +2722,17 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
             if not center_ok:
                 continue
         n_pass_center += 1
-        out.append((float(t0), float(t1)))
+        if return_combined_interval:
+            sw_left = max(a, a + int(width_left_idx) - combined_pad_n)
+            sw_right = min(b, a + int(width_right_idx) + combined_pad_n + 1)
+            out_s = max(0, min(s, sw_left))
+            out_e = min(t.size, max(e, sw_right))
+            if out_e <= out_s:
+                out.append((float(t0), float(t1)))
+            else:
+                out.append((float(t[out_s]), float(t[out_e - 1])))
+        else:
+            out.append((float(t0), float(t1)))
 
     if DEBUG_MAIN_SAFE:
         print(
@@ -2698,11 +2740,14 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
             f"cand={len(ripple_candidates)} keep={len(out)} "
             f"sw_band={sw_lo:.1f}-{sw_hi:.1f}Hz "
             f"amp_sigma={sw_amp_sigma:.2f} ptp_sigma={sw_ptp_sigma:.2f} "
+            f"prom_sigma={sw_prom_sigma:.2f} "
+            f"width_s={sw_min_width_s:.4f}-{sw_max_width_s:.4f} "
             f"slope_sigma={sw_slope_sigma:.2f} min_abs_amp={sw_min_abs_amp:.4g} "
             f"pol={sw_polarity} require_overlap={int(sw_require_overlap)} "
+            f"return_combined_interval={int(return_combined_interval)} "
             f"min_overlap_s={sw_min_overlap_s:.4f} overlap_pad_s={sw_overlap_pad_s:.4f} "
             f"require_center={int(sw_require_center)} center_tol_s={sw_center_tol_s:.3f} "
-            f"pass_amp_ptp={n_pass_amp_ptp} pass_slope={n_pass_slope} "
+            f"pass_amp_ptp={n_pass_amp_ptp} pass_prom_width={n_pass_prom_width} pass_slope={n_pass_slope} "
             f"pass_overlap={n_pass_overlap} pass_center={n_pass_center}"
         )
     return out
@@ -2728,6 +2773,221 @@ def _bandpass_1d(signal_1d, dt, f_lo=10.0, f_hi=15.0, order=3, causal=True):
     except Exception as e:
         print(f"[WARN] bandpass {f_lo}-{f_hi} Hz failed: {e}")
         return x.copy()
+
+
+def _filter_swr_by_up_relative_sharpwave_amp(
+    swr_intervals_s,
+    swr_signal_1d,
+    up_signal_1d,
+    time_s,
+    up_intervals_s,
+    dt,
+    *,
+    sw_f_lo=2.0,
+    sw_f_hi=40.0,
+    sw_pad_s=0.080,
+    match_pre_s=-0.05,
+    match_post_s=0.70,
+    min_ratio=0.35,
+    min_sw_ptp_abs=0.0,
+    require_up=False,
+    causal_filter=True,
+    label="SWR-UP-RATIO",
+):
+    intervals = [
+        (float(t0), float(t1))
+        for t0, t1 in (swr_intervals_s or [])
+        if np.isfinite(t0) and np.isfinite(t1) and float(t1) > float(t0)
+    ]
+    if not intervals or float(min_ratio) <= 0:
+        return intervals
+
+    t = np.asarray(time_s, float).reshape(-1)
+    swr_sig = np.asarray(swr_signal_1d, float).reshape(-1)
+    up_sig = np.asarray(up_signal_1d, float).reshape(-1)
+    if t.size < 2 or swr_sig.size != t.size or up_sig.size != t.size or dt <= 0:
+        return intervals
+
+    ups = [
+        (float(u0), float(u1))
+        for u0, u1 in (up_intervals_s or [])
+        if np.isfinite(u0) and np.isfinite(u1) and float(u1) > float(u0)
+    ]
+    if not ups:
+        return [] if require_up else intervals
+
+    sw_band = _bandpass_1d(
+        swr_sig,
+        dt,
+        f_lo=float(sw_f_lo),
+        f_hi=float(sw_f_hi),
+        order=3,
+        causal=bool(causal_filter),
+    )
+    pad_n = max(0, int(round(float(sw_pad_s) / float(dt))))
+    kept = []
+    rejected_ratio = 0
+    rejected_abs = 0
+    rejected_no_up = 0
+
+    for t0, t1 in intervals:
+        q0 = t0 + float(match_pre_s)
+        q1 = t0 + float(match_post_s)
+        best_up = None
+        best_overlap = -1.0
+        for u0, u1 in ups:
+            overlap = max(0.0, min(q1, u1) - max(q0, u0))
+            onset_in = q0 <= u0 <= q1
+            swr_overlap = max(0.0, min(t1, u1) - max(t0, u0))
+            score = overlap + swr_overlap + (1e-6 if onset_in else 0.0)
+            if score > best_overlap and (overlap > 0 or onset_in or swr_overlap > 0):
+                best_overlap = score
+                best_up = (u0, u1)
+
+        if best_up is None:
+            if require_up:
+                rejected_no_up += 1
+                continue
+            kept.append((t0, t1))
+            continue
+
+        s = int(np.searchsorted(t, t0, side="left"))
+        e = int(np.searchsorted(t, t1, side="right"))
+        s = max(0, min(s, t.size - 1))
+        e = max(s + 1, min(e, t.size))
+        a = max(0, s - pad_n)
+        b = min(t.size, e + pad_n)
+        sw_seg = np.asarray(sw_band[a:b], float)
+
+        u0, u1 = best_up
+        us = int(np.searchsorted(t, u0, side="left"))
+        ue = int(np.searchsorted(t, u1, side="right"))
+        us = max(0, min(us, t.size - 1))
+        ue = max(us + 1, min(ue, t.size))
+        up_seg = np.asarray(up_sig[us:ue], float)
+
+        if sw_seg.size == 0 or up_seg.size == 0:
+            kept.append((t0, t1))
+            continue
+        sw_ptp = float(np.nanmax(sw_seg) - np.nanmin(sw_seg))
+        up_ptp = float(np.nanmax(up_seg) - np.nanmin(up_seg))
+        if not (np.isfinite(sw_ptp) and np.isfinite(up_ptp)) or up_ptp <= 0:
+            kept.append((t0, t1))
+            continue
+
+        if float(min_sw_ptp_abs) > 0 and sw_ptp < float(min_sw_ptp_abs):
+            rejected_abs += 1
+            continue
+
+        if sw_ptp >= float(min_ratio) * up_ptp:
+            kept.append((t0, t1))
+        else:
+            rejected_ratio += 1
+
+    print(
+        f"[{label}] kept={len(kept)}/{len(intervals)} "
+        f"min_sw_ptp_over_up_ptp={float(min_ratio):.3f} "
+        f"min_sw_ptp_abs={float(min_sw_ptp_abs):.3f} "
+        f"rejected_abs={rejected_abs} rejected_ratio={rejected_ratio} rejected_no_up={rejected_no_up}"
+    )
+    return kept
+
+
+def _classify_swr_by_best_sharpwave_per_pulse(
+    swr_intervals_s,
+    pulse_times_s,
+    swr_signal_1d,
+    time_s,
+    dt,
+    *,
+    trig_win_s=0.50,
+    min_lat_s=0.0,
+    sw_f_lo=2.0,
+    sw_f_hi=40.0,
+    sw_pad_s=0.080,
+    causal_filter=True,
+):
+    intervals = [
+        (float(t0), float(t1))
+        for t0, t1 in (swr_intervals_s or [])
+        if np.isfinite(t0) and np.isfinite(t1) and float(t1) > float(t0)
+    ]
+    pulses = np.asarray(pulse_times_s, float) if pulse_times_s is not None else np.array([], float)
+    pulses = pulses[np.isfinite(pulses)]
+    pulses.sort()
+    if not intervals:
+        return [], [], np.array([], dtype=float)
+    if pulses.size == 0:
+        return intervals, [], np.array([], dtype=float)
+
+    t = np.asarray(time_s, float).reshape(-1)
+    sig = np.asarray(swr_signal_1d, float).reshape(-1)
+    if t.size < 2 or sig.size != t.size or dt <= 0:
+        return _classify_spindles_by_pulse_latency(
+            intervals,
+            pulses,
+            trig_win_s=trig_win_s,
+            min_lat_s=min_lat_s,
+            followup_trig_gap_s=0.0,
+            one_triggered_per_pulse=True,
+        )
+
+    sw_band = _bandpass_1d(
+        sig,
+        dt,
+        f_lo=float(sw_f_lo),
+        f_hi=float(sw_f_hi),
+        order=3,
+        causal=bool(causal_filter),
+    )
+    pad_n = max(0, int(round(float(sw_pad_s) / float(dt))))
+
+    by_pulse = {}
+    unmatched = []
+    event_meta = []
+    for idx, (t0, t1) in enumerate(intervals):
+        j = int(np.searchsorted(pulses, t0, side="right")) - 1
+        if j < 0:
+            unmatched.append(idx)
+            continue
+        lat = float(t0 - pulses[j])
+        if not (float(min_lat_s) <= lat <= float(trig_win_s)):
+            unmatched.append(idx)
+            continue
+
+        s = int(np.searchsorted(t, t0, side="left"))
+        e = int(np.searchsorted(t, t1, side="right"))
+        s = max(0, min(s, t.size - 1))
+        e = max(s + 1, min(e, t.size))
+        a = max(0, s - pad_n)
+        b = min(t.size, e + pad_n)
+        seg = np.asarray(sw_band[a:b], float)
+        score = float(np.nanmax(seg) - np.nanmin(seg)) if seg.size else 0.0
+        event_meta.append((idx, j, lat, score))
+        if j not in by_pulse or score > by_pulse[j][2]:
+            by_pulse[j] = (idx, lat, score)
+
+    triggered_idx = {idx for idx, _, _ in by_pulse.values()}
+    triggered = []
+    trig_lat = []
+    spontaneous = []
+    for idx, interval in enumerate(intervals):
+        if idx in triggered_idx:
+            triggered.append(interval)
+            lat = next((lat for i0, _, lat, _ in event_meta if i0 == idx), np.nan)
+            trig_lat.append(float(lat))
+        else:
+            spontaneous.append(interval)
+
+    if DEBUG_MAIN_SAFE:
+        print(
+            "[SWR-BEST-PER-PULSE]",
+            f"events={len(intervals)}",
+            f"triggered={len(triggered)}",
+            f"pulses_with_swr={len(triggered_idx)}",
+            f"trig_win_s={float(trig_win_s):.3f}",
+        )
+    return spontaneous, triggered, np.asarray(trig_lat, dtype=float)
 
 
 def _pair_idx_to_time_intervals(idx_pairs, time_s):
@@ -2772,6 +3032,7 @@ def _classify_spindles_by_pulse_latency(
     trig_win_s=1.0,
     min_lat_s=0.0,
     followup_trig_gap_s=0.35,
+    one_triggered_per_pulse=False,
 ):
     pulses = np.asarray(pulse_times_s, float) if pulse_times_s is not None else np.array([], float)
     pulses = pulses[np.isfinite(pulses)]
@@ -2781,6 +3042,7 @@ def _classify_spindles_by_pulse_latency(
     trig = []
     trig_latencies = []
     last_triggered_end = None
+    used_pulse_idx = set()
 
     for t0, t1 in spindle_intervals_s:
         if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
@@ -2789,6 +3051,8 @@ def _classify_spindles_by_pulse_latency(
         # Cascade rule: if a spindle starts shortly after a triggered spindle ended,
         # keep it in the triggered class instead of reclassifying it as spontaneous.
         if (
+            not bool(one_triggered_per_pulse)
+            and
             last_triggered_end is not None
             and float(followup_trig_gap_s) > 0
             and float(t0) >= float(last_triggered_end)
@@ -2811,9 +3075,13 @@ def _classify_spindles_by_pulse_latency(
 
         lat = float(t0 - pulses[j])
         if float(min_lat_s) <= lat <= float(trig_win_s):
+            if bool(one_triggered_per_pulse) and j in used_pulse_idx:
+                spont.append((float(t0), float(t1)))
+                continue
             trig.append((float(t0), float(t1)))
             trig_latencies.append(lat)
             last_triggered_end = float(t1)
+            used_pulse_idx.add(j)
         else:
             spont.append((float(t0), float(t1)))
 
@@ -2885,7 +3153,30 @@ def _classify_spindles_by_pulse_peak_latency(
     return spont, trig, np.asarray(trig_latencies, float), np.asarray(peak_times, float)
 
 
-def _classify_spindles_by_up_type(spindle_intervals_s, spont_up_s, trig_up_s, assoc_up_s):
+def _pulse_latency_in_window(event_t_s, pulse_times_s, *, min_lat_s=0.0, trig_win_s=1.0):
+    pulses = np.asarray(pulse_times_s, float) if pulse_times_s is not None else np.array([], float)
+    pulses = pulses[np.isfinite(pulses)]
+    if pulses.size == 0 or not np.isfinite(event_t_s):
+        return False, np.nan
+    pulses.sort()
+    j = int(np.searchsorted(pulses, float(event_t_s), side="right")) - 1
+    if j < 0:
+        return False, np.nan
+    lat = float(event_t_s) - float(pulses[j])
+    ok = float(min_lat_s) <= lat <= float(trig_win_s)
+    return bool(ok), lat
+
+
+def _classify_spindles_by_up_type(
+    spindle_intervals_s,
+    spont_up_s,
+    trig_up_s,
+    assoc_up_s,
+    *,
+    pulse_times_s=None,
+    trig_win_s=1.0,
+    min_lat_s=0.0,
+):
     spont = []
     trig = []
     assoc = []
@@ -2896,9 +3187,17 @@ def _classify_spindles_by_up_type(spindle_intervals_s, spont_up_s, trig_up_s, as
         hit_assoc = any(_intervals_overlap(t0, t1, a0, a1) for a0, a1 in assoc_up_s)
         hit_trig = any(_intervals_overlap(t0, t1, a0, a1) for a0, a1 in trig_up_s)
         hit_sp = any(_intervals_overlap(t0, t1, a0, a1) for a0, a1 in spont_up_s)
+        trig_in_pulse_window = True
+        if pulse_times_s is not None:
+            trig_in_pulse_window, _ = _pulse_latency_in_window(
+                float(t0),
+                pulse_times_s,
+                min_lat_s=min_lat_s,
+                trig_win_s=trig_win_s,
+            )
         if hit_assoc:
             assoc.append((float(t0), float(t1)))
-        elif hit_trig:
+        elif hit_trig and trig_in_pulse_window:
             trig.append((float(t0), float(t1)))
         elif hit_sp:
             spont.append((float(t0), float(t1)))
@@ -2978,6 +3277,327 @@ def _spindle_counts_per_upstate(up_intervals_s, spindle_intervals_s):
     return counts
 
 
+def _clean_time_intervals(intervals_s, label=None):
+    out = []
+    if intervals_s is None:
+        return out
+    for item in intervals_s:
+        if len(item) < 2:
+            continue
+        t0, t1 = float(item[0]), float(item[1])
+        if not (np.isfinite(t0) and np.isfinite(t1)) or t1 <= t0:
+            continue
+        if label is None:
+            out.append((t0, t1))
+        else:
+            out.append((t0, t1, str(label)))
+    out.sort(key=lambda v: (v[0], v[1]))
+    return out
+
+
+def _shift_intervals_circular(intervals_s, shift_s, t_start, t_stop):
+    duration = float(t_stop) - float(t_start)
+    if duration <= 0:
+        return []
+    shifted = []
+    for t0, t1 in _clean_time_intervals(intervals_s):
+        dur = max(0.0, float(t1) - float(t0))
+        if dur <= 0:
+            continue
+        nt0 = ((float(t0) - float(t_start) + float(shift_s)) % duration) + float(t_start)
+        nt1 = nt0 + dur
+        if nt1 <= t_stop:
+            shifted.append((float(nt0), float(nt1)))
+        else:
+            shifted.append((float(nt0), float(t_stop)))
+            shifted.append((float(t_start), float(t_start + (nt1 - float(t_stop)))))
+    shifted.sort(key=lambda v: (v[0], v[1]))
+    return shifted
+
+
+def quantify_swr_up_spindle_coupling(
+    swr_intervals_s,
+    up_intervals_by_type,
+    spindle_intervals_s,
+    *,
+    window_s=(-0.05, 0.70),
+    timeline_s=None,
+    n_shuffle=1000,
+    random_seed=13,
+):
+    swr = _clean_time_intervals(swr_intervals_s)
+    spindle = _clean_time_intervals(spindle_intervals_s)
+    up_all = []
+    for label, intervals in (up_intervals_by_type or {}).items():
+        up_all.extend(_clean_time_intervals(intervals, label=label))
+    up_all.sort(key=lambda v: (v[0], v[1], v[2]))
+
+    pre_s, post_s = float(window_s[0]), float(window_s[1])
+
+    def _best_up_for_swr(s0, s1, ups):
+        q0 = float(s0) + pre_s
+        q1 = float(s0) + post_s
+        candidates = []
+        for u0, u1, label in ups:
+            overlap = max(0.0, min(q1, u1) - max(q0, u0))
+            onset_in_win = (q0 <= u0 <= q1)
+            swr_overlap = max(0.0, min(s1, u1) - max(s0, u0))
+            if overlap > 0 or onset_in_win:
+                # Prefer direct SWR/UP overlap, then query-window overlap, then earliest onset.
+                score = (1 if swr_overlap > 0 else 0, overlap, -abs(u0 - s0))
+                candidates.append((score, u0, u1, label))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda v: v[0], reverse=True)
+        _, u0, u1, label = candidates[0]
+        return float(u0), float(u1), str(label)
+
+    def _best_spindle_for_up(s0, u0, u1, spindles):
+        hits = []
+        for p0, p1 in spindles:
+            if _intervals_overlap(u0, u1, p0, p1):
+                overlap = max(0.0, min(u1, p1) - max(u0, p0))
+                hits.append((overlap, -abs(p0 - s0), p0, p1))
+        if not hits:
+            return None
+        hits.sort(reverse=True)
+        _, _, p0, p1 = hits[0]
+        return float(p0), float(p1)
+
+    def _event_rows(ups, spindles):
+        rows = []
+        for i, (s0, s1) in enumerate(swr, start=1):
+            up_hit = _best_up_for_swr(s0, s1, ups)
+            sp_hit = None
+            if up_hit is not None:
+                sp_hit = _best_spindle_for_up(s0, up_hit[0], up_hit[1], spindles)
+            rows.append({
+                "swr_index": int(i),
+                "swr_t0_s": float(s0),
+                "swr_t1_s": float(s1),
+                "swr_duration_ms": float((s1 - s0) * 1000.0),
+                "has_s1_up": int(up_hit is not None),
+                "s1_up_t0_s": "" if up_hit is None else float(up_hit[0]),
+                "s1_up_t1_s": "" if up_hit is None else float(up_hit[1]),
+                "s1_up_type": "" if up_hit is None else str(up_hit[2]),
+                "latency_swr_to_up_onset_ms": "" if up_hit is None else float((up_hit[0] - s0) * 1000.0),
+                "has_s1_spindle_in_up": int(sp_hit is not None),
+                "s1_spindle_t0_s": "" if sp_hit is None else float(sp_hit[0]),
+                "s1_spindle_t1_s": "" if sp_hit is None else float(sp_hit[1]),
+                "latency_swr_to_spindle_onset_ms": "" if sp_hit is None else float((sp_hit[0] - s0) * 1000.0),
+                "complete_swr_up_spindle": int((up_hit is not None) and (sp_hit is not None)),
+            })
+        return rows
+
+    rows = _event_rows(up_all, spindle)
+    n_swr = len(rows)
+    n_up = int(sum(r["has_s1_up"] for r in rows))
+    n_complete = int(sum(r["complete_swr_up_spindle"] for r in rows))
+    obs_rate = float(n_complete / n_swr) if n_swr else np.nan
+
+    shuffle_counts = np.array([], dtype=float)
+    shuffle_rates = np.array([], dtype=float)
+    if n_swr and n_shuffle and timeline_s is not None:
+        t_start, t_stop = float(timeline_s[0]), float(timeline_s[1])
+        duration = t_stop - t_start
+        if duration > 1.0:
+            rng = np.random.default_rng(int(random_seed))
+            counts = []
+            up_plain = [(u0, u1, lab) for u0, u1, lab in up_all]
+            for _ in range(int(n_shuffle)):
+                shift = float(rng.uniform(0.05 * duration, 0.95 * duration))
+                shifted_up = []
+                for lab in sorted({u[2] for u in up_plain}):
+                    pieces = _shift_intervals_circular(
+                        [(u0, u1) for u0, u1, l0 in up_plain if l0 == lab],
+                        shift,
+                        t_start,
+                        t_stop,
+                    )
+                    shifted_up.extend((u0, u1, lab) for u0, u1 in pieces)
+                shifted_up.sort(key=lambda v: (v[0], v[1], v[2]))
+                shifted_sp = _shift_intervals_circular(spindle, shift, t_start, t_stop)
+                sim_rows = _event_rows(shifted_up, shifted_sp)
+                counts.append(int(sum(r["complete_swr_up_spindle"] for r in sim_rows)))
+            shuffle_counts = np.asarray(counts, dtype=float)
+            shuffle_rates = shuffle_counts / float(n_swr)
+
+    chance_mean = float(np.nanmean(shuffle_rates)) if shuffle_rates.size else np.nan
+    chance_std = float(np.nanstd(shuffle_rates, ddof=1)) if shuffle_rates.size > 1 else np.nan
+    z_score = float((obs_rate - chance_mean) / chance_std) if np.isfinite(chance_std) and chance_std > 0 else np.nan
+    p_ge = float((np.sum(shuffle_rates >= obs_rate) + 1.0) / (shuffle_rates.size + 1.0)) if shuffle_rates.size and np.isfinite(obs_rate) else np.nan
+    fold = float(obs_rate / chance_mean) if np.isfinite(chance_mean) and chance_mean > 0 else np.nan
+
+    summary = {
+        "n_swr": int(n_swr),
+        "n_swr_with_s1_up": int(n_up),
+        "n_complete_swr_up_spindle": int(n_complete),
+        "p_s1_up_given_swr": float(n_up / n_swr) if n_swr else np.nan,
+        "p_complete_given_swr": obs_rate,
+        "window_pre_s": pre_s,
+        "window_post_s": post_s,
+        "n_s1_up_total": int(len(up_all)),
+        "n_s1_spindle_total": int(len(spindle)),
+        "shuffle_n": int(shuffle_rates.size),
+        "shuffle_rate_mean": chance_mean,
+        "shuffle_rate_std": chance_std,
+        "shuffle_p_ge_observed": p_ge,
+        "shuffle_z_score": z_score,
+        "observed_over_chance": fold,
+    }
+    return pd.DataFrame(rows), pd.DataFrame([summary]), shuffle_rates
+
+
+def quantify_pulse_triggered_swr_rate(
+    swr_intervals_s,
+    pulse_times_s,
+    *,
+    timeline_s=None,
+    trig_win_s=0.50,
+    min_lat_s=0.0,
+    n_shuffle=1000,
+    random_seed=17,
+):
+    swr = _clean_time_intervals(swr_intervals_s)
+    pulses = np.asarray(pulse_times_s if pulse_times_s is not None else [], dtype=float)
+    pulses = pulses[np.isfinite(pulses)]
+    pulses.sort()
+
+    def _count_pulses_with_swr(swr_list):
+        if pulses.size == 0 or not swr_list:
+            return 0
+        swr_on = np.asarray([float(t0) for t0, _ in swr_list], dtype=float)
+        count = 0
+        for p in pulses:
+            lo = float(p) + float(min_lat_s)
+            hi = float(p) + float(trig_win_s)
+            if np.any((swr_on >= lo) & (swr_on <= hi)):
+                count += 1
+        return int(count)
+
+    n_pulses = int(pulses.size)
+    n_triggered = _count_pulses_with_swr(swr)
+    observed = float(n_triggered / n_pulses) if n_pulses else np.nan
+
+    shuffle_rates = np.array([], dtype=float)
+    if n_pulses and swr and n_shuffle and timeline_s is not None:
+        t_start, t_stop = float(timeline_s[0]), float(timeline_s[1])
+        duration = t_stop - t_start
+        if duration > 1.0:
+            rng = np.random.default_rng(int(random_seed))
+            rates_sh = []
+            for _ in range(int(n_shuffle)):
+                shift = float(rng.uniform(0.05 * duration, 0.95 * duration))
+                shifted = _shift_intervals_circular(swr, shift, t_start, t_stop)
+                rates_sh.append(_count_pulses_with_swr(shifted) / float(n_pulses))
+            shuffle_rates = np.asarray(rates_sh, dtype=float)
+
+    chance_mean = float(np.nanmean(shuffle_rates)) if shuffle_rates.size else np.nan
+    chance_std = float(np.nanstd(shuffle_rates, ddof=1)) if shuffle_rates.size > 1 else np.nan
+    z_score = float((observed - chance_mean) / chance_std) if np.isfinite(chance_std) and chance_std > 0 else np.nan
+    p_ge = float((np.sum(shuffle_rates >= observed) + 1.0) / (shuffle_rates.size + 1.0)) if shuffle_rates.size and np.isfinite(observed) else np.nan
+    fold = float(observed / chance_mean) if np.isfinite(chance_mean) and chance_mean > 0 else np.nan
+
+    return {
+        "n_pulses": n_pulses,
+        "n_pulses_with_triggered_swr": int(n_triggered),
+        "p_triggered_swr_given_pulse": observed,
+        "pulse_swr_shuffle_n": int(shuffle_rates.size),
+        "pulse_swr_shuffle_rate_mean": chance_mean,
+        "pulse_swr_shuffle_rate_std": chance_std,
+        "pulse_swr_shuffle_p_ge_observed": p_ge,
+        "pulse_swr_shuffle_z_score": z_score,
+        "pulse_swr_observed_over_chance": fold,
+    }, shuffle_rates
+
+
+def export_swr_up_spindle_coupling_report(
+    base_tag,
+    save_dir,
+    event_df,
+    summary_df,
+    shuffle_rates,
+    *,
+    title="CA1 SWR -> S1 UP + spindle coupling",
+):
+    os.makedirs(save_dir, exist_ok=True)
+    event_csv = os.path.join(save_dir, f"{base_tag}__swr_up_spindle_events.csv")
+    summary_csv = os.path.join(save_dir, f"{base_tag}__swr_up_spindle_summary.csv")
+    out_pdf = os.path.join(save_dir, f"{base_tag}__SWR_UP_SPINDLE_COUPLING.pdf")
+    event_df.to_csv(event_csv, index=False)
+    summary_df.to_csv(summary_csv, index=False)
+
+    s = summary_df.iloc[0].to_dict() if len(summary_df) else {}
+    with PdfPages(out_pdf) as pdf:
+        fig, axes = plt.subplots(2, 2, figsize=(11.0, 8.0))
+        fig.suptitle(title, fontsize=13)
+
+        ax = axes[0, 0]
+        vals = [
+            float(s.get("n_swr", 0)),
+            float(s.get("n_swr_with_s1_up", 0)),
+            float(s.get("n_complete_swr_up_spindle", 0)),
+        ]
+        labels = ["CA1 SWR", "+ S1 UP", "+ S1 spindle"]
+        colors = ["#4c78a8", "#59a14f", "#d37295"]
+        ax.bar(labels, vals, color=colors)
+        ax.set_ylabel("count")
+        ax.set_title("Event funnel")
+        for i, v in enumerate(vals):
+            ax.text(i, v, f"{int(v)}", ha="center", va="bottom", fontsize=9)
+
+        ax = axes[0, 1]
+        obs = float(s.get("p_complete_given_swr", np.nan))
+        chance = float(s.get("shuffle_rate_mean", np.nan))
+        bars = [obs, chance]
+        ax.bar(["observed", "shuffle"], bars, color=["#d37295", "#9e9e9e"])
+        ax.set_ylim(0, max([b for b in bars if np.isfinite(b)] + [0.05]) * 1.25)
+        ax.set_ylabel("P(UP + spindle | SWR)")
+        ax.set_title("Observed vs chance")
+        for i, v in enumerate(bars):
+            if np.isfinite(v):
+                ax.text(i, v, f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+        stat_txt = (
+            f"z = {float(s.get('shuffle_z_score', np.nan)):.2f}\n"
+            f"p = {float(s.get('shuffle_p_ge_observed', np.nan)):.4f}\n"
+            f"fold = {float(s.get('observed_over_chance', np.nan)):.2f}"
+        )
+        ax.text(0.98, 0.95, stat_txt, ha="right", va="top", transform=ax.transAxes, fontsize=9)
+
+        ax = axes[1, 0]
+        lat_up = pd.to_numeric(event_df.get("latency_swr_to_up_onset_ms", pd.Series(dtype=float)), errors="coerce")
+        lat_up = lat_up[np.isfinite(lat_up)]
+        if len(lat_up):
+            ax.hist(lat_up, bins=30, color="#59a14f", alpha=0.85)
+            ax.axvline(0, color="black", linewidth=0.8)
+            ax.set_xlabel("latency SWR -> UP onset (ms)")
+            ax.set_ylabel("count")
+        else:
+            _blank_ax(ax, "no SWR->UP latencies")
+        ax.set_title("SWR to S1 UP")
+
+        ax = axes[1, 1]
+        if shuffle_rates is not None and len(shuffle_rates):
+            ax.hist(np.asarray(shuffle_rates, float), bins=30, color="#9e9e9e", alpha=0.85)
+            if np.isfinite(obs):
+                ax.axvline(obs, color="#d37295", linewidth=2, label="observed")
+                ax.legend(frameon=False)
+            ax.set_xlabel("shuffle P(UP + spindle | SWR)")
+            ax.set_ylabel("count")
+        else:
+            _blank_ax(ax, "shuffle skipped")
+        ax.set_title("Chance distribution")
+
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+    print(f"[CSV] SWR-UP-Spindle events: {event_csv}")
+    print(f"[CSV] SWR-UP-Spindle summary: {summary_csv}")
+    print(f"[PDF] SWR-UP-Spindle coupling: {out_pdf}")
+    return out_pdf, event_csv, summary_csv
+
+
 spont_up_pairs = _pair_up_down_indices(Spontaneous_UP, Spontaneous_DOWN, len(time_s))
 trig_up_pairs = _pair_up_down_indices(Pulse_triggered_UP, Pulse_triggered_DOWN, len(time_s))
 assoc_up_pairs = _pair_up_down_indices(Pulse_associated_UP, Pulse_associated_DOWN, len(time_s))
@@ -3055,7 +3675,7 @@ try:
                 f_hi=scan_f_hi,
                 thr_k_on=float(os.environ.get("SWR_SCAN_THR_ON", "0.90")),
                 thr_k_off=float(os.environ.get("SWR_SCAN_THR_OFF", "0.30")),
-                min_dur_s=float(os.environ.get("SWR_SCAN_MIN_DUR_S", "0.015")),
+                min_dur_s=float(os.environ.get("SWR_SCAN_MIN_DUR_S", "0.040")),
                 max_dur_s=float(os.environ.get("SWR_SCAN_MAX_DUR_S", "0.150")),
                 max_gap_s=float(os.environ.get("SWR_SCAN_MAX_GAP_S", "0.020")),
                 min_cycles=int(os.environ.get("SWR_SCAN_MIN_CYCLES", "2")),
@@ -3242,41 +3862,48 @@ print(f"[SPINDLE] 10-15 Hz intervals (UP-overlap required): n={len(spindle_inter
 if enable_swr:
     swr_f_lo = float(os.environ.get("SWR_F_LO_HZ", "120.0"))
     swr_f_hi = float(os.environ.get("SWR_F_HI_HZ", "270.0"))
+    swr_require_up_overlap = str(os.environ.get("SWR_REQUIRE_UP_OVERLAP", "0")).strip().lower() not in ("0", "false", "no", "off")
     ripple_intervals_s = detect_sharp_wave_ripple_intervals_in_upstates(
         swr_channel, time_s, dt, all_up_pairs,
         f_lo=swr_f_lo,
         f_hi=swr_f_hi,
-        thr_k_on=float(os.environ.get("SWR_THR_ON", "1.25")),
-        thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.45")),
-        min_dur_s=float(os.environ.get("SWR_MIN_DUR_S", "0.020")),
-        max_dur_s=float(os.environ.get("SWR_MAX_DUR_S", "0.120")),
-        max_gap_s=float(os.environ.get("SWR_MAX_GAP_S", "0.015")),
-        min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "3")),
-        min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.05")),
-        min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "0.80")),
-        off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.008")),
+        thr_k_on=float(os.environ.get("SWR_THR_ON", "1.10")),
+        thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.35")),
+        min_dur_s=float(os.environ.get("SWR_MIN_DUR_S", "0.040")),
+        max_dur_s=float(os.environ.get("SWR_MAX_DUR_S", "0.150")),
+        max_gap_s=float(os.environ.get("SWR_MAX_GAP_S", "0.020")),
+        min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "2")),
+        min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.03")),
+        min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "0.65")),
+        off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.006")),
         only_in_upstates=False,
-        require_up_overlap=require_up_overlap_main,
+        require_up_overlap=swr_require_up_overlap,
         causal_filter=(not SPINDLE_ZERO_PHASE),
     )
     print(
         "[SWR-CONFIG] "
         f"f_lo={swr_f_lo}Hz "
         f"f_hi={swr_f_hi}Hz "
-        f"thr_on={os.environ.get('SWR_THR_ON', '1.25')} "
-        f"thr_off={os.environ.get('SWR_THR_OFF', '0.45')} "
-        f"min_dur={os.environ.get('SWR_MIN_DUR_S', '0.020')}s "
-        f"max_dur={os.environ.get('SWR_MAX_DUR_S', '0.120')}s "
-        f"max_gap={os.environ.get('SWR_MAX_GAP_S', '0.015')}s "
-        f"min_cycles={os.environ.get('SWR_MIN_CYCLES', '3')} "
-        f"min_env_sigma={os.environ.get('SWR_MIN_ENV_SIGMA', '0.80')} "
-        f"off_below_s={os.environ.get('SWR_OFF_BELOW_S', '0.008')} "
+        f"thr_on={os.environ.get('SWR_THR_ON', '1.10')} "
+        f"thr_off={os.environ.get('SWR_THR_OFF', '0.35')} "
+        f"min_dur={os.environ.get('SWR_MIN_DUR_S', '0.040')}s "
+        f"max_dur={os.environ.get('SWR_MAX_DUR_S', '0.150')}s "
+        f"max_gap={os.environ.get('SWR_MAX_GAP_S', '0.020')}s "
+        f"min_cycles={os.environ.get('SWR_MIN_CYCLES', '2')} "
+        f"min_env_sigma={os.environ.get('SWR_MIN_ENV_SIGMA', '0.65')} "
+        f"off_below_s={os.environ.get('SWR_OFF_BELOW_S', '0.006')} "
         f"require_sharp_wave={os.environ.get('SWR_REQUIRE_SHARP_WAVE', '1')} "
         f"sw_band={os.environ.get('SWR_SW_F_LO_HZ', '2.0')}-{os.environ.get('SWR_SW_F_HI_HZ', '40.0')}Hz "
-        f"sw_amp_sigma={os.environ.get('SWR_SW_MIN_AMP_SIGMA', '1.0')} "
-        f"sw_ptp_sigma={os.environ.get('SWR_SW_MIN_PTP_SIGMA', '2.0')} "
-        f"sw_slope_sigma={os.environ.get('SWR_SW_MIN_SLOPE_SIGMA', '1.0')} "
+        f"sw_amp_sigma={os.environ.get('SWR_SW_MIN_AMP_SIGMA', '2.5')} "
+        f"sw_ptp_sigma={os.environ.get('SWR_SW_MIN_PTP_SIGMA', '4.5')} "
+        f"sw_prom_sigma={os.environ.get('SWR_SW_MIN_PROM_SIGMA', '3.0')} "
+        f"sw_width={os.environ.get('SWR_SW_MIN_WIDTH_S', '0.012')}-{os.environ.get('SWR_SW_MAX_WIDTH_S', '0.120')}s "
+        f"sw_slope_sigma={os.environ.get('SWR_SW_MIN_SLOPE_SIGMA', '0.8')} "
         f"sw_min_abs_amp={os.environ.get('SWR_SW_MIN_ABS_AMP', '0.0')} "
+        f"sw_up_ratio={os.environ.get('SWR_SW_MIN_UP_AMP_RATIO', '0.15')} "
+        f"sw_up_ratio_enable={os.environ.get('SWR_SW_UP_RATIO_ENABLE', '1')} "
+        f"sw_min_ptp_uv={os.environ.get('SWR_SW_MIN_PTP_UV', '10.0')} "
+        f"return_combined_interval={os.environ.get('SWR_RETURN_COMBINED_INTERVAL', '1')} "
         f"sw_require_overlap={os.environ.get('SWR_SW_REQUIRE_OVERLAP', '1')} "
         f"sw_min_overlap_s={os.environ.get('SWR_SW_MIN_OVERLAP_S', '0.006')} "
         f"sw_overlap_pad_s={os.environ.get('SWR_SW_OVERLAP_PAD_S', '0.000')} "
@@ -3284,7 +3911,7 @@ if enable_swr:
         f"sw_center_tol_s={os.environ.get('SWR_SW_CENTER_TOL_S', '0.040')} "
         f"sw_polarity={os.environ.get('SWR_SW_POLARITY', 'auto')} "
         f"only_in_upstates=0 "
-        f"require_up_overlap={int(require_up_overlap_main)} "
+        f"require_up_overlap={int(swr_require_up_overlap)} "
         f"filter_mode={'zero_phase' if SPINDLE_ZERO_PHASE else 'causal'}"
     )
     print(f"[SWR] sharp-wave ripple intervals (UP-overlap required): n={len(ripple_intervals_s)}")
@@ -3299,20 +3926,20 @@ main_channel_bp_10_15 = _bandpass_1d(
 )
 
 # Pulse-orientierte Spindle-Klassifikation über echten Spindle-Onset.
-# WICHTIG: Trigger-Referenz ist explizit der Pulse-ONSET (nicht OFF).
+# WICHTIG: Trigger-Referenz ist explizit der Pulse-OFFSET.
 _p1 = np.asarray(pulse_times_1 if pulse_times_1 is not None else [], float)
 _p2 = np.asarray(pulse_times_2 if pulse_times_2 is not None else [], float)
 _p1_off = np.asarray(pulse_times_1_off if pulse_times_1_off is not None else [], float)
 _p2_off = np.asarray(pulse_times_2_off if pulse_times_2_off is not None else [], float)
-_p1_on = _p1[np.isfinite(_p1)]
-_p2_on = _p2[np.isfinite(_p2)]
-spindle_pulses_s = np.unique(np.concatenate([_p1_on, _p2_on])) if (_p1_on.size or _p2_on.size) else np.array([], float)
+_p1_ref = _p1_off[np.isfinite(_p1_off)]
+_p2_ref = _p2_off[np.isfinite(_p2_off)]
+spindle_pulses_s = np.unique(np.concatenate([_p1_ref, _p2_ref])) if (_p1_ref.size or _p2_ref.size) else np.array([], float)
 spindle_spont_s, spindle_trig_s, spindle_trig_lat_s = _classify_spindles_by_pulse_latency(
     spindle_intervals_s,
     spindle_pulses_s,
-    trig_win_s=0.70,
-    min_lat_s=0.00,
-    followup_trig_gap_s=float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.35")),
+    trig_win_s=float(os.environ.get("SPINDLE_TRIG_WIN_S", "0.40")),
+    min_lat_s=float(os.environ.get("SPINDLE_TRIG_MIN_LAT_S", "0.00")),
+    followup_trig_gap_s=float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.00")),
 )
 
 spont_up_s = _pair_idx_to_time_intervals(spont_up_pairs, time_s)
@@ -3325,6 +3952,9 @@ spindle_spont_s, spindle_trig_s, spindle_assoc_s, spindle_other_s = _classify_sp
     spont_up_s,
     trig_up_s,
     assoc_up_s,
+    pulse_times_s=spindle_pulses_s,
+    trig_win_s=float(os.environ.get("SPINDLE_TRIG_WIN_S", "0.40")),
+    min_lat_s=float(os.environ.get("SPINDLE_TRIG_MIN_LAT_S", "0.00")),
 )
 
 # Bidirektionale Trigger-Konsistenz:
@@ -3378,6 +4008,9 @@ if str(os.environ.get("REQUIRE_TRIGGERED_SPINDLE_FOR_TRIGGERED_UP", "1")).strip(
         spont_up_s,
         trig_up_s,
         assoc_up_s,
+        pulse_times_s=spindle_pulses_s,
+        trig_win_s=float(os.environ.get("SPINDLE_TRIG_WIN_S", "0.40")),
+        min_lat_s=float(os.environ.get("SPINDLE_TRIG_MIN_LAT_S", "0.00")),
     )
     print(
         "[UP-SPINDLE-CONSISTENCY] strict=1",
@@ -3386,22 +4019,46 @@ if str(os.environ.get("REQUIRE_TRIGGERED_SPINDLE_FOR_TRIGGERED_UP", "1")).strip(
     )
 
 print(
-    "[SPINDLE-CLASS][pulse-onset] spont=", len(spindle_spont_s),
+    "[SPINDLE-CLASS][pulse-offset] spont=", len(spindle_spont_s),
     "trig=", len(spindle_trig_s),
     "assoc=", len(spindle_assoc_s),
     "other=", len(spindle_other_s),
     "pulses=", len(spindle_pulses_s),
-    "ref=onset",
-    "followup_gap_s=", float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.35")),
+    "ref=offset",
+    "followup_gap_s=", float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.00")),
     "assoc_blocks_trig_gap_s=", float(os.environ.get("SPINDLE_ASSOC_BLOCK_TRIG_GAP_S", "0.35")),
     "trig_lat_mean_s=", (float(np.nanmean(spindle_trig_lat_s)) if spindle_trig_lat_s.size else np.nan),
 )
-ripple_spont_s, ripple_trig_s, ripple_trig_lat_s = _classify_spindles_by_pulse_latency(
+if enable_swr and str(os.environ.get("SWR_SW_UP_RATIO_ENABLE", "1")).strip().lower() not in ("0", "false", "no", "off"):
+    ripple_intervals_s = _filter_swr_by_up_relative_sharpwave_amp(
+        ripple_intervals_s,
+        swr_channel,
+        main_channel,
+        time_s,
+        spont_up_s + trig_up_s + assoc_up_s,
+        dt,
+        sw_f_lo=float(os.environ.get("SWR_SW_F_LO_HZ", "2.0")),
+        sw_f_hi=float(os.environ.get("SWR_SW_F_HI_HZ", "40.0")),
+        sw_pad_s=float(os.environ.get("SWR_SW_PAD_S", "0.080")),
+        match_pre_s=float(os.environ.get("SWR_SW_UP_MATCH_PRE_S", "-0.05")),
+        match_post_s=float(os.environ.get("SWR_SW_UP_MATCH_POST_S", "0.70")),
+        min_ratio=float(os.environ.get("SWR_SW_MIN_UP_AMP_RATIO", "0.15")),
+        require_up=str(os.environ.get("SWR_SW_UP_RATIO_REQUIRE_UP", "0")).strip().lower() not in ("0", "false", "no", "off"),
+        causal_filter=(not SPINDLE_ZERO_PHASE),
+        label="SWR-UP-RATIO-MAIN",
+    )
+ripple_spont_s, ripple_trig_s, ripple_trig_lat_s = _classify_swr_by_best_sharpwave_per_pulse(
     ripple_intervals_s,
     spindle_pulses_s,
-    trig_win_s=float(os.environ.get("SWR_TRIG_WIN_S", "0.25")),
-    min_lat_s=0.00,
-    followup_trig_gap_s=float(os.environ.get("SWR_FOLLOWUP_TRIG_GAP_S", "0.08")),
+    swr_channel,
+    time_s,
+    dt,
+    trig_win_s=float(os.environ.get("SWR_TRIG_WIN_S", "0.40")),
+    min_lat_s=float(os.environ.get("SWR_TRIG_MIN_LAT_S", "0.00")),
+    sw_f_lo=float(os.environ.get("SWR_SW_F_LO_HZ", "2.0")),
+    sw_f_hi=float(os.environ.get("SWR_SW_F_HI_HZ", "40.0")),
+    sw_pad_s=float(os.environ.get("SWR_SW_PAD_S", "0.080")),
+    causal_filter=(not SPINDLE_ZERO_PHASE),
 )
 ripple_assoc_s = []
 ripple_spont_only_s = []
@@ -3414,17 +4071,19 @@ ripple_spont_s = ripple_spont_only_s
 ripple_assoc_s, ripple_trig_s = _enforce_assoc_blocks_triggered(
     ripple_assoc_s,
     ripple_trig_s,
-    block_gap_s=float(os.environ.get("SWR_ASSOC_BLOCK_TRIG_GAP_S", "0.08")),
+    block_gap_s=float(os.environ.get("SWR_ASSOC_BLOCK_TRIG_GAP_S", "0.12")),
 )
 print(
-    "[SWR-CLASS][pulse-onset] spont=", len(ripple_spont_s),
+    "[SWR-CLASS][pulse-offset] spont=", len(ripple_spont_s),
     "trig=", len(ripple_trig_s),
     "assoc=", len(ripple_assoc_s),
     "pulses=", len(spindle_pulses_s),
-    "ref=onset",
-    "trig_win_s=", float(os.environ.get("SWR_TRIG_WIN_S", "0.25")),
-    "followup_gap_s=", float(os.environ.get("SWR_FOLLOWUP_TRIG_GAP_S", "0.08")),
-    "assoc_blocks_trig_gap_s=", float(os.environ.get("SWR_ASSOC_BLOCK_TRIG_GAP_S", "0.08")),
+    "ref=offset",
+    "trig_win_s=", float(os.environ.get("SWR_TRIG_WIN_S", "0.40")),
+    "min_lat_s=", float(os.environ.get("SWR_TRIG_MIN_LAT_S", "0.00")),
+    "one_per_pulse=", 1,
+    "followup_gap_s=", 0.0,
+    "assoc_blocks_trig_gap_s=", float(os.environ.get("SWR_ASSOC_BLOCK_TRIG_GAP_S", "0.12")),
     "trig_lat_mean_s=", (float(np.nanmean(ripple_trig_lat_s)) if ripple_trig_lat_s.size else np.nan),
 )
 
@@ -3913,6 +4572,7 @@ try:
     swr_f_hi = float(os.environ.get("SWR_F_HI_HZ", "270.0"))
     swr_sw_f_lo = float(os.environ.get("SWR_SW_F_LO_HZ", "2.0"))
     swr_sw_f_hi = float(os.environ.get("SWR_SW_F_HI_HZ", "40.0"))
+    swr_require_up_overlap_4p = str(os.environ.get("SWR_REQUIRE_UP_OVERLAP", "0")).strip().lower() not in ("0", "false", "no", "off")
     swr_bp_plot = _bandpass_1d(
         swr_plot, dt, f_lo=swr_f_lo, f_hi=swr_f_hi, order=3, causal=(not SPINDLE_ZERO_PHASE)
     )
@@ -3935,25 +4595,50 @@ try:
         swr_raw, time_s, dt, all_up_pairs,
         f_lo=swr_f_lo,
         f_hi=swr_f_hi,
-        thr_k_on=float(os.environ.get("SWR_THR_ON", "1.25")),
-        thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.45")),
-        min_dur_s=float(os.environ.get("SWR_MIN_DUR_S", "0.020")),
-        max_dur_s=float(os.environ.get("SWR_MAX_DUR_S", "0.120")),
-        max_gap_s=float(os.environ.get("SWR_MAX_GAP_S", "0.015")),
-        min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "3")),
-        min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.05")),
-        min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "0.80")),
-        off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.008")),
+        thr_k_on=float(os.environ.get("SWR_THR_ON", "1.10")),
+        thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.35")),
+        min_dur_s=float(os.environ.get("SWR_MIN_DUR_S", "0.040")),
+        max_dur_s=float(os.environ.get("SWR_MAX_DUR_S", "0.150")),
+        max_gap_s=float(os.environ.get("SWR_MAX_GAP_S", "0.020")),
+        min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "2")),
+        min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.03")),
+        min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "0.65")),
+        off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.006")),
         only_in_upstates=False,
-        require_up_overlap=bool(len(all_up_pairs)),
+        require_up_overlap=swr_require_up_overlap_4p,
         causal_filter=(not SPINDLE_ZERO_PHASE),
     )
-    swr_ripple_spont_s, swr_ripple_trig_s, _ = _classify_spindles_by_pulse_latency(
+    if str(os.environ.get("SWR_SW_UP_RATIO_ENABLE", "1")).strip().lower() not in ("0", "false", "no", "off"):
+        swr_ripple_intervals_s = _filter_swr_by_up_relative_sharpwave_amp(
+            swr_ripple_intervals_s,
+            swr_plot,
+            up_plot,
+            time_s,
+            spont_up_s + trig_up_s + assoc_up_s,
+            dt,
+            sw_f_lo=swr_sw_f_lo,
+            sw_f_hi=swr_sw_f_hi,
+            sw_pad_s=float(os.environ.get("SWR_SW_PAD_S", "0.080")),
+            match_pre_s=float(os.environ.get("SWR_SW_UP_MATCH_PRE_S", "-0.05")),
+            match_post_s=float(os.environ.get("SWR_SW_UP_MATCH_POST_S", "0.70")),
+            min_ratio=float(os.environ.get("SWR_SW_MIN_UP_AMP_RATIO", "0.15")),
+            min_sw_ptp_abs=float(os.environ.get("SWR_SW_MIN_PTP_UV", "10.0")),
+            require_up=str(os.environ.get("SWR_SW_UP_RATIO_REQUIRE_UP", "0")).strip().lower() not in ("0", "false", "no", "off"),
+            causal_filter=(not SPINDLE_ZERO_PHASE),
+            label="SWR-UP-RATIO-4P",
+        )
+    swr_ripple_spont_s, swr_ripple_trig_s, _ = _classify_swr_by_best_sharpwave_per_pulse(
         swr_ripple_intervals_s,
         spindle_pulses_s,
-        trig_win_s=float(os.environ.get("SWR_TRIG_WIN_S", "0.25")),
-        min_lat_s=0.00,
-        followup_trig_gap_s=float(os.environ.get("SWR_FOLLOWUP_TRIG_GAP_S", "0.08")),
+        swr_plot,
+        time_s,
+        dt,
+        trig_win_s=float(os.environ.get("SWR_TRIG_WIN_S", "0.40")),
+        min_lat_s=float(os.environ.get("SWR_TRIG_MIN_LAT_S", "0.00")),
+        sw_f_lo=swr_sw_f_lo,
+        sw_f_hi=swr_sw_f_hi,
+        sw_pad_s=float(os.environ.get("SWR_SW_PAD_S", "0.080")),
+        causal_filter=(not SPINDLE_ZERO_PHASE),
     )
     swr_ripple_assoc_s = []
     swr_ripple_spont_only_s = []
@@ -3966,7 +4651,7 @@ try:
     swr_ripple_assoc_s, swr_ripple_trig_s = _enforce_assoc_blocks_triggered(
         swr_ripple_assoc_s,
         swr_ripple_trig_s,
-        block_gap_s=float(os.environ.get("SWR_ASSOC_BLOCK_TRIG_GAP_S", "0.08")),
+        block_gap_s=float(os.environ.get("SWR_ASSOC_BLOCK_TRIG_GAP_S", "0.12")),
     )
     SWR_Ripple_Spont_UP, SWR_Ripple_Spont_DOWN = _time_intervals_to_idx_pairs(swr_ripple_spont_s, time_s)
     SWR_Ripple_Trig_UP, SWR_Ripple_Trig_DOWN = _time_intervals_to_idx_pairs(swr_ripple_trig_s, time_s)
@@ -3994,9 +4679,9 @@ try:
     up_sp_spont_s, up_sp_trig_s, _ = _classify_spindles_by_pulse_latency(
         up_spindle_intervals_s,
         spindle_pulses_s,
-        trig_win_s=0.70,
-        min_lat_s=0.00,
-        followup_trig_gap_s=float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.35")),
+        trig_win_s=float(os.environ.get("SPINDLE_TRIG_WIN_S", "0.40")),
+        min_lat_s=float(os.environ.get("SPINDLE_TRIG_MIN_LAT_S", "0.00")),
+        followup_trig_gap_s=float(os.environ.get("SPINDLE_FOLLOWUP_TRIG_GAP_S", "0.00")),
     )
     up_sp_assoc_s = []
     up_sp_spont_only_s = []
@@ -4028,6 +4713,44 @@ try:
         f"sp={len(UP_Sp_Spont_UP)}",
         f"tr={len(UP_Sp_Trig_UP)}",
         f"as={len(UP_Sp_Assoc_UP)}",
+    )
+
+    coupling_pre_s = float(os.environ.get("SWR_UP_SPINDLE_PRE_S", "-0.05"))
+    coupling_post_s = float(os.environ.get("SWR_UP_SPINDLE_POST_S", "0.70"))
+    coupling_n_shuffle = int(os.environ.get("SWR_UP_SPINDLE_N_SHUFFLE", "1000"))
+    coupling_seed = int(os.environ.get("SWR_UP_SPINDLE_RANDOM_SEED", "13"))
+    coupling_events_df, coupling_summary_df, coupling_shuffle_rates = quantify_swr_up_spindle_coupling(
+        swr_ripple_trig_s,
+        {
+            "triggered": trig_up_s,
+        },
+        up_sp_trig_s,
+        window_s=(coupling_pre_s, coupling_post_s),
+        timeline_s=(float(time_s[0]), float(time_s[-1])) if len(time_s) else None,
+        n_shuffle=coupling_n_shuffle,
+        random_seed=coupling_seed,
+    )
+    pulse_swr_summary, pulse_swr_shuffle_rates = quantify_pulse_triggered_swr_rate(
+        swr_ripple_intervals_s,
+        spindle_pulses_s,
+        timeline_s=(float(time_s[0]), float(time_s[-1])) if len(time_s) else None,
+        trig_win_s=float(os.environ.get("SWR_TRIG_WIN_S", "0.40")),
+        min_lat_s=float(os.environ.get("SWR_TRIG_MIN_LAT_S", "0.00")),
+        n_shuffle=coupling_n_shuffle,
+        random_seed=int(os.environ.get("SWR_PULSE_RATE_RANDOM_SEED", "17")),
+    )
+    for k, v in pulse_swr_summary.items():
+        coupling_summary_df.loc[0, k] = v
+    export_swr_up_spindle_coupling_report(
+        f"{BASE_TAG}__TRIGGERED_ch{swr_ch_idx}_ca1_ch{up_ch_idx}_s1",
+        SAVE_DIR,
+        coupling_events_df,
+        coupling_summary_df,
+        coupling_shuffle_rates,
+        title=(
+            f"{BASE_TAG} -- triggered CA1 ch{swr_ch_idx} SWR with sharp-wave "
+            f"-> triggered S1 ch{up_ch_idx} UP + triggered spindle"
+        ),
     )
 
     export_interactive_four_channel_lfp_html(
@@ -4085,6 +4808,7 @@ except Exception as e:
 
 try:
     pulse_qa_enabled = str(os.environ.get("PULSE_QA_4P_ENABLE", "1")).strip().lower() not in ("0", "false", "no", "off")
+    pulse_qa_swr_triggered_only = str(os.environ.get("PULSE_QA_SWR_TRIGGERED_ONLY", "1")).strip().lower() not in ("0", "false", "no", "off")
     pulse_qa_scope = globals()
     pulse_qa_required = (
         "swr_ch_idx", "up_ch_idx", "swr_bp_plot", "swr_sw_plot",
@@ -4099,6 +4823,7 @@ try:
         "UP_Sp_Assoc_UP", "UP_Sp_Assoc_DOWN",
     )
     if pulse_qa_enabled and all(name in pulse_qa_scope for name in pulse_qa_required):
+        pulse_qa_empty_swr = (np.array([], dtype=int), np.array([], dtype=int))
         export_pulse_qa_four_channel_html(
             f"{BASE_TAG}__ch{swr_ch_idx}_ripple_sharpwave_ch{up_ch_idx}_up_spindle",
             SAVE_DIR,
@@ -4111,9 +4836,9 @@ try:
             pulse_times_2=pulse_times_2_html_export,
             pulse_times_1_off=pulse_times_1_off_html_plot,
             pulse_times_2_off=pulse_times_2_off_html_export,
-            swr_spont=(SWR_Ripple_Spont_UP, SWR_Ripple_Spont_DOWN),
+            swr_spont=(pulse_qa_empty_swr if pulse_qa_swr_triggered_only else (SWR_Ripple_Spont_UP, SWR_Ripple_Spont_DOWN)),
             swr_trig=(SWR_Ripple_Trig_UP, SWR_Ripple_Trig_DOWN),
-            swr_assoc=(SWR_Ripple_Assoc_UP, SWR_Ripple_Assoc_DOWN),
+            swr_assoc=(pulse_qa_empty_swr if pulse_qa_swr_triggered_only else (SWR_Ripple_Assoc_UP, SWR_Ripple_Assoc_DOWN)),
             up_spont=(Spontaneous_UP, Spontaneous_DOWN),
             up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
             up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
@@ -5101,30 +5826,31 @@ def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *
     print(f"[ALL-CH] SVG geschrieben: {out_svg}")
 
 
-try:
-    _save_all_channels_svg_from_array(
-        time_s, LFP_array_good, ch_names_good,
-        os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_GOOD.svg"),
-        max_points=40000,
-        title=f"Gefilterte Kanäle (n={NUM_CHANNELS_GOOD}/{NUM_CHANNELS})"
-    )
-except Exception as e:
-    print("[ALL-CH][DS] skip:", e)
-
-try:
-    excluded_idx = [i for i in range(NUM_CHANNELS) if i not in set(good_idx)]
-    if excluded_idx:
+if ENABLE_SVG_OUTPUT:
+    try:
         _save_all_channels_svg_from_array(
-            time_s,
-            LFP_array[excluded_idx, :],
-            [f"pri_{i}" for i in excluded_idx],
-            os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_EXCLUDED.svg"),
-            max_points=40000
+            time_s, LFP_array_good, ch_names_good,
+            os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_GOOD.svg"),
+            max_points=40000,
+            title=f"Gefilterte Kanäle (n={NUM_CHANNELS_GOOD}/{NUM_CHANNELS})"
         )
-    else:
-        print("[ALL-CH][EXCLUDED] keine ausgeschlossenen Kanäle")
-except Exception as e:
-    print("[ALL-CH][EXCLUDED] skip:", e)
+    except Exception as e:
+        print("[ALL-CH][DS] skip:", e)
+
+    try:
+        excluded_idx = [i for i in range(NUM_CHANNELS) if i not in set(good_idx)]
+        if excluded_idx:
+            _save_all_channels_svg_from_array(
+                time_s,
+                LFP_array[excluded_idx, :],
+                [f"pri_{i}" for i in excluded_idx],
+                os.path.join(SAVE_DIR, f"{BASE_TAG}__all_channels_EXCLUDED.svg"),
+                max_points=40000
+            )
+        else:
+            print("[ALL-CH][EXCLUDED] keine ausgeschlossenen Kanäle")
+    except Exception as e:
+        print("[ALL-CH][EXCLUDED] skip:", e)
 
 
 def up_onset_mean_ax(main_channel, dt, onsets, ax=None, title="UPs – onset-aligned mean"):
@@ -7808,8 +8534,9 @@ rates = compute_upstate_rate(
     )
 
 
-rate_bar_svg = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_rate_bar.svg")
-plot_upstate_rates_bar(rates, rate_bar_svg)
+if ENABLE_SVG_OUTPUT:
+    rate_bar_svg = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_rate_bar.svg")
+    plot_upstate_rates_bar(rates, rate_bar_svg)
 
 
 def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_save_each_svg=False, write_summary=True):
@@ -7900,6 +8627,161 @@ def _merge_pdfs(out_pdf, in_pdfs):
             return False, f"pdfunite failed ({e_pdfunite}); gs failed ({e_gs})"
 
 
+def _write_parent_swr_up_spindle_coupling_pdf(root):
+    root = Path(root).resolve()
+    def _natural_sort_key(value):
+        text = str(value)
+        return [
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", text)
+        ]
+
+    summary_files = sorted(
+        (
+            p for p in root.rglob("*__TRIGGERED_ch*_ca1_ch*_s1__swr_up_spindle_summary.csv")
+            if p.is_file() and p.parent != root
+        ),
+        key=lambda p: _natural_sort_key(p.parent.name)
+    )
+    if not summary_files:
+        print(f"[AGG][COUPLING] no triggered SWR-UP-spindle summaries under {root}")
+        return None
+
+    rows = []
+    for path in summary_files:
+        try:
+            df = pd.read_csv(path)
+            if df.empty:
+                continue
+            row = df.iloc[0].to_dict()
+            row["folder"] = path.parent.name
+            row["path"] = str(path)
+            rows.append(row)
+        except Exception as e:
+            print(f"[AGG][COUPLING][WARN] skipped {path}: {e}")
+
+    if not rows:
+        print(f"[AGG][COUPLING] no readable triggered summaries under {root}")
+        return None
+
+    def _num(row, key, default=np.nan):
+        try:
+            v = float(row.get(key, default))
+        except Exception:
+            return float(default)
+        return v if np.isfinite(v) else float(default)
+
+    def _pulse_count_for_folder(folder_path):
+        summary_path = Path(folder_path) / "upstate_summary.csv"
+        if not summary_path.is_file():
+            return np.nan
+        try:
+            d = pd.read_csv(summary_path, sep=None, engine="python")
+            if d.empty:
+                return np.nan
+            row = d.iloc[0].to_dict()
+            return float(_num(row, "Pulse count 1", 0.0) + _num(row, "Pulse count 2", 0.0))
+        except Exception:
+            return np.nan
+
+    for r in rows:
+        n_pulses = _num(r, "n_pulses", np.nan)
+        if not np.isfinite(n_pulses):
+            n_pulses = _pulse_count_for_folder(Path(str(r.get("path", ""))).parent)
+        n_swr = _num(r, "n_swr", 0.0)
+        r["n_pulses"] = n_pulses
+        if not np.isfinite(_num(r, "p_triggered_swr_given_pulse", np.nan)):
+            r["p_triggered_swr_given_pulse"] = float(n_swr / n_pulses) if np.isfinite(n_pulses) and n_pulses > 0 else np.nan
+    rows.sort(key=lambda r: _natural_sort_key(r.get("folder", "")))
+
+    total_swr = int(np.nansum([_num(r, "n_swr", 0.0) for r in rows]))
+    total_pulses = int(np.nansum([_num(r, "n_pulses", 0.0) for r in rows]))
+    pooled_rate = float(total_swr / total_pulses) if total_pulses > 0 else np.nan
+    expected_chance_hits = float(np.nansum([
+        _num(r, "pulse_swr_shuffle_rate_mean", np.nan) * _num(r, "n_pulses", 0.0)
+        for r in rows
+        if np.isfinite(_num(r, "pulse_swr_shuffle_rate_mean", np.nan))
+    ]))
+    pooled_chance = float(expected_chance_hits / total_pulses) if total_pulses > 0 else np.nan
+
+    panels = [{
+        "folder": "ALL SUBFOLDERS pooled",
+        "p_triggered_swr_given_pulse": pooled_rate,
+        "chance_triggered_swr_given_pulse": pooled_chance,
+        "n_triggered_swr": total_swr,
+        "n_pulses": total_pulses,
+    }]
+    for r in rows:
+        panels.append({
+            "folder": str(r.get("folder", "")),
+            "p_triggered_swr_given_pulse": _num(r, "p_triggered_swr_given_pulse", np.nan),
+            "chance_triggered_swr_given_pulse": _num(r, "pulse_swr_shuffle_rate_mean", np.nan),
+            "pulse_swr_shuffle_p_ge_observed": _num(r, "pulse_swr_shuffle_p_ge_observed", np.nan),
+            "pulse_swr_shuffle_z_score": _num(r, "pulse_swr_shuffle_z_score", np.nan),
+            "n_triggered_swr": int(_num(r, "n_swr", 0.0)),
+            "n_pulses": int(_num(r, "n_pulses", 0.0)),
+            "p_up_spindle_given_triggered_swr": _num(r, "p_complete_given_swr", np.nan),
+            "n_complete_up_spindle": int(_num(r, "n_complete_swr_up_spindle", 0.0)),
+        })
+
+    out_pdf = root / "PULSE_TRIGGERED_SWR_RATE__ALL_SUBFOLDERS.pdf"
+    out_csv = root / "PULSE_TRIGGERED_SWR_RATE__ALL_SUBFOLDERS.csv"
+    pd.DataFrame(panels).to_csv(out_csv, index=False)
+
+    def _draw_panel(ax, panel):
+        rate = float(panel.get("p_triggered_swr_given_pulse", np.nan))
+        chance = float(panel.get("chance_triggered_swr_given_pulse", np.nan))
+        vals = [rate, chance]
+        ax.bar(["observed", "chance"], vals, color=["#4c78a8", "#9e9e9e"])
+        finite = [v for v in vals if np.isfinite(v)]
+        ax.set_ylim(0, max(finite + [0.05]) * 1.25)
+        ax.set_title(str(panel.get("folder", "")), fontsize=10)
+        ax.set_ylabel("P(triggered SWR | pulse)")
+        for i, v in enumerate(vals):
+            if np.isfinite(v):
+                ax.text(i, v, f"{v:.3f}\n({100.0*v:.1f}%)", ha="center", va="bottom", fontsize=8)
+        ax.text(
+            0.98, 0.94,
+            f"pulses={int(panel.get('n_pulses', 0))}\ntriggered SWR={int(panel.get('n_triggered_swr', 0))}",
+            ha="right",
+            va="top",
+            transform=ax.transAxes,
+            fontsize=8,
+        )
+        p_val = float(panel.get("pulse_swr_shuffle_p_ge_observed", np.nan))
+        z_val = float(panel.get("pulse_swr_shuffle_z_score", np.nan))
+        if np.isfinite(p_val) or np.isfinite(z_val):
+            ax.text(
+                0.98, 0.72,
+                f"z={z_val:.2f}\np={p_val:.4f}",
+                ha="right",
+                va="top",
+                transform=ax.transAxes,
+                fontsize=8,
+            )
+
+    panels_per_page = 6
+    with PdfPages(out_pdf) as pdf:
+        for start in range(0, len(panels), panels_per_page):
+            chunk = panels[start:start + panels_per_page]
+            nrows = 3
+            ncols = 2
+            fig, axes = plt.subplots(nrows, ncols, figsize=(11.0, 8.5))
+            axes_flat = np.asarray(axes).ravel()
+            for ax, panel in zip(axes_flat, chunk):
+                _draw_panel(ax, panel)
+            for ax in axes_flat[len(chunk):]:
+                ax.set_axis_off()
+            fig.suptitle("Pulse-triggered CA1 SWR rate: P(triggered SWR | pulse)", fontsize=13)
+            fig.tight_layout(rect=[0, 0, 1, 0.96])
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+    print(f"[AGG][SWR-RATE] PDF: {out_pdf}")
+    print(f"[AGG][SWR-RATE] CSV: {out_csv}")
+    return out_pdf
+
+
 def _aggregate_subfolder_reports(base_path):
     if os.environ.get("AGGREGATE_SUBFOLDER_PDFS", "1") != "1":
         print("[AGG] skipped (AGGREGATE_SUBFOLDER_PDFS!=1)")
@@ -7913,6 +8795,7 @@ def _aggregate_subfolder_reports(base_path):
     def _count_hits(root_dir):
         hits = list(root_dir.rglob("*__UPSTATES_COMPACT_ALL_PLOTS_STACKED.pdf"))
         hits += list(root_dir.rglob("*__SPINDLE_OVERVIEW_ALL_PLOTS_STACKED.pdf"))
+        hits += list(root_dir.rglob("*__TRIGGERED_ch*_ca1_ch*_s1__swr_up_spindle_summary.csv"))
         return len([p for p in hits if p.is_file() and p.parent != root_dir])
 
     if _count_hits(root) == 0:
@@ -7942,6 +8825,7 @@ def _aggregate_subfolder_reports(base_path):
     print(f"[AGG] SP: {len(sp_in)} files -> {out_sp} | {msg_sp}")
     if not ok_up or not ok_sp:
         print("[AGG][WARN] one or more merged PDFs could not be created")
+    _write_parent_swr_up_spindle_coupling_pdf(root)
 
 
 def main():
@@ -7952,7 +8836,7 @@ def main():
     export_with_layout(
         BASE_TAG, SAVE_DIR, layout_rows,
         rows_per_page=3,          # 3 Zeilen -> alles auf eine Seite
-        also_save_each_svg=True
+        also_save_each_svg=ENABLE_SVG_OUTPUT
     )
     export_with_layout(
         f"{BASE_TAG}__SPINDLE_OVERVIEW",

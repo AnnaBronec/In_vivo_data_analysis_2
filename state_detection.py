@@ -631,11 +631,11 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     if Pulse_intervals.size:
         Pulse_intervals = Pulse_intervals[np.argsort(Pulse_intervals[:, 0])]
 
-    trig_win_s = float(os.environ.get("TRIG_WIN_S", "0.35"))
-    trig_win_off_s = float(os.environ.get("TRIG_WIN_OFF_S", "0.35"))
-    # Causal default: no pre-onset allowance for "triggered" UP states.
-    trig_interval_pre_s = float(os.environ.get("TRIG_INTERVAL_PRE_S", "0.00"))
-    trig_interval_post_s = float(os.environ.get("TRIG_INTERVAL_POST_S", "0.15"))
+    trig_win_s = float(os.environ.get("TRIG_WIN_S", "0.40"))
+    trig_win_off_s = float(os.environ.get("TRIG_WIN_OFF_S", "0.40"))
+    # Causal rule: triggered UPs must start in a window after the pulse offset.
+    trig_interval_min_lat_s = float(os.environ.get("TRIG_INTERVAL_MIN_LAT_S", "0.00"))
+    trig_interval_post_s = float(os.environ.get("TRIG_INTERVAL_POST_S", "0.40"))
     assoc_tail_s = float(os.environ.get("ASSOC_TAIL_S", "0.20"))
     assoc_min_delay_s = float(os.environ.get("ASSOC_MIN_DELAY_S", "0.20"))
     assoc_enable = os.environ.get("ASSOC_ENABLE", "1") == "1"
@@ -673,7 +673,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         # weitere UPs im Pulsfenster -> associated.
         if assoc_enable and Pulse_intervals.size and intervals_reliable:
             for on_t, off_t in Pulse_intervals:
-                trig_lo = float(on_t) - trig_interval_pre_s
+                trig_lo = float(off_t) + max(0.0, trig_interval_min_lat_s)
                 trig_hi = float(off_t) + trig_interval_post_s
                 trig_cand = np.where(
                     (~mask_trig) & (~mask_assoc) &
@@ -702,13 +702,13 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                 t_up = float(up_times[i])
                 t_dn = float(dn_times[i])
 
-                has_near_on = np.any(
-                    (Pulse_times_array >= (t_up - trig_win_s)) &
-                    (Pulse_times_array <= (t_up + trig_win_s))
-                )
+                # Fallback without reliable ON/OFF intervals: triggered means
+                # UP onset inside the causal post-offset window.
+                has_near_on = False
                 has_near_off = np.any(
-                    (Pulse_off_array >= (t_up - trig_win_off_s)) &
-                    (Pulse_off_array <= (t_up + trig_win_off_s))
+                    (Pulse_off_array <= t_up) &
+                    ((t_up - Pulse_off_array) >= 0.0) &
+                    ((t_up - Pulse_off_array) <= trig_win_off_s)
                 )
                 assoc_hi = min(t_dn, t_up + assoc_onset_max_s)
                 has_assoc_late = assoc_enable and np.any(
