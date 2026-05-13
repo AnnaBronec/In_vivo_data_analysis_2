@@ -1005,6 +1005,18 @@ PER_CH_GAIN = {
     # "CSC2_values": 1000.0,
 }
 
+
+def _channel_signal_uV_from_index(ch_idx, sig=None):
+    x = np.asarray(LFP_array[int(ch_idx)] if sig is None else sig, dtype=float)
+    ch_name = chan_cols[int(ch_idx)] if (0 <= int(ch_idx) < len(chan_cols)) else None
+    gain_ch = PER_CH_GAIN.get(ch_name, PREAMP_GAIN)
+    if CALIB_MODE == "counts":
+        return _counts_to_uV(x, ADC_BITS, ADC_VPP, gain_ch)
+    if CALIB_MODE == "volts":
+        return _volts_to_uV(x)
+    return x.copy()
+
+
 UNIT_LABEL = "µV/mm²"          
 PSD_UNIT_LABEL = "µV²/Hz"
 
@@ -1199,6 +1211,52 @@ else:
     NUM_CHANNELS = LFP_array.shape[0]
 
 
+def _downsample_lfp_df_butter_antialias(df_ds, num_channels, downsample_factor):
+    factor = int(downsample_factor)
+    if factor <= 1:
+        time_out = pd.to_numeric(df_ds["timesamples"], errors="coerce").to_numpy(dtype=float)
+        chans = [f"pri_{i}" for i in range(int(num_channels))]
+        dt_out = float(np.nanmedian(np.diff(time_out))) if time_out.size > 1 else 1.0
+        return time_out, dt_out, df_ds[chans].to_numpy(dtype=np.float32).T
+
+    time_full_local = pd.to_numeric(df_ds["timesamples"], errors="coerce").to_numpy(dtype=float)
+    if time_full_local.size < factor * 4:
+        raise ValueError("Too few samples for Butterworth anti-alias downsampling.")
+
+    raw_dt = float(np.nanmedian(np.diff(time_full_local)))
+    if (not np.isfinite(raw_dt)) or raw_dt <= 0:
+        raw_dt = 1.0
+    fs_raw = (DEFAULT_FS_XDAT / raw_dt) if raw_dt > 0.5 else (1.0 / raw_dt)
+    fs_ds = fs_raw / float(factor)
+    nyq_ds = 0.5 * fs_ds
+    cutoff_hz = float(os.environ.get("DOWNSAMPLE_ANTIALIAS_CUTOFF_HZ", str(0.92 * nyq_ds)))
+    cutoff_hz = max(1.0, min(cutoff_hz, 0.98 * nyq_ds))
+    order = int(os.environ.get("DOWNSAMPLE_ANTIALIAS_ORDER", "6"))
+    sos = signal.butter(order, cutoff_hz, btype="lowpass", fs=fs_raw, output="sos")
+
+    n_ds = len(time_full_local[::factor])
+    arr_ds = np.empty((int(num_channels), n_ds), dtype=np.float32)
+    for i in range(int(num_channels)):
+        col = f"pri_{i}"
+        x = pd.to_numeric(df_ds[col], errors="coerce").to_numpy(dtype=float)
+        x = np.nan_to_num(x, nan=float(np.nanmedian(x)))
+        try:
+            y = signal.sosfiltfilt(sos, x)
+        except Exception as e:
+            print(f"[DOWNSAMPLE-AA][WARN] pri_{i} filter failed: {e}; using unfiltered decimation")
+            y = x
+        arr_ds[i, :] = y[::factor][:n_ds].astype(np.float32, copy=False)
+
+    time_out = time_full_local[::factor][:n_ds]
+    dt_out = float(np.nanmedian(np.diff(time_out))) if time_out.size > 1 else factor * raw_dt
+    print(
+        "[DOWNSAMPLE-AA] "
+        f"Butterworth lowpass before decimation: order={order} cutoff={cutoff_hz:g}Hz "
+        f"fs_raw={fs_raw:g}Hz fs_ds={fs_ds:g}Hz factor={factor}"
+    )
+    return time_out, dt_out, arr_ds
+
+
 if FROM_STREAM:
     dt = float(np.median(np.diff(time_s))) if len(time_s) > 1 else 1.0
 
@@ -1227,12 +1285,25 @@ else:
 
     NUM_CHANNELS = len(chan_cols)
 
-    time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(
-        DOWNSAMPLE_FACTOR, LFP_df_ds, NUM_CHANNELS,
-        pulse_times_1=pulse_times_1_full,
-        pulse_times_2=pulse_times_2_full,
-        snap_pulses=True
-    )
+    if str(os.environ.get("DOWNSAMPLE_ANTIALIAS", "0")).strip().lower() not in ("0", "false", "no", "off"):
+        time_s, dt, LFP_array = _downsample_lfp_df_butter_antialias(
+            LFP_df_ds,
+            NUM_CHANNELS,
+            DOWNSAMPLE_FACTOR,
+        )
+        pulse_times_1 = snap_times_to_timebase(
+            _ensure_seconds(pulse_times_1_full, time_s, DEFAULT_FS_XDAT), time_s
+        )
+        pulse_times_2 = snap_times_to_timebase(
+            _ensure_seconds(pulse_times_2_full, time_s, DEFAULT_FS_XDAT), time_s
+        )
+    else:
+        time_s, dt, LFP_array, pulse_times_1, pulse_times_2 = _ds_fun(
+            DOWNSAMPLE_FACTOR, LFP_df_ds, NUM_CHANNELS,
+            pulse_times_1=pulse_times_1_full,
+            pulse_times_2=pulse_times_2_full,
+            snap_pulses=True
+        )
 
     # OFF pulses: seconds normalize + snap
     pulse_times_1_off = snap_times_to_timebase(
@@ -1624,25 +1695,13 @@ ch_idx_used = int(np.clip(req_up_ch, 0, int(NUM_CHANNELS) - 1))
 if ch_idx_used != int(req_up_ch):
     print(f"[WARN] requested UP channel pri_{req_up_ch} not available -> using pri_{ch_idx_used}")
 main_channel = np.asarray(LFP_array[ch_idx_used], dtype=float)
-
-# Für HTML: Main-Channel in µV (mit passendem Gain des globalen Kanals)
-main_channel_uV = None
-if HTML_IN_uV:
-    orig_name = chan_cols[ch_idx_used] if (0 <= ch_idx_used < len(chan_cols)) else None
-    gain_used = PER_CH_GAIN.get(orig_name, PREAMP_GAIN)
-    if CALIB_MODE == "counts":
-        main_channel_uV = _counts_to_uV(main_channel, ADC_BITS, ADC_VPP, gain_used)
-    elif CALIB_MODE == "volts":
-        main_channel_uV = _volts_to_uV(main_channel)
-    elif CALIB_MODE == "uV":
-        main_channel_uV = main_channel.copy()
-    else:
-        main_channel_uV = main_channel.copy()
+main_channel_uV = _channel_signal_uV_from_index(ch_idx_used, main_channel)
 
 print(f"[MAIN-CH] using fixed LFP/UP/SP channel: pri_{ch_idx_used}")
 swr_ch_idx_main = int(np.clip(req_swr_ch, 0, int(NUM_CHANNELS) - 1))
 # SWR always from the configured global channel; this intentionally ignores channel-quality filtering.
 swr_channel = np.asarray(LFP_array[int(swr_ch_idx_main)], dtype=float) if enable_swr else None
+swr_channel_uV = _channel_signal_uV_from_index(swr_ch_idx_main, swr_channel) if enable_swr else None
 print(
     f"[CHAN-MODE] dual_probe={int(is_dual_probe_mode)} "
     f"requested_UP=pri_{req_up_ch} "
@@ -1650,6 +1709,8 @@ print(
     f"UP=pri_{ch_idx_used} "
     f"SWR={'pri_' + str(swr_ch_idx_main) if enable_swr else 'disabled'}"
 )
+if enable_swr:
+    print("[SWR-UNITS] absolute sharp-wave thresholds are evaluated on uV-scaled SWR signal")
 
 
 if HIGH_CUTOFF <= LOW_CUTOFF:
@@ -2336,6 +2397,7 @@ def detect_spindle_intervals_in_upstates(
     min_cycles=1,
     min_spindle_band_power_ratio=1.0,
     min_spindle_power_fraction=0.05,
+    min_band_ptp_sigma=0.0,
     min_env_peak_quantile=0.02,
     min_env_peak_sigma=0.55,
     off_below_s=0.06,
@@ -2396,6 +2458,11 @@ def detect_spindle_intervals_in_upstates(
     mad = float(np.nanmedian(np.abs(e_up - med)))
     robust_sigma = 1.4826 * mad
     sig = max(robust_sigma, 1e-12)
+    xb_up = xb[up_mask]
+    xb_med = float(np.nanmedian(xb_up))
+    xb_mad = float(np.nanmedian(np.abs(xb_up - xb_med)))
+    xb_sigma = max(1.4826 * xb_mad, 1e-12)
+    band_ptp_floor = max(0.0, float(min_band_ptp_sigma)) * xb_sigma
     thr_on = med + float(thr_k_on) * sig
     thr_off = med + float(thr_k_off) * sig
     if thr_off > thr_on:
@@ -2454,6 +2521,7 @@ def detect_spindle_intervals_in_upstates(
 
     out = []
     n_after_duration = 0
+    n_after_band_ptp = 0
     n_after_env = 0
     n_after_cycles = 0
     n_after_psd = 0
@@ -2471,6 +2539,11 @@ def detect_spindle_intervals_in_upstates(
         if L < min_len or L > max_len:
             continue
         n_after_duration += 1
+        if band_ptp_floor > 0:
+            seg_ptp = float(np.nanmax(xb[s:e]) - np.nanmin(xb[s:e]))
+            if (not np.isfinite(seg_ptp)) or seg_ptp < band_ptp_floor:
+                continue
+        n_after_band_ptp += 1
         if float(np.nanmax(env[s:e])) < env_peak_floor:
             continue
         n_after_env += 1
@@ -2505,10 +2578,170 @@ def detect_spindle_intervals_in_upstates(
         print(
             "[SPINDLE-DBG] segs=", len(segs),
             "after_dur=", n_after_duration,
+            "after_band_ptp=", n_after_band_ptp,
             "after_env=", n_after_env,
             "after_cycles=", n_after_cycles,
             "after_psd=", n_after_psd,
             "accepted=", len(out),
+        )
+    return out
+
+
+def _detect_ripple_intervals_by_envelope_peaks(
+    signal_1d,
+    time_s,
+    dt,
+    up_pairs,
+    *,
+    f_lo=120.0,
+    f_hi=270.0,
+    thr_k_on=1.15,
+    thr_k_off=0.30,
+    min_dur_s=0.040,
+    max_dur_s=0.500,
+    max_gap_s=0.050,
+    min_cycles=4,
+    min_env_peak_quantile=0.02,
+    min_env_peak_sigma=1.10,
+    only_in_upstates=False,
+    require_up_overlap=False,
+    causal_filter=True,
+):
+    x = np.asarray(signal_1d, float).reshape(-1)
+    t = np.asarray(time_s, float).reshape(-1)
+    if x.size < 10 or t.size != x.size or dt <= 0:
+        return []
+
+    fs = 1.0 / float(dt)
+    nyq = 0.5 * fs
+    lo = max(0.5, float(f_lo))
+    hi = min(float(f_hi), 0.95 * nyq)
+    if lo >= hi:
+        return []
+
+    x0 = np.nan_to_num(x, nan=float(np.nanmedian(x)))
+    try:
+        if causal_filter:
+            sos = signal.butter(3, [lo / nyq, hi / nyq], btype="bandpass", output="sos")
+            xb = signal.sosfilt(sos, x0)
+        else:
+            b, a = signal.butter(3, [lo / nyq, hi / nyq], btype="bandpass")
+            xb = signal.filtfilt(b, a, x0)
+        env = np.abs(signal.hilbert(xb))
+    except Exception:
+        return []
+
+    valid_up_pairs = []
+    for u, d in up_pairs:
+        try:
+            ui = int(u)
+            di = int(d)
+        except Exception:
+            continue
+        ui = max(0, min(ui, x.size))
+        di = max(0, min(di, x.size))
+        if di > ui:
+            valid_up_pairs.append((ui, di))
+
+    if only_in_upstates:
+        up_mask = np.zeros_like(x, dtype=bool)
+        for u, d in valid_up_pairs:
+            up_mask[u:d] = True
+        if not np.any(up_mask):
+            return []
+    else:
+        up_mask = np.ones_like(x, dtype=bool)
+        if require_up_overlap and (not valid_up_pairs):
+            return []
+
+    e_ref = env[up_mask]
+    med = float(np.nanmedian(e_ref))
+    sig = max(1.4826 * float(np.nanmedian(np.abs(e_ref - med))), 1e-12)
+    thr_on = med + float(thr_k_on) * sig
+    thr_off = med + float(thr_k_off) * sig
+    if thr_off > thr_on:
+        thr_off = thr_on
+    peak_floor = max(
+        float(np.nanquantile(e_ref, float(min_env_peak_quantile))),
+        med + float(min_env_peak_sigma) * sig,
+        thr_on,
+    )
+
+    xb_ref = xb[up_mask]
+    xb_med = float(np.nanmedian(xb_ref))
+    xb_sig = max(1.4826 * float(np.nanmedian(np.abs(xb_ref - xb_med))), 1e-12)
+    ptp_floor = max(0.0, float(os.environ.get("SWR_RIPPLE_MIN_PTP_SIGMA", "4.0"))) * xb_sig
+
+    min_len = max(1, int(round(float(min_dur_s) / float(dt))))
+    max_len = max(min_len, int(round(float(max_dur_s) / float(dt))))
+    max_gap = max(0, int(round(float(max_gap_s) / float(dt))))
+    min_peak_distance = max(1, int(round(0.5 * float(min_dur_s) / float(dt))))
+    peak_idx, props = signal.find_peaks(env, height=peak_floor, distance=min_peak_distance)
+    if peak_idx.size == 0:
+        return []
+    peak_idx = peak_idx[up_mask[peak_idx]]
+    if peak_idx.size == 0:
+        return []
+
+    segs = []
+    for p in peak_idx:
+        s = int(p)
+        while s > 0 and up_mask[s - 1] and env[s - 1] >= thr_off and (p - s) < max_len:
+            s -= 1
+        e = int(p) + 1
+        while e < x.size and up_mask[e] and env[e] >= thr_off and (e - p) < max_len:
+            e += 1
+        if (e - s) < min_len:
+            half = max(1, min_len // 2)
+            s = max(0, int(p) - half)
+            e = min(x.size, s + min_len)
+        if (e - s) > max_len:
+            half = max_len // 2
+            s = max(0, int(p) - half)
+            e = min(x.size, s + max_len)
+        segs.append((s, e))
+
+    segs.sort()
+    merged = []
+    for s, e in segs:
+        if not merged or s - merged[-1][1] > max_gap or (e - merged[-1][0]) > max_len:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+
+    out = []
+    n_after_duration = 0
+    n_after_ptp = 0
+    n_after_cycles = 0
+    peak_distance = max(1, int(round(fs / max(hi, 1.0) * 0.8)))
+    for s, e in merged:
+        if require_up_overlap:
+            if not any((s < d) and (e > u) for u, d in valid_up_pairs):
+                continue
+        if (e - s) < min_len or (e - s) > max_len:
+            continue
+        n_after_duration += 1
+        seg_ptp = float(np.nanmax(xb[s:e]) - np.nanmin(xb[s:e]))
+        if (not np.isfinite(seg_ptp)) or seg_ptp < ptp_floor:
+            continue
+        n_after_ptp += 1
+        peaks, _ = signal.find_peaks(xb[s:e], distance=peak_distance)
+        troughs, _ = signal.find_peaks(-xb[s:e], distance=peak_distance)
+        if min(peaks.size, troughs.size) < int(min_cycles):
+            continue
+        n_after_cycles += 1
+        out.append((float(t[s]), float(t[e - 1])))
+
+    if DEBUG_MAIN_SAFE:
+        print(
+            "[SWR-VIS-DBG] peaks=", int(peak_idx.size),
+            "merged=", len(merged),
+            "after_dur=", n_after_duration,
+            "after_ptp=", n_after_ptp,
+            "after_cycles=", n_after_cycles,
+            "accepted=", len(out),
+            "peak_floor=", float(peak_floor),
+            "ptp_floor=", float(ptp_floor),
         )
     return out
 
@@ -2534,34 +2767,57 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     require_up_overlap=True,
     causal_filter=True,
 ):
-    ripple_candidates = detect_spindle_intervals_in_upstates(
-        signal_1d,
-        time_s,
-        dt,
-        up_pairs,
-        f_lo=float(f_lo),
-        f_hi=float(f_hi),
-        thr_k_on=float(thr_k_on),
-        thr_k_off=float(thr_k_off),
-        min_dur_s=float(min_dur_s),
-        max_dur_s=float(max_dur_s),
-        max_gap_s=float(max_gap_s),
-        min_cycles=int(min_cycles),
-        min_spindle_band_power_ratio=1.0,
-        min_spindle_power_fraction=0.0,
-        min_env_peak_quantile=float(min_env_peak_quantile),
-        min_env_peak_sigma=float(min_env_peak_sigma),
-        off_below_s=float(off_below_s),
-        only_in_upstates=bool(only_in_upstates),
-        require_up_overlap=bool(require_up_overlap),
-        use_psd_check=False,
-        causal_filter=bool(causal_filter),
-    )
+    use_visual_detector = str(os.environ.get("SWR_VISUAL_DETECTOR", "1")).strip().lower() not in ("0", "false", "no", "off")
+    if use_visual_detector:
+        ripple_candidates = _detect_ripple_intervals_by_envelope_peaks(
+            signal_1d,
+            time_s,
+            dt,
+            up_pairs,
+            f_lo=float(f_lo),
+            f_hi=float(f_hi),
+            thr_k_on=float(thr_k_on),
+            thr_k_off=float(thr_k_off),
+            min_dur_s=float(min_dur_s),
+            max_dur_s=float(max_dur_s),
+            max_gap_s=float(max_gap_s),
+            min_cycles=int(min_cycles),
+            min_env_peak_quantile=float(min_env_peak_quantile),
+            min_env_peak_sigma=float(min_env_peak_sigma),
+            only_in_upstates=bool(only_in_upstates),
+            require_up_overlap=bool(require_up_overlap),
+            causal_filter=bool(causal_filter),
+        )
+    else:
+        ripple_candidates = detect_spindle_intervals_in_upstates(
+            signal_1d,
+            time_s,
+            dt,
+            up_pairs,
+            f_lo=float(f_lo),
+            f_hi=float(f_hi),
+            thr_k_on=float(thr_k_on),
+            thr_k_off=float(thr_k_off),
+            min_dur_s=float(min_dur_s),
+            max_dur_s=float(max_dur_s),
+            max_gap_s=float(max_gap_s),
+            min_cycles=int(min_cycles),
+            min_spindle_band_power_ratio=1.0,
+            min_spindle_power_fraction=0.0,
+            min_band_ptp_sigma=float(os.environ.get("SWR_RIPPLE_MIN_PTP_SIGMA", "4.0")),
+            min_env_peak_quantile=float(min_env_peak_quantile),
+            min_env_peak_sigma=float(min_env_peak_sigma),
+            off_below_s=float(off_below_s),
+            only_in_upstates=bool(only_in_upstates),
+            require_up_overlap=bool(require_up_overlap),
+            use_psd_check=False,
+            causal_filter=bool(causal_filter),
+        )
     if not ripple_candidates:
         return []
 
-    # Optional SW gate to reduce false positives: require a time-locked low-frequency
-    # sharp-wave deflection around each ripple candidate.
+    # Optional SW gate to reduce false positives: first detect ripple-band
+    # oscillations, then require a low-frequency sharp-wave deflection nearby.
     sw_gate_on = str(os.environ.get("SWR_REQUIRE_SHARP_WAVE", "1")).strip().lower() not in ("0", "false", "no", "off")
     if not sw_gate_on:
         return ripple_candidates
@@ -2574,20 +2830,22 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     sw_lo = float(os.environ.get("SWR_SW_F_LO_HZ", "2.0"))
     sw_hi = float(os.environ.get("SWR_SW_F_HI_HZ", "40.0"))
     sw_pad_s = float(os.environ.get("SWR_SW_PAD_S", "0.080"))
-    sw_amp_sigma = float(os.environ.get("SWR_SW_MIN_AMP_SIGMA", "2.5"))
-    sw_ptp_sigma = float(os.environ.get("SWR_SW_MIN_PTP_SIGMA", "4.5"))
-    sw_slope_sigma = float(os.environ.get("SWR_SW_MIN_SLOPE_SIGMA", "0.8"))
-    sw_prom_sigma = float(os.environ.get("SWR_SW_MIN_PROM_SIGMA", "3.0"))
-    sw_min_width_s = float(os.environ.get("SWR_SW_MIN_WIDTH_S", "0.012"))
-    sw_max_width_s = float(os.environ.get("SWR_SW_MAX_WIDTH_S", "0.120"))
-    sw_min_abs_amp = float(os.environ.get("SWR_SW_MIN_ABS_AMP", "0.0"))
-    sw_center_tol_s = float(os.environ.get("SWR_SW_CENTER_TOL_S", "0.040"))
-    sw_polarity = str(os.environ.get("SWR_SW_POLARITY", "auto")).strip().lower()  # auto|negative|positive|both
+    sw_amp_sigma = float(os.environ.get("SWR_SW_MIN_AMP_SIGMA", "0.0"))
+    sw_ptp_sigma = float(os.environ.get("SWR_SW_MIN_PTP_SIGMA", "0.0"))
+    sw_slope_sigma = float(os.environ.get("SWR_SW_MIN_SLOPE_SIGMA", "0.0"))
+    sw_prom_sigma = float(os.environ.get("SWR_SW_MIN_PROM_SIGMA", "1.0"))
+    sw_min_width_s = float(os.environ.get("SWR_SW_MIN_WIDTH_S", "0.015"))
+    sw_max_width_s = float(os.environ.get("SWR_SW_MAX_WIDTH_S", "0.160"))
+    sw_min_abs_amp = float(os.environ.get("SWR_SW_MIN_ABS_AMP", "2.0"))
+    sw_min_ptp_uv = float(os.environ.get("SWR_SW_MIN_PTP_UV", "5.0"))
+    sw_center_tol_s = float(os.environ.get("SWR_SW_CENTER_TOL_S", "0.090"))
+    sw_polarity = str(os.environ.get("SWR_SW_POLARITY", "negative")).strip().lower()  # auto|negative|positive|both
     sw_require_overlap = str(os.environ.get("SWR_SW_REQUIRE_OVERLAP", "1")).strip().lower() not in ("0", "false", "no", "off")
     sw_min_overlap_s = float(os.environ.get("SWR_SW_MIN_OVERLAP_S", "0.006"))
     sw_overlap_pad_s = float(os.environ.get("SWR_SW_OVERLAP_PAD_S", "0.000"))
-    sw_require_center = str(os.environ.get("SWR_SW_REQUIRE_CENTER", "0")).strip().lower() not in ("0", "false", "no", "off")
-    return_combined_interval = str(os.environ.get("SWR_RETURN_COMBINED_INTERVAL", "1")).strip().lower() not in ("0", "false", "no", "off")
+    sw_require_center = str(os.environ.get("SWR_SW_REQUIRE_CENTER", "1")).strip().lower() not in ("0", "false", "no", "off")
+    sw_search_within_ripple = str(os.environ.get("SWR_SW_SEARCH_WITHIN_RIPPLE", "1")).strip().lower() not in ("0", "false", "no", "off")
+    return_combined_interval = str(os.environ.get("SWR_RETURN_COMBINED_INTERVAL", "0")).strip().lower() not in ("0", "false", "no", "off")
     combined_pad_n = max(0, int(round(float(os.environ.get("SWR_COMBINED_PAD_S", "0.015")) / float(dt))))
 
     sw_band = _bandpass_1d(x, dt, f_lo=sw_lo, f_hi=sw_hi, order=3, causal=bool(causal_filter))
@@ -2598,7 +2856,7 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     amp_thr = max(sw_amp_sigma * sw_sigma, 1e-12)
     if sw_min_abs_amp > 0:
         amp_thr = max(amp_thr, sw_min_abs_amp)
-    ptp_thr = max(sw_ptp_sigma * sw_sigma, 1e-12)
+    ptp_thr = max(sw_ptp_sigma * sw_sigma, sw_min_ptp_uv, 1e-12)
     prom_thr = max(sw_prom_sigma * sw_sigma, 1e-12)
     sw_d = np.diff(sw_band) / float(dt)
     sw_d_med = float(np.nanmedian(sw_d)) if sw_d.size else 0.0
@@ -2608,6 +2866,8 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
     pad_n = max(1, int(round(sw_pad_s / dt)))
     overlap_pad_n = max(0, int(round(sw_overlap_pad_s / dt)))
     min_overlap_n = max(1, int(round(sw_min_overlap_s / dt)))
+    sw_gate_qa = str(os.environ.get("SWR_SW_GATE_QA", "0")).strip().lower() not in ("0", "false", "no", "off")
+    qa_rows = []
 
     out = []
     n_pass_amp_ptp = 0
@@ -2627,8 +2887,12 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
         if e <= s:
             continue
         c_idx = int(round(0.5 * (s + e - 1)))
-        a = max(0, s - pad_n)
-        b = min(t.size, e + pad_n)
+        if sw_search_within_ripple:
+            a = s
+            b = e
+        else:
+            a = max(0, s - pad_n)
+            b = min(t.size, e + pad_n)
         seg = sw_band[a:b]
         if seg.size < 3:
             continue
@@ -2637,9 +2901,10 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
         i_max = int(np.argmax(seg))
         v_min = float(seg[i_min])
         v_max = float(seg[i_max])
-        neg_ok = abs(v_min) >= amp_thr
-        pos_ok = abs(v_max) >= amp_thr
-        ptp_ok = (v_max - v_min) >= ptp_thr
+        neg_ok = v_min <= -amp_thr
+        pos_ok = v_max >= amp_thr
+        sw_ptp = float(v_max - v_min)
+        ptp_ok = sw_ptp > ptp_thr
         seg_d = np.diff(seg) / float(dt)
         slope_ok = True
         if slope_thr > 0:
@@ -2667,10 +2932,27 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
             prom_trace = -seg if abs(v_min) >= abs(v_max) else seg
 
         if not pol_ok or not ptp_ok:
+            if sw_gate_qa:
+                qa_rows.append({
+                    "stage": "fail_polarity_or_ptp",
+                    "t0_s": float(t0), "t1_s": float(t1),
+                    "sw_ptp_uV": sw_ptp,
+                    "v_min_uV": v_min, "v_max_uV": v_max,
+                    "ptp_thr_uV": float(ptp_thr),
+                    "amp_thr_uV": float(amp_thr),
+                    "pol_ok": int(bool(pol_ok)),
+                    "ptp_ok": int(bool(ptp_ok)),
+                    "prom_uV": np.nan,
+                    "width_s": np.nan,
+                    "center_dt_s": abs(sw_idx - c_idx) * float(dt),
+                    "overlap_samples": np.nan,
+                })
             continue
         n_pass_amp_ptp += 1
         prom_ok = True
         width_ok = True
+        prom = np.nan
+        width_s = np.nan
         width_left_idx = sw_rel_idx
         width_right_idx = sw_rel_idx
         if prom_thr > 0 or sw_min_width_s > 0 or sw_max_width_s > 0:
@@ -2691,19 +2973,80 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
                 prom_ok = False
                 width_ok = False
         if not (prom_ok and width_ok):
+            if sw_gate_qa:
+                qa_rows.append({
+                    "stage": "fail_prom_or_width",
+                    "t0_s": float(t0), "t1_s": float(t1),
+                    "sw_ptp_uV": sw_ptp,
+                    "v_min_uV": v_min, "v_max_uV": v_max,
+                    "ptp_thr_uV": float(ptp_thr),
+                    "amp_thr_uV": float(amp_thr),
+                    "pol_ok": int(bool(pol_ok)),
+                    "ptp_ok": int(bool(ptp_ok)),
+                    "prom_uV": float(prom) if np.isfinite(prom) else np.nan,
+                    "width_s": float(width_s) if np.isfinite(width_s) else np.nan,
+                    "center_dt_s": abs(sw_idx - c_idx) * float(dt),
+                    "overlap_samples": np.nan,
+                })
             continue
         n_pass_prom_width += 1
         if not slope_ok:
+            if sw_gate_qa:
+                qa_rows.append({
+                    "stage": "fail_slope",
+                    "t0_s": float(t0), "t1_s": float(t1),
+                    "sw_ptp_uV": sw_ptp,
+                    "v_min_uV": v_min, "v_max_uV": v_max,
+                    "ptp_thr_uV": float(ptp_thr),
+                    "amp_thr_uV": float(amp_thr),
+                    "pol_ok": int(bool(pol_ok)),
+                    "ptp_ok": int(bool(ptp_ok)),
+                    "prom_uV": float(prom) if np.isfinite(prom) else np.nan,
+                    "width_s": float(width_s) if np.isfinite(width_s) else np.nan,
+                    "center_dt_s": abs(sw_idx - c_idx) * float(dt),
+                    "overlap_samples": np.nan,
+                })
             continue
         n_pass_slope += 1
 
+        overlap_samples = np.nan
         if sw_require_overlap:
             s_ov = max(0, s - overlap_pad_n)
             e_ov = min(t.size, e + overlap_pad_n)
             if e_ov <= s_ov:
+                if sw_gate_qa:
+                    qa_rows.append({
+                        "stage": "fail_overlap_window",
+                        "t0_s": float(t0), "t1_s": float(t1),
+                        "sw_ptp_uV": sw_ptp,
+                        "v_min_uV": v_min, "v_max_uV": v_max,
+                        "ptp_thr_uV": float(ptp_thr),
+                        "amp_thr_uV": float(amp_thr),
+                        "pol_ok": int(bool(pol_ok)),
+                        "ptp_ok": int(bool(ptp_ok)),
+                        "prom_uV": float(prom) if np.isfinite(prom) else np.nan,
+                        "width_s": float(width_s) if np.isfinite(width_s) else np.nan,
+                        "center_dt_s": abs(sw_idx - c_idx) * float(dt),
+                        "overlap_samples": np.nan,
+                    })
                 continue
             ov_seg = sw_band[s_ov:e_ov]
             if ov_seg.size == 0:
+                if sw_gate_qa:
+                    qa_rows.append({
+                        "stage": "fail_overlap_empty",
+                        "t0_s": float(t0), "t1_s": float(t1),
+                        "sw_ptp_uV": sw_ptp,
+                        "v_min_uV": v_min, "v_max_uV": v_max,
+                        "ptp_thr_uV": float(ptp_thr),
+                        "amp_thr_uV": float(amp_thr),
+                        "pol_ok": int(bool(pol_ok)),
+                        "ptp_ok": int(bool(ptp_ok)),
+                        "prom_uV": float(prom) if np.isfinite(prom) else np.nan,
+                        "width_s": float(width_s) if np.isfinite(width_s) else np.nan,
+                        "center_dt_s": abs(sw_idx - c_idx) * float(dt),
+                        "overlap_samples": np.nan,
+                    })
                 continue
             if sw_polarity == "negative":
                 sw_mask = ov_seg <= -amp_thr
@@ -2713,15 +3056,61 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
                 sw_mask = (ov_seg <= -amp_thr) | (ov_seg >= amp_thr)
             else:
                 sw_mask = np.abs(ov_seg) >= amp_thr
-            if int(np.count_nonzero(sw_mask)) < int(min_overlap_n):
+            overlap_samples = int(np.count_nonzero(sw_mask))
+            if int(overlap_samples) < int(min_overlap_n):
+                if sw_gate_qa:
+                    qa_rows.append({
+                        "stage": "fail_overlap",
+                        "t0_s": float(t0), "t1_s": float(t1),
+                        "sw_ptp_uV": sw_ptp,
+                        "v_min_uV": v_min, "v_max_uV": v_max,
+                        "ptp_thr_uV": float(ptp_thr),
+                        "amp_thr_uV": float(amp_thr),
+                        "pol_ok": int(bool(pol_ok)),
+                        "ptp_ok": int(bool(ptp_ok)),
+                        "prom_uV": float(prom) if np.isfinite(prom) else np.nan,
+                        "width_s": float(width_s) if np.isfinite(width_s) else np.nan,
+                        "center_dt_s": abs(sw_idx - c_idx) * float(dt),
+                        "overlap_samples": int(overlap_samples),
+                    })
                 continue
         n_pass_overlap += 1
 
         if sw_require_center:
             center_ok = abs(sw_idx - c_idx) * float(dt) <= sw_center_tol_s
             if not center_ok:
+                if sw_gate_qa:
+                    qa_rows.append({
+                        "stage": "fail_center",
+                        "t0_s": float(t0), "t1_s": float(t1),
+                        "sw_ptp_uV": sw_ptp,
+                        "v_min_uV": v_min, "v_max_uV": v_max,
+                        "ptp_thr_uV": float(ptp_thr),
+                        "amp_thr_uV": float(amp_thr),
+                        "pol_ok": int(bool(pol_ok)),
+                        "ptp_ok": int(bool(ptp_ok)),
+                        "prom_uV": float(prom) if np.isfinite(prom) else np.nan,
+                        "width_s": float(width_s) if np.isfinite(width_s) else np.nan,
+                        "center_dt_s": abs(sw_idx - c_idx) * float(dt),
+                        "overlap_samples": int(overlap_samples) if np.isfinite(overlap_samples) else np.nan,
+                    })
                 continue
         n_pass_center += 1
+        if sw_gate_qa:
+            qa_rows.append({
+                "stage": "keep",
+                "t0_s": float(t0), "t1_s": float(t1),
+                "sw_ptp_uV": sw_ptp,
+                "v_min_uV": v_min, "v_max_uV": v_max,
+                "ptp_thr_uV": float(ptp_thr),
+                "amp_thr_uV": float(amp_thr),
+                "pol_ok": int(bool(pol_ok)),
+                "ptp_ok": int(bool(ptp_ok)),
+                "prom_uV": float(prom) if np.isfinite(prom) else np.nan,
+                "width_s": float(width_s) if np.isfinite(width_s) else np.nan,
+                "center_dt_s": abs(sw_idx - c_idx) * float(dt),
+                "overlap_samples": int(overlap_samples) if np.isfinite(overlap_samples) else np.nan,
+            })
         if return_combined_interval:
             sw_left = max(a, a + int(width_left_idx) - combined_pad_n)
             sw_right = min(b, a + int(width_right_idx) + combined_pad_n + 1)
@@ -2734,7 +3123,8 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
         else:
             out.append((float(t0), float(t1)))
 
-    if DEBUG_MAIN_SAFE:
+    sw_gate_debug = DEBUG_MAIN_SAFE or str(os.environ.get("SWR_SW_GATE_DEBUG", "0")).strip().lower() not in ("0", "false", "no", "off")
+    if sw_gate_debug:
         print(
             "[SWR-SW-GATE] "
             f"cand={len(ripple_candidates)} keep={len(out)} "
@@ -2743,13 +3133,25 @@ def detect_sharp_wave_ripple_intervals_in_upstates(
             f"prom_sigma={sw_prom_sigma:.2f} "
             f"width_s={sw_min_width_s:.4f}-{sw_max_width_s:.4f} "
             f"slope_sigma={sw_slope_sigma:.2f} min_abs_amp={sw_min_abs_amp:.4g} "
-            f"pol={sw_polarity} require_overlap={int(sw_require_overlap)} "
+            f"pol={sw_polarity} search_within_ripple={int(sw_search_within_ripple)} "
+            f"require_overlap={int(sw_require_overlap)} "
             f"return_combined_interval={int(return_combined_interval)} "
             f"min_overlap_s={sw_min_overlap_s:.4f} overlap_pad_s={sw_overlap_pad_s:.4f} "
             f"require_center={int(sw_require_center)} center_tol_s={sw_center_tol_s:.3f} "
             f"pass_amp_ptp={n_pass_amp_ptp} pass_prom_width={n_pass_prom_width} pass_slope={n_pass_slope} "
             f"pass_overlap={n_pass_overlap} pass_center={n_pass_center}"
         )
+    if sw_gate_qa and qa_rows:
+        try:
+            qa_counter = int(getattr(detect_sharp_wave_ripple_intervals_in_upstates, "_qa_counter", 0)) + 1
+            setattr(detect_sharp_wave_ripple_intervals_in_upstates, "_qa_counter", qa_counter)
+            qa_dir = globals().get("SAVE_DIR", os.getcwd())
+            qa_tag = globals().get("BASE_TAG", "analysis")
+            qa_path = os.path.join(str(qa_dir), f"{qa_tag}__swr_sw_gate_QA_{qa_counter:02d}.csv")
+            pd.DataFrame(qa_rows).to_csv(qa_path, index=False)
+            print(f"[SWR-SW-GATE-QA] wrote {qa_path}")
+        except Exception as e:
+            print(f"[SWR-SW-GATE-QA][WARN] failed to write QA CSV: {e}")
     return out
 
 
@@ -2773,6 +3175,69 @@ def _bandpass_1d(signal_1d, dt, f_lo=10.0, f_hi=15.0, order=3, causal=True):
     except Exception as e:
         print(f"[WARN] bandpass {f_lo}-{f_hi} Hz failed: {e}")
         return x.copy()
+
+
+def _parse_float_list_env(name, default=""):
+    raw = str(os.environ.get(name, default)).strip()
+    if not raw:
+        return []
+    vals = []
+    for part in re.split(r"[,\s;]+", raw):
+        if not part:
+            continue
+        try:
+            vals.append(float(part))
+        except Exception:
+            print(f"[WARN] ignoring invalid {name} value: {part!r}")
+    return vals
+
+
+def _notch_filter_1d(signal_1d, dt, freqs_hz, q=35.0, causal=False):
+    x = np.asarray(signal_1d, float).reshape(-1)
+    if x.size < 10 or dt <= 0:
+        return x.copy()
+    freqs = [float(f) for f in freqs_hz if np.isfinite(f) and float(f) > 0]
+    if not freqs:
+        return x.copy()
+    fs = 1.0 / float(dt)
+    nyq = 0.5 * fs
+    y = np.nan_to_num(x, nan=float(np.nanmedian(x)))
+    for f0 in freqs:
+        if f0 >= 0.95 * nyq:
+            print(f"[WARN] skipping notch {f0:g} Hz: above Nyquist for fs={fs:g} Hz")
+            continue
+        try:
+            b, a = signal.iirnotch(w0=f0, Q=float(q), fs=fs)
+            y = signal.lfilter(b, a, y) if causal else signal.filtfilt(b, a, y)
+        except Exception as e:
+            print(f"[WARN] notch {f0:g} Hz failed: {e}")
+    return y
+
+
+def _smooth_1d(signal_1d, dt, smooth_s):
+    y = np.asarray(signal_1d, float).reshape(-1)
+    n = int(round(float(smooth_s) / float(dt))) if dt > 0 else 0
+    if y.size < 3 or n <= 1:
+        return y.copy()
+    n = max(1, min(n, max(1, y.size // 2)))
+    kernel = np.ones(n, dtype=float) / float(n)
+    return np.convolve(y, kernel, mode="same")
+
+
+def _ripple_visual_trace_from_band(ripple_band, dt, mode="bandpass", smooth_s=0.008):
+    mode = str(mode or "bandpass").strip().lower()
+    rb = np.asarray(ripple_band, float).reshape(-1)
+    if mode in ("env", "envelope", "hilbert"):
+        try:
+            env = np.abs(signal.hilbert(np.nan_to_num(rb, nan=float(np.nanmedian(rb)))))
+        except Exception as e:
+            print(f"[WARN] ripple envelope failed: {e}")
+            return rb.copy(), "bandpass"
+        return _smooth_1d(env, dt, smooth_s), "envelope"
+    if mode in ("rms", "power"):
+        rms = np.sqrt(_smooth_1d(np.square(np.nan_to_num(rb, nan=0.0)), dt, smooth_s))
+        return rms, "RMS"
+    return rb.copy(), "bandpass"
 
 
 def _filter_swr_by_up_relative_sharpwave_amp(
@@ -2932,6 +3397,7 @@ def _classify_swr_by_best_sharpwave_per_pulse(
             one_triggered_per_pulse=True,
         )
 
+    score_mode = str(os.environ.get("SWR_BEST_PER_PULSE_SCORE", "ripple")).strip().lower()
     sw_band = _bandpass_1d(
         sig,
         dt,
@@ -2940,6 +3406,21 @@ def _classify_swr_by_best_sharpwave_per_pulse(
         order=3,
         causal=bool(causal_filter),
     )
+    ripple_band = None
+    ripple_env = None
+    if score_mode == "ripple":
+        ripple_band = _bandpass_1d(
+            sig,
+            dt,
+            f_lo=float(os.environ.get("SWR_F_LO_HZ", "120.0")),
+            f_hi=float(os.environ.get("SWR_F_HI_HZ", "270.0")),
+            order=3,
+            causal=bool(causal_filter),
+        )
+        try:
+            ripple_env = np.abs(signal.hilbert(np.asarray(ripple_band, float)))
+        except Exception:
+            ripple_env = None
     pad_n = max(0, int(round(float(sw_pad_s) / float(dt))))
 
     by_pulse = {}
@@ -2959,10 +3440,14 @@ def _classify_swr_by_best_sharpwave_per_pulse(
         e = int(np.searchsorted(t, t1, side="right"))
         s = max(0, min(s, t.size - 1))
         e = max(s + 1, min(e, t.size))
-        a = max(0, s - pad_n)
-        b = min(t.size, e + pad_n)
-        seg = np.asarray(sw_band[a:b], float)
-        score = float(np.nanmax(seg) - np.nanmin(seg)) if seg.size else 0.0
+        if score_mode == "ripple":
+            seg = np.asarray((ripple_env if ripple_env is not None else ripple_band)[s:e], float)
+            score = float(np.nanmax(seg)) if seg.size else 0.0
+        else:
+            a = max(0, s - pad_n)
+            b = min(t.size, e + pad_n)
+            seg = np.asarray(sw_band[a:b], float)
+            score = float(np.nanmax(seg) - np.nanmin(seg)) if seg.size else 0.0
         event_meta.append((idx, j, lat, score))
         if j not in by_pulse or score > by_pulse[j][2]:
             by_pulse[j] = (idx, lat, score)
@@ -2986,6 +3471,7 @@ def _classify_swr_by_best_sharpwave_per_pulse(
             f"triggered={len(triggered)}",
             f"pulses_with_swr={len(triggered_idx)}",
             f"trig_win_s={float(trig_win_s):.3f}",
+            f"score_mode={score_mode}",
         )
     return spontaneous, triggered, np.asarray(trig_lat, dtype=float)
 
@@ -3670,17 +4156,17 @@ try:
                     sig_plot = sig_raw.copy()
 
             swr_int = detect_sharp_wave_ripple_intervals_in_upstates(
-                sig_raw, time_s, dt, all_up_pairs,
+                _channel_signal_uV_from_index(ch_idx, sig_raw), time_s, dt, all_up_pairs,
                 f_lo=scan_f_lo,
                 f_hi=scan_f_hi,
-                thr_k_on=float(os.environ.get("SWR_SCAN_THR_ON", "0.90")),
+                thr_k_on=float(os.environ.get("SWR_SCAN_THR_ON", "1.15")),
                 thr_k_off=float(os.environ.get("SWR_SCAN_THR_OFF", "0.30")),
                 min_dur_s=float(os.environ.get("SWR_SCAN_MIN_DUR_S", "0.040")),
                 max_dur_s=float(os.environ.get("SWR_SCAN_MAX_DUR_S", "0.150")),
                 max_gap_s=float(os.environ.get("SWR_SCAN_MAX_GAP_S", "0.020")),
-                min_cycles=int(os.environ.get("SWR_SCAN_MIN_CYCLES", "2")),
-                min_env_peak_quantile=float(os.environ.get("SWR_SCAN_MIN_ENV_Q", "0.03")),
-                min_env_peak_sigma=float(os.environ.get("SWR_SCAN_MIN_ENV_SIGMA", "0.60")),
+                min_cycles=int(os.environ.get("SWR_SCAN_MIN_CYCLES", "4")),
+                min_env_peak_quantile=float(os.environ.get("SWR_SCAN_MIN_ENV_Q", "0.02")),
+                min_env_peak_sigma=float(os.environ.get("SWR_SCAN_MIN_ENV_SIGMA", "1.10")),
                 off_below_s=float(os.environ.get("SWR_SCAN_OFF_BELOW_S", "0.006")),
                 only_in_upstates=False,
                 require_up_overlap=False,
@@ -3864,18 +4350,18 @@ if enable_swr:
     swr_f_hi = float(os.environ.get("SWR_F_HI_HZ", "270.0"))
     swr_require_up_overlap = str(os.environ.get("SWR_REQUIRE_UP_OVERLAP", "0")).strip().lower() not in ("0", "false", "no", "off")
     ripple_intervals_s = detect_sharp_wave_ripple_intervals_in_upstates(
-        swr_channel, time_s, dt, all_up_pairs,
+        swr_channel_uV, time_s, dt, all_up_pairs,
         f_lo=swr_f_lo,
         f_hi=swr_f_hi,
-        thr_k_on=float(os.environ.get("SWR_THR_ON", "1.10")),
-        thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.35")),
+        thr_k_on=float(os.environ.get("SWR_THR_ON", "1.15")),
+        thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.30")),
         min_dur_s=float(os.environ.get("SWR_MIN_DUR_S", "0.040")),
         max_dur_s=float(os.environ.get("SWR_MAX_DUR_S", "0.150")),
         max_gap_s=float(os.environ.get("SWR_MAX_GAP_S", "0.020")),
-        min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "2")),
-        min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.03")),
-        min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "0.65")),
-        off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.006")),
+        min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "4")),
+        min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.02")),
+        min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "1.10")),
+        off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.004")),
         only_in_upstates=False,
         require_up_overlap=swr_require_up_overlap,
         causal_filter=(not SPINDLE_ZERO_PHASE),
@@ -3884,32 +4370,34 @@ if enable_swr:
         "[SWR-CONFIG] "
         f"f_lo={swr_f_lo}Hz "
         f"f_hi={swr_f_hi}Hz "
-        f"thr_on={os.environ.get('SWR_THR_ON', '1.10')} "
-        f"thr_off={os.environ.get('SWR_THR_OFF', '0.35')} "
+        f"thr_on={os.environ.get('SWR_THR_ON', '1.15')} "
+        f"thr_off={os.environ.get('SWR_THR_OFF', '0.30')} "
         f"min_dur={os.environ.get('SWR_MIN_DUR_S', '0.040')}s "
         f"max_dur={os.environ.get('SWR_MAX_DUR_S', '0.150')}s "
         f"max_gap={os.environ.get('SWR_MAX_GAP_S', '0.020')}s "
-        f"min_cycles={os.environ.get('SWR_MIN_CYCLES', '2')} "
-        f"min_env_sigma={os.environ.get('SWR_MIN_ENV_SIGMA', '0.65')} "
-        f"off_below_s={os.environ.get('SWR_OFF_BELOW_S', '0.006')} "
+        f"min_cycles={os.environ.get('SWR_MIN_CYCLES', '4')} "
+        f"ripple_min_ptp_sigma={os.environ.get('SWR_RIPPLE_MIN_PTP_SIGMA', '4.0')} "
+        f"min_env_sigma={os.environ.get('SWR_MIN_ENV_SIGMA', '1.10')} "
+        f"off_below_s={os.environ.get('SWR_OFF_BELOW_S', '0.004')} "
         f"require_sharp_wave={os.environ.get('SWR_REQUIRE_SHARP_WAVE', '1')} "
         f"sw_band={os.environ.get('SWR_SW_F_LO_HZ', '2.0')}-{os.environ.get('SWR_SW_F_HI_HZ', '40.0')}Hz "
-        f"sw_amp_sigma={os.environ.get('SWR_SW_MIN_AMP_SIGMA', '2.5')} "
-        f"sw_ptp_sigma={os.environ.get('SWR_SW_MIN_PTP_SIGMA', '4.5')} "
-        f"sw_prom_sigma={os.environ.get('SWR_SW_MIN_PROM_SIGMA', '3.0')} "
-        f"sw_width={os.environ.get('SWR_SW_MIN_WIDTH_S', '0.012')}-{os.environ.get('SWR_SW_MAX_WIDTH_S', '0.120')}s "
-        f"sw_slope_sigma={os.environ.get('SWR_SW_MIN_SLOPE_SIGMA', '0.8')} "
-        f"sw_min_abs_amp={os.environ.get('SWR_SW_MIN_ABS_AMP', '0.0')} "
+        f"sw_amp_sigma={os.environ.get('SWR_SW_MIN_AMP_SIGMA', '0.0')} "
+        f"sw_ptp_sigma={os.environ.get('SWR_SW_MIN_PTP_SIGMA', '0.0')} "
+        f"sw_prom_sigma={os.environ.get('SWR_SW_MIN_PROM_SIGMA', '1.0')} "
+        f"sw_width={os.environ.get('SWR_SW_MIN_WIDTH_S', '0.015')}-{os.environ.get('SWR_SW_MAX_WIDTH_S', '0.160')}s "
+        f"sw_slope_sigma={os.environ.get('SWR_SW_MIN_SLOPE_SIGMA', '0.0')} "
+        f"sw_min_abs_amp={os.environ.get('SWR_SW_MIN_ABS_AMP', '2.0')} "
         f"sw_up_ratio={os.environ.get('SWR_SW_MIN_UP_AMP_RATIO', '0.15')} "
-        f"sw_up_ratio_enable={os.environ.get('SWR_SW_UP_RATIO_ENABLE', '1')} "
-        f"sw_min_ptp_uv={os.environ.get('SWR_SW_MIN_PTP_UV', '10.0')} "
-        f"return_combined_interval={os.environ.get('SWR_RETURN_COMBINED_INTERVAL', '1')} "
+        f"sw_up_ratio_enable={os.environ.get('SWR_SW_UP_RATIO_ENABLE', '0')} "
+        f"sw_min_ptp_uv={os.environ.get('SWR_SW_MIN_PTP_UV', '5.0')} "
+        f"sw_search_within_ripple={os.environ.get('SWR_SW_SEARCH_WITHIN_RIPPLE', '1')} "
+        f"return_combined_interval={os.environ.get('SWR_RETURN_COMBINED_INTERVAL', '0')} "
         f"sw_require_overlap={os.environ.get('SWR_SW_REQUIRE_OVERLAP', '1')} "
         f"sw_min_overlap_s={os.environ.get('SWR_SW_MIN_OVERLAP_S', '0.006')} "
         f"sw_overlap_pad_s={os.environ.get('SWR_SW_OVERLAP_PAD_S', '0.000')} "
-        f"sw_require_center={os.environ.get('SWR_SW_REQUIRE_CENTER', '0')} "
-        f"sw_center_tol_s={os.environ.get('SWR_SW_CENTER_TOL_S', '0.040')} "
-        f"sw_polarity={os.environ.get('SWR_SW_POLARITY', 'auto')} "
+        f"sw_require_center={os.environ.get('SWR_SW_REQUIRE_CENTER', '1')} "
+        f"sw_center_tol_s={os.environ.get('SWR_SW_CENTER_TOL_S', '0.090')} "
+        f"sw_polarity={os.environ.get('SWR_SW_POLARITY', 'negative')} "
         f"only_in_upstates=0 "
         f"require_up_overlap={int(swr_require_up_overlap)} "
         f"filter_mode={'zero_phase' if SPINDLE_ZERO_PHASE else 'causal'}"
@@ -4029,11 +4517,11 @@ print(
     "assoc_blocks_trig_gap_s=", float(os.environ.get("SPINDLE_ASSOC_BLOCK_TRIG_GAP_S", "0.35")),
     "trig_lat_mean_s=", (float(np.nanmean(spindle_trig_lat_s)) if spindle_trig_lat_s.size else np.nan),
 )
-if enable_swr and str(os.environ.get("SWR_SW_UP_RATIO_ENABLE", "1")).strip().lower() not in ("0", "false", "no", "off"):
+if enable_swr and str(os.environ.get("SWR_SW_UP_RATIO_ENABLE", "0")).strip().lower() not in ("0", "false", "no", "off"):
     ripple_intervals_s = _filter_swr_by_up_relative_sharpwave_amp(
         ripple_intervals_s,
-        swr_channel,
-        main_channel,
+        swr_channel_uV,
+        main_channel_uV,
         time_s,
         spont_up_s + trig_up_s + assoc_up_s,
         dt,
@@ -4050,7 +4538,7 @@ if enable_swr and str(os.environ.get("SWR_SW_UP_RATIO_ENABLE", "1")).strip().low
 ripple_spont_s, ripple_trig_s, ripple_trig_lat_s = _classify_swr_by_best_sharpwave_per_pulse(
     ripple_intervals_s,
     spindle_pulses_s,
-    swr_channel,
+    swr_channel_uV,
     time_s,
     dt,
     trig_win_s=float(os.environ.get("SWR_TRIG_WIN_S", "0.40")),
@@ -4082,6 +4570,7 @@ print(
     "trig_win_s=", float(os.environ.get("SWR_TRIG_WIN_S", "0.40")),
     "min_lat_s=", float(os.environ.get("SWR_TRIG_MIN_LAT_S", "0.00")),
     "one_per_pulse=", 1,
+    "score_mode=", os.environ.get("SWR_BEST_PER_PULSE_SCORE", "ripple"),
     "followup_gap_s=", 0.0,
     "assoc_blocks_trig_gap_s=", float(os.environ.get("SWR_ASSOC_BLOCK_TRIG_GAP_S", "0.12")),
     "trig_lat_mean_s=", (float(np.nanmean(ripple_trig_lat_s)) if ripple_trig_lat_s.size else np.nan),
@@ -4572,10 +5061,35 @@ try:
     swr_f_hi = float(os.environ.get("SWR_F_HI_HZ", "270.0"))
     swr_sw_f_lo = float(os.environ.get("SWR_SW_F_LO_HZ", "2.0"))
     swr_sw_f_hi = float(os.environ.get("SWR_SW_F_HI_HZ", "40.0"))
+    swr_notch_hz = _parse_float_list_env("SWR_NOTCH_HZ", "")
+    swr_notch_q = float(os.environ.get("SWR_NOTCH_Q", "35.0"))
+    if swr_notch_hz:
+        swr_plot = _notch_filter_1d(
+            swr_plot, dt, swr_notch_hz, q=swr_notch_q, causal=(not SPINDLE_ZERO_PHASE)
+        )
+        print(
+            "[SWR-NOTCH][4P] "
+            f"freqs={','.join(f'{f:g}' for f in swr_notch_hz)}Hz "
+            f"Q={swr_notch_q:g} "
+            f"mode={'zero_phase' if SPINDLE_ZERO_PHASE else 'causal'}"
+        )
     swr_require_up_overlap_4p = str(os.environ.get("SWR_REQUIRE_UP_OVERLAP", "0")).strip().lower() not in ("0", "false", "no", "off")
     swr_bp_plot = _bandpass_1d(
         swr_plot, dt, f_lo=swr_f_lo, f_hi=swr_f_hi, order=3, causal=(not SPINDLE_ZERO_PHASE)
     )
+    swr_ripple_plot_mode = str(os.environ.get("SWR_RIPPLE_PLOT_MODE", "bandpass")).strip().lower()
+    swr_ripple_plot, swr_ripple_plot_kind = _ripple_visual_trace_from_band(
+        swr_bp_plot,
+        dt,
+        mode=swr_ripple_plot_mode,
+        smooth_s=float(os.environ.get("SWR_RIPPLE_ENV_SMOOTH_S", "0.008")),
+    )
+    if swr_ripple_plot_kind != "bandpass":
+        print(
+            "[SWR-PLOT][4P] "
+            f"ripple panel uses {swr_ripple_plot_kind} "
+            f"smooth_s={float(os.environ.get('SWR_RIPPLE_ENV_SMOOTH_S', '0.008')):g}"
+        )
     swr_sw_plot = _bandpass_1d(
         swr_plot, dt, f_lo=swr_sw_f_lo, f_hi=swr_sw_f_hi, order=3, causal=(not SPINDLE_ZERO_PHASE)
     )
@@ -4591,24 +5105,29 @@ try:
         )
 
     # SWR im gewählten SWR-Kanal (UP-overlap required, gleiche Klassifikationslogik wie sonst).
+    swr_detect_signal = _channel_signal_uV_from_index(swr_ch_idx, swr_raw)
+    if swr_notch_hz:
+        swr_detect_signal = _notch_filter_1d(
+            swr_detect_signal, dt, swr_notch_hz, q=swr_notch_q, causal=(not SPINDLE_ZERO_PHASE)
+        )
     swr_ripple_intervals_s = detect_sharp_wave_ripple_intervals_in_upstates(
-        swr_raw, time_s, dt, all_up_pairs,
+        swr_detect_signal, time_s, dt, all_up_pairs,
         f_lo=swr_f_lo,
         f_hi=swr_f_hi,
-        thr_k_on=float(os.environ.get("SWR_THR_ON", "1.10")),
-        thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.35")),
+        thr_k_on=float(os.environ.get("SWR_THR_ON", "1.15")),
+        thr_k_off=float(os.environ.get("SWR_THR_OFF", "0.30")),
         min_dur_s=float(os.environ.get("SWR_MIN_DUR_S", "0.040")),
         max_dur_s=float(os.environ.get("SWR_MAX_DUR_S", "0.150")),
         max_gap_s=float(os.environ.get("SWR_MAX_GAP_S", "0.020")),
-        min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "2")),
-        min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.03")),
-        min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "0.65")),
-        off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.006")),
+        min_cycles=int(os.environ.get("SWR_MIN_CYCLES", "4")),
+        min_env_peak_quantile=float(os.environ.get("SWR_MIN_ENV_Q", "0.02")),
+        min_env_peak_sigma=float(os.environ.get("SWR_MIN_ENV_SIGMA", "1.10")),
+        off_below_s=float(os.environ.get("SWR_OFF_BELOW_S", "0.004")),
         only_in_upstates=False,
         require_up_overlap=swr_require_up_overlap_4p,
         causal_filter=(not SPINDLE_ZERO_PHASE),
     )
-    if str(os.environ.get("SWR_SW_UP_RATIO_ENABLE", "1")).strip().lower() not in ("0", "false", "no", "off"):
+    if str(os.environ.get("SWR_SW_UP_RATIO_ENABLE", "0")).strip().lower() not in ("0", "false", "no", "off"):
         swr_ripple_intervals_s = _filter_swr_by_up_relative_sharpwave_amp(
             swr_ripple_intervals_s,
             swr_plot,
@@ -4622,7 +5141,7 @@ try:
             match_pre_s=float(os.environ.get("SWR_SW_UP_MATCH_PRE_S", "-0.05")),
             match_post_s=float(os.environ.get("SWR_SW_UP_MATCH_POST_S", "0.70")),
             min_ratio=float(os.environ.get("SWR_SW_MIN_UP_AMP_RATIO", "0.15")),
-            min_sw_ptp_abs=float(os.environ.get("SWR_SW_MIN_PTP_UV", "10.0")),
+            min_sw_ptp_abs=float(os.environ.get("SWR_SW_MIN_PTP_UV", "5.0")),
             require_up=str(os.environ.get("SWR_SW_UP_RATIO_REQUIRE_UP", "0")).strip().lower() not in ("0", "false", "no", "off"),
             causal_filter=(not SPINDLE_ZERO_PHASE),
             label="SWR-UP-RATIO-4P",
@@ -4757,7 +5276,7 @@ try:
         f"{BASE_TAG}__ch{swr_ch_idx}_ripple_sharpwave_ch{up_ch_idx}_up_spindle",
         SAVE_DIR,
         time_s,
-        swr_bp_plot,
+        swr_ripple_plot,
         swr_sw_plot,
         up_plot,
         up_bp_10_15_plot,
@@ -4784,11 +5303,11 @@ try:
             f"+ sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz | ch{up_ch_idx} UP "
             f"| ch{up_ch_idx} 10-15 Hz Spindles"
         ),
-        raw_top_name=f"pri_{swr_ch_idx} (ripple {swr_f_lo:g}-{swr_f_hi:g} Hz bandpass)",
+        raw_top_name=f"pri_{swr_ch_idx} (ripple {swr_f_lo:g}-{swr_f_hi:g} Hz {swr_ripple_plot_kind})",
         top_name=f"pri_{swr_ch_idx} (sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz bandpass)",
         mid_name=f"pri_{up_ch_idx} (UP)",
         bottom_name=f"pri_{up_ch_idx} (10-15 Hz bandpass)",
-        raw_top_y_label=(f"ch{swr_ch_idx} ripple {swr_f_lo:g}-{swr_f_hi:g} Hz (µV)" if HTML_IN_uV else f"ch{swr_ch_idx} ripple {swr_f_lo:g}-{swr_f_hi:g} Hz ({UNIT_LABEL})"),
+        raw_top_y_label=(f"ch{swr_ch_idx} ripple {swr_ripple_plot_kind} (µV)" if HTML_IN_uV else f"ch{swr_ch_idx} ripple {swr_ripple_plot_kind} ({UNIT_LABEL})"),
         top_y_label=(f"ch{swr_ch_idx} sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz (µV)" if HTML_IN_uV else f"ch{swr_ch_idx} sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz ({UNIT_LABEL})"),
         mid_y_label=(f"ch{up_ch_idx} LFP (µV)" if HTML_IN_uV else f"ch{up_ch_idx} LFP ({UNIT_LABEL})"),
         bottom_y_label=(f"ch{up_ch_idx} 10-15 Hz (µV)" if HTML_IN_uV else f"ch{up_ch_idx} 10-15 Hz ({UNIT_LABEL})"),
@@ -4808,10 +5327,10 @@ except Exception as e:
 
 try:
     pulse_qa_enabled = str(os.environ.get("PULSE_QA_4P_ENABLE", "1")).strip().lower() not in ("0", "false", "no", "off")
-    pulse_qa_swr_triggered_only = str(os.environ.get("PULSE_QA_SWR_TRIGGERED_ONLY", "1")).strip().lower() not in ("0", "false", "no", "off")
+    pulse_qa_swr_triggered_only = str(os.environ.get("PULSE_QA_SWR_TRIGGERED_ONLY", "0")).strip().lower() not in ("0", "false", "no", "off")
     pulse_qa_scope = globals()
     pulse_qa_required = (
-        "swr_ch_idx", "up_ch_idx", "swr_bp_plot", "swr_sw_plot",
+        "swr_ch_idx", "up_ch_idx", "swr_ripple_plot", "swr_sw_plot",
         "up_plot", "up_bp_10_15_plot",
         "pulse_times_1_html", "pulse_times_2_html_export",
         "pulse_times_1_off_html_plot", "pulse_times_2_off_html_export",
@@ -4828,7 +5347,7 @@ try:
             f"{BASE_TAG}__ch{swr_ch_idx}_ripple_sharpwave_ch{up_ch_idx}_up_spindle",
             SAVE_DIR,
             time_s,
-            swr_bp_plot,
+            swr_ripple_plot,
             swr_sw_plot,
             up_plot,
             up_bp_10_15_plot,
@@ -4854,11 +5373,11 @@ try:
                 f"{BASE_TAG} pulse QA -- ch{swr_ch_idx} ripple/sharp-wave | "
                 f"ch{up_ch_idx} UP/spindle"
             ),
-            ripple_name=f"pri_{swr_ch_idx} ripple {swr_f_lo:g}-{swr_f_hi:g} Hz",
+            ripple_name=f"pri_{swr_ch_idx} ripple {swr_f_lo:g}-{swr_f_hi:g} Hz {swr_ripple_plot_kind}",
             sharp_name=f"pri_{swr_ch_idx} sharp-wave {swr_sw_f_lo:g}-{swr_sw_f_hi:g} Hz",
             up_name=f"pri_{up_ch_idx} UP/LFP",
             spindle_name=f"pri_{up_ch_idx} spindle 10-15 Hz",
-            ripple_y_label=(f"ch{swr_ch_idx} ripple (uV)" if HTML_IN_uV else f"ch{swr_ch_idx} ripple ({UNIT_LABEL})"),
+            ripple_y_label=(f"ch{swr_ch_idx} ripple {swr_ripple_plot_kind} (uV)" if HTML_IN_uV else f"ch{swr_ch_idx} ripple {swr_ripple_plot_kind} ({UNIT_LABEL})"),
             sharp_y_label=(f"ch{swr_ch_idx} sharp-wave (uV)" if HTML_IN_uV else f"ch{swr_ch_idx} sharp-wave ({UNIT_LABEL})"),
             up_y_label=(f"ch{up_ch_idx} LFP (uV)" if HTML_IN_uV else f"ch{up_ch_idx} LFP ({UNIT_LABEL})"),
             spindle_y_label=(f"ch{up_ch_idx} spindle (uV)" if HTML_IN_uV else f"ch{up_ch_idx} spindle ({UNIT_LABEL})"),
