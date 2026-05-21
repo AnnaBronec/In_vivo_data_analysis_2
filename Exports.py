@@ -1528,6 +1528,9 @@ def export_pulse_qa_four_channel_html(
     sharp_y_label="Sharp-wave",
     up_y_label="UP",
     spindle_y_label="Spindle",
+    raw_swr=None,
+    raw_swr_name="Raw SWR channel",
+    raw_swr_y_label="Raw SWR",
     show_pulse_durations=True,
     require_full_window=True,
     trace_time_shifts_s=None,
@@ -1539,12 +1542,16 @@ def export_pulse_qa_four_channel_html(
         np.asarray(y_up, dtype=float).ravel(),
         np.asarray(y_spindle, dtype=float).ravel(),
     ]
+    has_raw_swr = raw_swr is not None
+    if has_raw_swr:
+        traces = [np.asarray(raw_swr, dtype=float).ravel()] + traces
     m = min([t_all.size] + [x.size for x in traces])
     if m < 3:
         raise ValueError("Not enough points for pulse QA export.")
     t_all = t_all[:m]
     traces = [x[:m] for x in traces]
-    shifts = np.zeros(4, dtype=float)
+    n_rows = len(traces)
+    panel_tag = f"{n_rows}panel"
 
     def _clean_times(ts):
         if ts is None:
@@ -1574,8 +1581,8 @@ def export_pulse_qa_four_channel_html(
         pulses = pulses[:int(max_pulses)]
     if not pulses:
         os.makedirs(save_dir, exist_ok=True)
-        out_html = os.path.join(save_dir, f"{base_tag}__pulse_qa_4panel.html")
-        out_pdf = os.path.join(save_dir, f"{base_tag}__pulse_qa_4panel.pdf")
+        out_html = os.path.join(save_dir, f"{base_tag}__pulse_qa_{panel_tag}.html")
+        out_pdf = os.path.join(save_dir, f"{base_tag}__pulse_qa_{panel_tag}.pdf")
         msg = (
             "No pulses with a complete pre/post window found for pulse QA export."
             if require_full_window
@@ -1594,8 +1601,8 @@ def export_pulse_qa_four_channel_html(
             ax.text(0.5, 0.45, msg, ha="center", va="center", fontsize=11, transform=ax.transAxes)
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
-        print(f"[HTML] pulse QA 4-panel placeholder: {out_html}")
-        print(f"[PDF] pulse QA 4-panel placeholder: {out_pdf}")
+        print(f"[HTML] pulse QA {n_rows}-panel placeholder: {out_html}")
+        print(f"[PDF] pulse QA {n_rows}-panel placeholder: {out_pdf}")
         return out_html
 
     def _mk_intervals(pair):
@@ -1681,15 +1688,23 @@ def export_pulse_qa_four_channel_html(
         pulse_pages.append((tt.copy(), [np.asarray(x, float).copy() for x in local], p, label, ordinal, off, w0, w1))
 
         fig = make_subplots(
-            rows=4,
+            rows=n_rows,
             cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.025,
-            row_heights=[0.25, 0.25, 0.25, 0.25],
+            vertical_spacing=0.02,
+            row_heights=[1.0 / n_rows] * n_rows,
         )
         names = [ripple_name, sharp_name, up_name, spindle_name]
+        y_labels = [ripple_y_label, sharp_y_label, up_y_label, spindle_y_label]
         colors = ["#444444", "#8b0000", "#111111", "#cc00cc"]
         widths = [0.9, 1.1, 1.0, 1.0]
+        group_sets = [swr_groups, swr_groups, up_groups, spindle_groups]
+        if has_raw_swr:
+            names = [raw_swr_name] + names
+            y_labels = [raw_swr_y_label] + y_labels
+            colors = ["#111111"] + colors
+            widths = [0.8] + widths
+            group_sets = [swr_groups] + group_sets
         for row, yy in enumerate(local, start=1):
             fig.add_trace(go.Scatter(
                 x=tt,
@@ -1702,7 +1717,7 @@ def export_pulse_qa_four_channel_html(
             _apply_local_y(fig, row, yy)
 
         shapes = []
-        for row in range(1, 5):
+        for row in range(1, n_rows + 1):
             shapes.append(dict(
                 type="line",
                 x0=0,
@@ -1736,10 +1751,8 @@ def export_pulse_qa_four_channel_html(
                     yref=_y_domain_ref(row),
                     line=dict(width=2, dash="dash", color="red"),
                 ))
-        _add_event_spans(shapes, swr_groups, 1, p, w0, w1)
-        _add_event_spans(shapes, swr_groups, 2, p, w0, w1)
-        _add_event_spans(shapes, up_groups, 3, p, w0, w1)
-        _add_event_spans(shapes, spindle_groups, 4, p, w0, w1)
+        for row, groups in enumerate(group_sets, start=1):
+            _add_event_spans(shapes, groups, row, p, w0, w1)
 
         if i_pulse == 0:
             for legend_label, _, fill in swr_groups + up_groups + spindle_groups:
@@ -1777,15 +1790,13 @@ def export_pulse_qa_four_channel_html(
             shapes=shapes,
             margin=dict(l=68, r=20, t=42, b=42),
             template="plotly_white",
-            height=640,
+            height=760 if has_raw_swr else 640,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         )
-        fig.update_yaxes(title_text=ripple_y_label, row=1, col=1)
-        fig.update_yaxes(title_text=sharp_y_label, row=2, col=1)
-        fig.update_yaxes(title_text=up_y_label, row=3, col=1)
-        fig.update_yaxes(title_text=spindle_y_label, row=4, col=1)
-        fig.update_xaxes(title_text="Time from pulse onset (s)", row=4, col=1)
-        for row in range(1, 5):
+        for row, y_label in enumerate(y_labels, start=1):
+            fig.update_yaxes(title_text=y_label, row=row, col=1)
+        fig.update_xaxes(title_text="Time from pulse onset (s)", row=n_rows, col=1)
+        for row in range(1, n_rows + 1):
             fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror="allticks", row=row, col=1)
             fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror="allticks", row=row, col=1)
 
@@ -1795,7 +1806,7 @@ def export_pulse_qa_four_channel_html(
             config={"responsive": True, "displaylogo": False},
         ))
 
-    out_html = os.path.join(save_dir, f"{base_tag}__pulse_qa_4panel.html")
+    out_html = os.path.join(save_dir, f"{base_tag}__pulse_qa_{panel_tag}.html")
     css = """
     body { font-family: Arial, sans-serif; margin: 20px; color: #222; }
     h1 { font-size: 22px; margin: 0 0 6px; }
@@ -1809,16 +1820,20 @@ def export_pulse_qa_four_channel_html(
         f.write(
             "<div class='meta'>"
             f"n_pulses={len(pulses)} | window=-{float(pre_s):.3f}s..+{float(post_s):.3f}s | "
-            "Panel 1: ripple, Panel 2: sharp-wave, Panel 3: UP, Panel 4: spindle"
-            "</div>"
+            + (
+                "Panel 1: raw SWR, Panel 2: ripple, Panel 3: sharp-wave, Panel 4: UP, Panel 5: spindle"
+                if has_raw_swr
+                else "Panel 1: ripple, Panel 2: sharp-wave, Panel 3: UP, Panel 4: spindle"
+            )
+            + "</div>"
         )
         for snip in snippets:
             f.write("<div class='pulse-block'>")
             f.write(snip)
             f.write("</div>")
         f.write("</body></html>")
-    print(f"[HTML] pulse QA 4-panel: {out_html}")
-    out_pdf = os.path.join(save_dir, f"{base_tag}__pulse_qa_4panel.pdf")
+    print(f"[HTML] pulse QA {n_rows}-panel: {out_html}")
+    out_pdf = os.path.join(save_dir, f"{base_tag}__pulse_qa_{panel_tag}.pdf")
 
     def _rgba_to_mpl(c):
         if isinstance(c, str) and c.startswith("rgba(") and c.endswith(")"):
@@ -1837,16 +1852,20 @@ def export_pulse_qa_four_channel_html(
 
     with PdfPages(out_pdf) as pdf:
         for tt, local, p, label, ordinal, off, w0, w1 in pulse_pages:
-            fig_pdf, axes = plt.subplots(4, 1, figsize=(11.0, 8.5), sharex=True)
+            fig_pdf, axes = plt.subplots(n_rows, 1, figsize=(11.0, 9.4 if has_raw_swr else 8.5), sharex=True)
             fig_pdf.suptitle(
                 f"{label} #{ordinal} at {p:.3f}s"
                 + (f" | offset +{(float(off) - p):.3f}s" if show_pulse_durations and off is not None and off > p else ""),
                 fontsize=11,
             )
-            names = [ripple_y_label, sharp_y_label, up_y_label, spindle_y_label]
+            y_labels = [ripple_y_label, sharp_y_label, up_y_label, spindle_y_label]
             colors = ["#444444", "#8b0000", "#111111", "#cc00cc"]
             group_sets = [swr_groups, swr_groups, up_groups, spindle_groups]
-            for i_row, (ax, yy, ylab, line_color, groups) in enumerate(zip(axes, local, names, colors, group_sets)):
+            if has_raw_swr:
+                y_labels = [raw_swr_y_label] + y_labels
+                colors = ["#111111"] + colors
+                group_sets = [swr_groups] + group_sets
+            for ax, yy, ylab, line_color, groups in zip(axes, local, y_labels, colors, group_sets):
                 _shade_pdf_groups(ax, groups, p, w0, w1)
                 ax.axvline(0.0, color="red", linestyle=":", linewidth=1.2)
                 if show_pulse_durations and off is not None and off > p:
@@ -1868,7 +1887,7 @@ def export_pulse_qa_four_channel_html(
             fig_pdf.tight_layout(rect=[0, 0, 1, 0.97])
             pdf.savefig(fig_pdf)
             plt.close(fig_pdf)
-    print(f"[PDF] pulse QA 4-panel: {out_pdf}")
+    print(f"[PDF] pulse QA {n_rows}-panel: {out_pdf}")
     return out_html
 
 

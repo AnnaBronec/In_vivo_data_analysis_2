@@ -97,7 +97,6 @@ AUTO_PULSE_ARTIFACT_ALIGN = os.environ.get("AUTO_PULSE_ARTIFACT_ALIGN", "0") == 
 FORCE_ONSET_ONLY_PLOTS = os.environ.get("FORCE_ONSET_ONLY_PLOTS", "0") == "1"
 SHOW_COMMENT_PULSE_OFFSETS = os.environ.get("SHOW_COMMENT_PULSE_OFFSETS", "1") == "1"
 IGNORE_PULSE_2 = os.environ.get("IGNORE_PULSE_2", "0") == "1"
-SPINDLE_ZERO_PHASE = os.environ.get("SPINDLE_ZERO_PHASE", "1") == "1"
 ENABLE_SVG_OUTPUT = str(os.environ.get("ENABLE_SVG_OUTPUT", "0")).strip().lower() not in ("0", "false", "no", "off")
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
@@ -207,6 +206,9 @@ def _bootstrap_analysis_config(base_path):
 
 
 _bootstrap_analysis_config(BASE_PATH)
+
+SPINDLE_ZERO_PHASE = os.environ.get("SPINDLE_ZERO_PHASE", "1") == "1"
+print(f"[CONFIG][FILTER] SPINDLE_ZERO_PHASE={'1' if SPINDLE_ZERO_PHASE else '0'}")
 
 
 if "LFP_FILENAME" in globals():
@@ -519,6 +521,14 @@ def load_parts_to_array_streaming_with_ttl(
     p2_on_list, p2_off_list = [], []
     time_col_name = None
     auto_stim_col = None
+    sample_offset = 0
+    anti_alias_stream = (
+        bool(ds_factor and int(ds_factor) > 1)
+        and str(os.environ.get("DOWNSAMPLE_ANTIALIAS", "0")).strip().lower() not in ("0", "false", "no", "off")
+    )
+    aa_sos = None
+    aa_zi = None
+    aa_failed = False
 
     def _detect_auto_stim_col_in_df(df, chan_cols_local):
         def _is_quasi_binary_local(col_name):
@@ -661,12 +671,48 @@ def load_parts_to_array_streaming_with_ttl(
         if time_col_name != "time":
             df_lfp = df_lfp.rename(columns={time_col_name: "time"})
 
-        if ds_factor and ds_factor > 1:
-            df_lfp = df_lfp.iloc[::int(ds_factor), :].reset_index(drop=True)
+        t_full_lfp = pd.to_numeric(df_lfp["time"], errors="coerce").to_numpy(float)
+        x_full_lfp = df_lfp[chan_cols].to_numpy(dtype=float)
+        if anti_alias_stream and not aa_failed:
+            try:
+                if aa_sos is None:
+                    raw_dt = float(np.nanmedian(np.diff(t_full_lfp))) if t_full_lfp.size > 1 else 1.0
+                    if (not np.isfinite(raw_dt)) or raw_dt <= 0:
+                        raw_dt = 1.0
+                    fs_raw = (DEFAULT_FS_XDAT / raw_dt) if raw_dt > 0.5 else (1.0 / raw_dt)
+                    fs_ds = fs_raw / float(ds_factor)
+                    nyq_ds = 0.5 * fs_ds
+                    cutoff_hz = float(os.environ.get("DOWNSAMPLE_ANTIALIAS_CUTOFF_HZ", str(0.92 * nyq_ds)))
+                    cutoff_hz = max(1.0, min(cutoff_hz, 0.98 * nyq_ds, 0.45 * fs_raw))
+                    order = int(os.environ.get("DOWNSAMPLE_ANTIALIAS_ORDER", "6"))
+                    aa_sos = signal.butter(order, cutoff_hz, btype="lowpass", fs=fs_raw, output="sos")
+                    print(
+                        "[STREAM-AA] "
+                        f"causal Butterworth lowpass before decimation: order={order} "
+                        f"cutoff={cutoff_hz:g}Hz fs_raw={fs_raw:g}Hz fs_ds={fs_ds:g}Hz "
+                        f"factor={int(ds_factor)}"
+                    )
+                col_med = np.nanmedian(x_full_lfp, axis=0)
+                col_med = np.where(np.isfinite(col_med), col_med, 0.0)
+                x_full_lfp = np.where(np.isfinite(x_full_lfp), x_full_lfp, col_med)
+                if aa_zi is None:
+                    aa_zi = signal.sosfilt_zi(aa_sos)[:, :, None] * x_full_lfp[0][None, None, :]
+                x_full_lfp, aa_zi = signal.sosfilt(aa_sos, x_full_lfp, axis=0, zi=aa_zi)
+            except Exception as e:
+                aa_failed = True
+                print(f"[STREAM-AA][WARN] anti-alias filter failed: {e}; using unfiltered decimation")
 
-        t_ds = pd.to_numeric(df_lfp["time"], errors="coerce").to_numpy(float)
+        if ds_factor and int(ds_factor) > 1:
+            n_full = len(t_full_lfp)
+            keep = ((np.arange(n_full, dtype=np.int64) + int(sample_offset)) % int(ds_factor)) == 0
+            sample_offset += n_full
+            t_ds = t_full_lfp[keep]
+            x_ds = x_full_lfp[keep]
+        else:
+            t_ds = t_full_lfp
+            x_ds = x_full_lfp
         time_chunks.append(t_ds)
-        data_chunks.append(df_lfp[chan_cols].to_numpy(dtype=dtype))
+        data_chunks.append(x_ds.astype(dtype, copy=False))
 
         del df, df_lfp
 
@@ -1717,7 +1763,8 @@ if HIGH_CUTOFF <= LOW_CUTOFF:
     raise ValueError(f"Invalid filter band: LOW_CUTOFF={LOW_CUTOFF} must be < HIGH_CUTOFF={HIGH_CUTOFF}")
 b_lp, a_lp, b_hp, a_hp = filtering(HIGH_CUTOFF, LOW_CUTOFF, dt)  # Bandpass via LP(10 Hz) + HP(2 Hz)
 
-
+_mc_lp = signal.filtfilt(b_lp, a_lp, main_channel)
+main_channel_bp = signal.filtfilt(b_hp, a_hp, _mc_lp)
 
 print(f"[INFO] NUM_CHANNELS={NUM_CHANNELS}, main_channel_len={len(main_channel)}")
 pre, post, win_len, align_pre, align_post, align_len = pre_post_condition(dt)
@@ -2338,9 +2385,9 @@ dur_df.to_csv(dur_csv_path, index=False)
 print(f"[CSV] UP-Dauern geschrieben: {dur_csv_path}  (spont={len(dur_sp)}, trig={len(dur_tr)})")
 
 
-# --- Amplituden pro UP-Typ (max - min) berechnen + CSV ablegen ---
-spont_amp = _upstate_amplitudes(main_channel, Spon_UP_crop, Spon_DOWN_crop)
-trig_amp  = _upstate_amplitudes(main_channel, Trig_UP_crop, Trig_DOWN_crop)
+# --- Amplituden pro UP-Typ (max - min) auf 2-10 Hz bandpass-gefiltertem Signal ---
+spont_amp = _upstate_amplitudes(main_channel_bp, Spon_UP_crop, Spon_DOWN_crop)
+trig_amp  = _upstate_amplitudes(main_channel_bp, Trig_UP_crop, Trig_DOWN_crop)
 
 amp_df = pd.DataFrame({
     "group": (["spontaneous"] * len(spont_amp)) + (["triggered"] * len(trig_amp)),
@@ -2414,9 +2461,14 @@ def detect_spindle_intervals_in_upstates(
     fs = 1.0 / dt
     nyq = 0.5 * fs
     lo = max(0.5, float(f_lo))
-    hi = min(float(f_hi), 0.95 * nyq)
+    hi = float(f_hi)
+    if hi >= 0.95 * nyq:
+        raise ValueError(
+            f"Invalid spindle bandpass {f_lo:g}-{f_hi:g}Hz for fs={fs:g}Hz "
+            f"(Nyquist={nyq:g}Hz). Reduce DOWNSAMPLE_FACTOR or choose a lower band."
+        )
     if lo >= hi:
-        return []
+        raise ValueError(f"Invalid spindle bandpass: f_lo={f_lo:g}Hz must be < f_hi={f_hi:g}Hz")
 
     x0 = np.nan_to_num(x, nan=float(np.nanmedian(x)))
     try:
@@ -2615,9 +2667,14 @@ def _detect_ripple_intervals_by_envelope_peaks(
     fs = 1.0 / float(dt)
     nyq = 0.5 * fs
     lo = max(0.5, float(f_lo))
-    hi = min(float(f_hi), 0.95 * nyq)
+    hi = float(f_hi)
+    if hi >= 0.95 * nyq:
+        raise ValueError(
+            f"Invalid ripple bandpass {f_lo:g}-{f_hi:g}Hz for fs={fs:g}Hz "
+            f"(Nyquist={nyq:g}Hz). Reduce DOWNSAMPLE_FACTOR or choose a lower band."
+        )
     if lo >= hi:
-        return []
+        raise ValueError(f"Invalid ripple bandpass: f_lo={f_lo:g}Hz must be < f_hi={f_hi:g}Hz")
 
     x0 = np.nan_to_num(x, nan=float(np.nanmedian(x)))
     try:
@@ -3162,9 +3219,14 @@ def _bandpass_1d(signal_1d, dt, f_lo=10.0, f_hi=15.0, order=3, causal=True):
     fs = 1.0 / float(dt)
     nyq = 0.5 * fs
     lo = max(0.5, float(f_lo))
-    hi = min(float(f_hi), 0.95 * nyq)
+    hi = float(f_hi)
+    if hi >= 0.95 * nyq:
+        raise ValueError(
+            f"Invalid bandpass {f_lo:g}-{f_hi:g}Hz for fs={fs:g}Hz "
+            f"(Nyquist={nyq:g}Hz). Reduce DOWNSAMPLE_FACTOR or use a lower band."
+        )
     if lo >= hi:
-        return x.copy()
+        raise ValueError(f"Invalid bandpass: f_lo={f_lo:g}Hz must be < f_hi={f_hi:g}Hz")
     x0 = np.nan_to_num(x, nan=float(np.nanmedian(x)))
     try:
         if causal:
@@ -5056,6 +5118,7 @@ try:
     swr_raw = np.asarray(LFP_array[swr_ch_idx], dtype=float)
     up_raw = np.asarray(LFP_array[up_ch_idx], dtype=float)
     swr_plot = _channel_signal_for_html(swr_ch_idx)
+    swr_raw_plot = np.asarray(swr_plot, dtype=float).copy()
     up_plot = _channel_signal_for_html(up_ch_idx)
     swr_f_lo = float(os.environ.get("SWR_F_LO_HZ", "120.0"))
     swr_f_hi = float(os.environ.get("SWR_F_HI_HZ", "270.0"))
@@ -5381,6 +5444,9 @@ try:
             sharp_y_label=(f"ch{swr_ch_idx} sharp-wave (uV)" if HTML_IN_uV else f"ch{swr_ch_idx} sharp-wave ({UNIT_LABEL})"),
             up_y_label=(f"ch{up_ch_idx} LFP (uV)" if HTML_IN_uV else f"ch{up_ch_idx} LFP ({UNIT_LABEL})"),
             spindle_y_label=(f"ch{up_ch_idx} spindle (uV)" if HTML_IN_uV else f"ch{up_ch_idx} spindle ({UNIT_LABEL})"),
+            raw_swr=swr_raw_plot,
+            raw_swr_name=f"pri_{swr_ch_idx} raw/no bandpass",
+            raw_swr_y_label=(f"ch{swr_ch_idx} raw (uV)" if HTML_IN_uV else f"ch{swr_ch_idx} raw ({UNIT_LABEL})"),
             show_pulse_durations=bool(
                 (pulse_times_1_off_html_plot is not None and len(pulse_times_1_off_html_plot)) or
                 (pulse_times_2_off_html_export is not None and len(pulse_times_2_off_html_export))
@@ -5389,9 +5455,9 @@ try:
         )
     elif pulse_qa_enabled:
         missing = [name for name in pulse_qa_required if name not in pulse_qa_scope]
-        print(f"[INFO] pulse QA 4-panel skipped: missing prerequisites {missing}")
+        print(f"[INFO] pulse QA export skipped: missing prerequisites {missing}")
 except Exception as e:
-    print(f"[WARN] pulse QA 4-panel export skipped: {e}")
+    print(f"[WARN] pulse QA export skipped: {e}")
 
 # Zusatz-HTML: zwei "gute" Channels übereinander (ohne Spindle)
 try:

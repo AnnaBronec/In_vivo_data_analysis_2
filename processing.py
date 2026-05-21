@@ -214,9 +214,9 @@ def _clip_events_to_bounds(pulse_times, time_s, pre_s, post_s):
 
 
 
-def _upstate_amplitudes(signal, up_idx, down_idx):
+def _upstate_amplitudes(signal, up_idx, down_idx, p_hi=95, p_lo=5):
     """
-    Misst pro UP-Event die Amplitude (max - min) im Rohsignal.
+    Misst pro UP-Event die Amplitude als p95–p5 des Segments (robust gegen Spikes).
     up_idx/down_idx: Sample-Indizes in 'signal' (wie aus classify_states).
     Rückgabe: np.ndarray [n_events] (float), NaN-frei gefiltert.
     """
@@ -229,7 +229,6 @@ def _upstate_amplitudes(signal, up_idx, down_idx):
         return np.array([], dtype=float)
 
     U, D = U[:m], D[:m]
-    # chronologisch sortieren (optional)
     order = np.argsort(U)
     U, D = U[order], D[order]
 
@@ -242,7 +241,7 @@ def _upstate_amplitudes(signal, up_idx, down_idx):
         seg = seg[np.isfinite(seg)]
         if seg.size == 0:
             continue
-        amps.append(float(np.nanmax(seg) - np.nanmin(seg)))
+        amps.append(float(np.percentile(seg, p_hi) - np.percentile(seg, p_lo)))
     return np.array(amps, dtype=float)
 
 
@@ -582,7 +581,7 @@ def upstate_amplitude_compare_ax(
         )
     ax.set_xticks(x, labels)
     ax.set_ylabel(f"Amplitude ({UNIT_LABEL})")
-    ax.set_title(title)
+    ax.set_title(title, fontsize=9)
     ax.grid(alpha=0.15, linestyle=":")
     st = _mwu_stats(sp_valid, tr_valid, alpha=0.05)
     txt = (
@@ -1370,7 +1369,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             vals = vals[np.isfinite(vals)]
             if vals.size:
                 vmin = float(np.nanmin(vals))
-                vmax = float(np.nanmax(vals))
+                vmax = float(np.nanpercentile(vals, 99))
                 if np.isfinite(vmin) and np.isfinite(vmax):
                     if np.isclose(vmin, vmax):
                         pad = max(1e-6, abs(vmax) * 0.1)
@@ -1393,17 +1392,177 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 fig, axs = plt.subplots(nrows_page, ncols, figsize=(11, 12))
                 axs = np.asarray(axs).reshape(-1)
                 for ax, row in zip(axs, chunk):
-                    title = f"{row['session_name']} — UP Amplitude (max-min, mean): Spontan vs. Getriggert"
+                    title = f"{row['session_name']}\nUP Amplitude (max-min, mean): Spontan vs. Getriggert"
                     upstate_amplitude_compare_ax(
                         row["spont_amp"], row["trig_amp"], ax=ax, title=title, y_limits=global_ylim
                     )
                 for ax in axs[len(chunk):]:
                     ax.axis("off")
                 fig.suptitle("UP-amplitude overview per subfolder", y=0.995)
-                fig.tight_layout(rect=[0, 0, 1, 0.98])
+                fig.tight_layout(rect=[0, 0, 1, 0.97], h_pad=3.5)
                 pdf.savefig(fig, bbox_inches="tight")
                 plt.close(fig)
         print(f"[SUMMARY][UP-AMP][PDF] {out_pdf}")
+
+    def _write_parent_up_amplitude_trend_pdf(parent_dir, summary_files):
+        def _nat_session_key(path_str):
+            sess = os.path.basename(os.path.dirname(path_str))
+            m = re.match(r"^\s*(\d+)", str(sess))
+            if m:
+                return (0, int(m.group(1)), str(sess).lower())
+            return (1, str(sess).lower())
+
+        rows = []
+        for sp in sorted(summary_files, key=_nat_session_key):
+            sess_dir = os.path.dirname(sp)
+            sess_name = os.path.basename(sess_dir)
+            amp_files = sorted(glob.glob(os.path.join(sess_dir, "*__upstate_amplitudes.csv")))
+            spont = np.array([], dtype=float)
+            trig = np.array([], dtype=float)
+            if amp_files:
+                try:
+                    dfm = pd.read_csv(amp_files[-1])
+                    st = dfm.get("group", pd.Series([], dtype=str)).astype(str).str.lower().str.strip()
+                    st = st.replace({"spont": "spontaneous", "trig": "triggered", "trigger": "triggered"})
+                    amp = pd.to_numeric(dfm.get("amplitude", pd.Series([], dtype=float)), errors="coerce").to_numpy(float)
+                    spont = amp[(st.to_numpy() == "spontaneous") & np.isfinite(amp)]
+                    trig  = amp[(st.to_numpy() == "triggered")   & np.isfinite(amp)]
+                except Exception:
+                    pass
+            rows.append({
+                "session_name": sess_name,
+                "spont_mean": float(np.nanmean(spont)) if spont.size else np.nan,
+                "trig_mean":  float(np.nanmean(trig))  if trig.size  else np.nan,
+            })
+
+        if not rows:
+            return
+
+        labels     = [r["session_name"] for r in rows]
+        x          = np.arange(len(labels))
+        spont_vals = np.array([r["spont_mean"] for r in rows])
+        trig_vals  = np.array([r["trig_mean"]  for r in rows])
+
+        all_vals = np.concatenate([spont_vals[np.isfinite(spont_vals)],
+                                   trig_vals[np.isfinite(trig_vals)]])
+        if all_vals.size:
+            vmax = float(np.nanpercentile(all_vals, 99))
+            vmin = float(np.nanmin(all_vals))
+            span = max(vmax - vmin, 1e-6)
+            ylim = (min(0.0, vmin - 0.05 * span), vmax + 0.20 * span)
+        else:
+            ylim = None
+
+        fig_w = max(8, len(labels) * 0.9)
+        fig, ax = plt.subplots(figsize=(fig_w, 5))
+
+        ax.plot(x[np.isfinite(spont_vals)], spont_vals[np.isfinite(spont_vals)],
+                color="#4C78A8", marker="o", linewidth=1.5, markersize=7, label="Spontan")
+        ax.plot(x[np.isfinite(trig_vals)], trig_vals[np.isfinite(trig_vals)],
+                color="#F58518", marker="o", linewidth=1.5, markersize=7, label="Getriggert")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
+        ax.set_ylabel(f"Mean Amplitude ({UNIT_LABEL})")
+        ax.set_title("UP Amplitude (mean) pro Session", fontsize=11)
+        if ylim:
+            ax.set_ylim(ylim)
+        ax.grid(alpha=0.2, linestyle=":")
+        ax.legend(fontsize=9)
+
+        fig.tight_layout()
+        out_pdf = os.path.join(parent_dir, "upstate_summary_ALL_parent__up_amplitude_trend.pdf")
+        fig.savefig(out_pdf, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[SUMMARY][UP-AMP-TREND][PDF] {out_pdf}")
+
+    def _write_global_all_trend_pdf(root_dir):
+        """Kombiniert alle Parent-Trend-Plots in root_dir in eine einzige PDF."""
+        def _name_key(name):
+            m = re.match(r"^\s*(\d+)", str(name))
+            return (0, int(m.group(1)), str(name).lower()) if m else (1, str(name).lower())
+
+        parent_dirs = sorted(
+            [e.path for e in os.scandir(root_dir) if e.is_dir()],
+            key=lambda p: _name_key(os.path.basename(p))
+        )
+
+        entries = []
+        for pd_path in parent_dirs:
+            session_dirs = sorted(
+                [e for e in os.scandir(pd_path) if e.is_dir()],
+                key=lambda e: _name_key(e.name)
+            )
+            rows = []
+            for entry in session_dirs:
+                amp_files = sorted(glob.glob(os.path.join(entry.path, "*__upstate_amplitudes.csv")))
+                spont = np.array([], dtype=float)
+                trig  = np.array([], dtype=float)
+                if amp_files:
+                    try:
+                        dfm = pd.read_csv(amp_files[-1])
+                        st = (dfm.get("group", pd.Series([], dtype=str))
+                                 .astype(str).str.lower().str.strip()
+                                 .replace({"spont": "spontaneous", "trig": "triggered",
+                                           "trigger": "triggered"}))
+                        amp = pd.to_numeric(
+                            dfm.get("amplitude", pd.Series([], dtype=float)), errors="coerce"
+                        ).to_numpy(float)
+                        spont = amp[(st.to_numpy() == "spontaneous") & np.isfinite(amp)]
+                        trig  = amp[(st.to_numpy() == "triggered")   & np.isfinite(amp)]
+                    except Exception:
+                        pass
+                spont_mean = float(np.nanmean(spont)) if spont.size else np.nan
+                trig_mean  = float(np.nanmean(trig))  if trig.size  else np.nan
+                if np.isfinite(spont_mean) or np.isfinite(trig_mean):
+                    rows.append({"session_name": entry.name,
+                                 "spont_mean": spont_mean, "trig_mean": trig_mean})
+            if rows:
+                entries.append((os.path.basename(pd_path), rows))
+
+        if not entries:
+            return
+
+        out_pdf = os.path.join(root_dir, "ALL_trend_amplitude.pdf")
+        with PdfPages(out_pdf) as pdf:
+            for folder_name, rows in entries:
+                labels     = [r["session_name"] for r in rows]
+                x          = np.arange(len(labels))
+                spont_vals = np.array([r["spont_mean"] for r in rows])
+                trig_vals  = np.array([r["trig_mean"]  for r in rows])
+                sp_ok = np.isfinite(spont_vals)
+                tr_ok = np.isfinite(trig_vals)
+
+                all_vals = np.concatenate([spont_vals[sp_ok], trig_vals[tr_ok]])
+                if all_vals.size:
+                    vmax = float(np.nanpercentile(all_vals, 99))
+                    vmin = float(np.nanmin(all_vals))
+                    span = max(vmax - vmin, 1e-6)
+                    ylim = (min(0.0, vmin - 0.05 * span), vmax + 0.20 * span)
+                else:
+                    ylim = None
+
+                fig_w = max(9, len(labels) * 0.9)
+                fig, ax = plt.subplots(figsize=(fig_w, 5))
+                if sp_ok.any():
+                    ax.plot(x[sp_ok], spont_vals[sp_ok],
+                            color="#4C78A8", marker="o", linewidth=1.5, markersize=7, label="Spontan")
+                if tr_ok.any():
+                    ax.plot(x[tr_ok], trig_vals[tr_ok],
+                            color="#F58518", marker="o", linewidth=1.5, markersize=7, label="Getriggert")
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
+                ax.set_ylabel(f"Mean Amplitude ({UNIT_LABEL})")
+                ax.set_title(folder_name, fontsize=12, fontweight="bold", pad=8)
+                if ylim:
+                    ax.set_ylim(ylim)
+                ax.grid(alpha=0.2, linestyle=":")
+                ax.legend(fontsize=9)
+                fig.tight_layout()
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+        print(f"[SUMMARY][ALL-TREND][PDF] {out_pdf}  ({len(entries)} Parent-Ordner)")
 
     exp_dir       = os.path.dirname(summary_path)
     parent_dir    = os.path.dirname(exp_dir)        
@@ -1422,6 +1581,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         _write_parent_group_compare_pdf(parent_dir, files_parent)
         _write_parent_up_rate_overview_pdf(parent_dir, files_parent)
         _write_parent_up_amplitude_overview_pdf(parent_dir, files_parent)
+        _write_parent_up_amplitude_trend_pdf(parent_dir, files_parent)
     else:
         print("[SUMMARY][ROLLUP Parent] keine Quellen gefunden")
 
@@ -1435,5 +1595,6 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         _write_semicolon(out_fd, r_all)
         print(f"[SUMMARY][ROLLUP For David] {out_fd}  (Quellen: {len(files_all)})")
         _write_group_compare(r_all, for_david_dir, "upstate_summary_ALL_global")
+        _write_global_all_trend_pdf(for_david_dir)
     else:
         print("[SUMMARY][ROLLUP For David] keine Quellen gefunden")

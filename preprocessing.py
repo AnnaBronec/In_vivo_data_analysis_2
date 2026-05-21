@@ -147,13 +147,46 @@ def get_main_channel(downsample_factor: int, df, num_channels):
 
     return(main_channel)
 
-def filtering(high_cutoff, low_cutoff, dt):
-    srate = 1/dt
+def sampling_info(dt, label="signal"):
+    dt = float(dt)
+    if not np.isfinite(dt) or dt <= 0:
+        raise ValueError(f"Invalid dt for {label}: {dt!r}")
+    srate = 1.0 / dt
     nyq = 0.5 * srate
-    high = high_cutoff / nyq
-    low = low_cutoff / nyq
-    b_lp, a_lp = signal.butter(5, high, btype='low', analog=False)
-    b_hp, a_hp = signal.butter(5, low, btype='high', analog=False)
+    print(f"[SAMPLING] {label}: dt={dt:.9g}s fs={srate:.3f}Hz nyquist={nyq:.3f}Hz")
+    return srate, nyq
+
+
+def _validate_filter_band(high_cutoff, low_cutoff, dt, *, label="bandpass"):
+    srate, nyq = sampling_info(dt, label)
+    high_cutoff = float(high_cutoff)
+    low_cutoff = float(low_cutoff)
+    if not np.isfinite(low_cutoff) or not np.isfinite(high_cutoff):
+        raise ValueError(
+            f"Invalid {label}: cutoffs must be finite, got "
+            f"LOW_CUTOFF={low_cutoff!r}, HIGH_CUTOFF={high_cutoff!r}"
+        )
+    if low_cutoff <= 0:
+        raise ValueError(f"Invalid {label}: LOW_CUTOFF={low_cutoff:g}Hz must be > 0")
+    if high_cutoff <= low_cutoff:
+        raise ValueError(
+            f"Invalid {label}: LOW_CUTOFF={low_cutoff:g}Hz must be < "
+            f"HIGH_CUTOFF={high_cutoff:g}Hz"
+        )
+    if high_cutoff >= 0.95 * nyq:
+        raise ValueError(
+            f"Invalid {label}: HIGH_CUTOFF={high_cutoff:g}Hz is too close to/above "
+            f"Nyquist={nyq:g}Hz after downsampling. Lower the band or reduce the "
+            "downsampling factor."
+        )
+    return srate, nyq
+
+
+def filtering(high_cutoff, low_cutoff, dt):
+    srate, _ = _validate_filter_band(high_cutoff, low_cutoff, dt, label="LP/HP filter")
+    b_lp, a_lp = signal.butter(5, float(high_cutoff), btype='low', analog=False, fs=srate)
+    b_hp, a_hp = signal.butter(5, float(low_cutoff), btype='high', analog=False, fs=srate)
+    print(f"[FILTER] LP/HP band: {float(low_cutoff):g}-{float(high_cutoff):g}Hz")
     return b_lp, a_lp, b_hp, a_hp
 
 def pre_post_condition(dt):
@@ -166,7 +199,6 @@ def pre_post_condition(dt):
     align_len = align_pre + align_post
 
     return(pre, post, win_len, align_pre, align_post, align_len)
-
 
 
 

@@ -157,11 +157,10 @@ def _build_stim_from_ttls(event_times_s, event_ttls, time, mask=None, active_low
             mask = 0x0001
 
     idxs = np.searchsorted(e_t, time, side="right")
-    stim = np.zeros(time.shape, dtype=np.uint8)
-    for i in range(time.size):
-        cur = e_v[idxs[i]-1] if idxs[i] > 0 else e_v[0]
-        bit = 1 if (cur & mask) != 0 else 0
-        stim[i] = (1 - bit) if active_low else bit
+    safe_idxs = np.where(idxs > 0, idxs - 1, 0)
+    cur = e_v[safe_idxs]
+    bit = ((cur & mask) != 0).astype(np.uint8)
+    stim = (1 - bit) if active_low else bit
     return stim, int(mask)
 
 def _build_stim_by_pulses(event_times_s, time, pulse_ms=5.0, durations_s=None):
