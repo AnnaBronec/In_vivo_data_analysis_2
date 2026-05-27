@@ -62,6 +62,13 @@ def compute_peak_aligned_segments(
     else:
         signal_1d = signal_data
 
+    # Einmal vorfiltern statt pro Segment — spart N×2 filtfilt-Aufrufe
+    try:
+        _tmp = signal.filtfilt(b_lp, a_lp, signal_1d)
+        signal_1d_bp = signal.filtfilt(b_hp, a_hp, _tmp)
+    except Exception:
+        signal_1d_bp = signal_1d
+
     peak_segments = np.full((len(up_indices), align_len), np.nan)
     peak_indices = []
 
@@ -77,13 +84,7 @@ def compute_peak_aligned_segments(
             continue
 
         current_data = np.asarray(signal_1d[start_idx:end_idx], dtype=float)
-
-        # Filtern (LP dann HP)
-        try:
-            V_filt = signal.filtfilt(b_lp, a_lp, current_data)
-            V_filt = signal.filtfilt(b_hp, a_hp, V_filt)
-        except Exception:
-            V_filt = current_data  
+        V_filt = signal_1d_bp[start_idx:end_idx]
 
         # Peak-Suchbereich innerhalb des Ausschnitts festlegen
         lo = int((search_start_s - offset_start) / dt)  # relative Indizes
@@ -254,6 +255,8 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
 
     print("Total_power stats:", np.min(Total_power), np.max(Total_power), np.isnan(Total_power).sum())
+
+
 
     # 2) Smooth 
     # 2) Smooth in *Sekunden* (weil t_feat ~ dt ist)
@@ -799,23 +802,21 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     UP_Time = (np.arange(align_len) - align_pre_samp) * dt
 
 
+    # Einmal vorfiltern statt pro Segment
+    try:
+        _tmp = signal.filtfilt(b_lp, a_lp, main_trace)
+        main_trace_bp = signal.filtfilt(b_hp, a_hp, _tmp)
+    except Exception:
+        main_trace_bp = main_trace
+
     Spon_Peaks = []
 
     for i_Spon in range(len(Spontaneous_UP)):
-        # Feature-Index → Zeit (s)
-        # t_feat = time_s[Spontaneous_UP[i_Spon]]
-
-        # # Zeit → Rohsample-Index
-        # start_idx = int((t_feat - 0.75) / dt)
-        # end_idx   = int((t_feat + 2.0) / dt)
-
         t_up = t_feat[Spontaneous_UP[i_Spon]]
 
-        # Zeit relativ zum Start -> Sample-Index
         t0 = t_feat[0]
         start_idx = int(((t_up - t0) - 0.75) / dt)
         end_idx   = int(((t_up - t0) + 2.0) / dt)
-
 
         start_idx = int(start_idx)
         end_idx = int(end_idx)
@@ -825,12 +826,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
             continue
 
         current_data = main_trace[start_idx:end_idx]
-
-        try:
-            V_filt = signal.filtfilt(b_lp, a_lp, current_data)
-            V_filt = signal.filtfilt(b_hp, a_hp, V_filt)
-        except Exception:
-            V_filt = current_data
+        V_filt = main_trace_bp[start_idx:end_idx]
 
         lo = int(0.25 / dt)  # roh-dt
         hi = int(1.25 / dt)
@@ -1327,3 +1323,8 @@ def _up_onsets(UP_idx, DOWN_idx):
         return np.array([], int)
     U, D = U[:m], D[:m]
     return np.sort(U)
+
+
+
+
+

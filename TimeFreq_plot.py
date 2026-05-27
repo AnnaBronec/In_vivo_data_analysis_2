@@ -24,60 +24,40 @@ half_wave = (len(t_wav)-1)/2
 Win_T = np.arange(-2+dt,2-dt,dt)
 
 def Compute_spectrogram(y,t_win):
-		
-	# FFT parameters
+
 	nKern = len(t_wav)
 	nData = len(y)
-	nConv = nKern+nData-1
-	# Convert data to frequency domain
-	dataX   = np.fft.fft( y ,nConv )
-	tf = np.zeros((num_frex,len(y)-1)) #np.zeros((num_frex,len(t_win)-1))
-	#tf = np.zeros((num_frex,nConv-1))
+	nConv = nKern + nData - 1
+	hw    = int(half_wave)
 
-	# Loop through each frequency.
-	for fi in range(0,num_frex):
-		s = nCycs[fi]/(2*np.pi*frex[fi]);
-		# Wavelet function	
-		wavelet = np.exp(2*complex(0,1)*np.pi*frex[fi]*t_wav) * np.exp(-t_wav**2/(2*s**2))
-		# Wavelet function in the frequency domain
-		waveletX = np.fft.fft(wavelet,nConv);
-		waveR = [wr.real for wr in wavelet]
-		waveI = [wi.imag for wi in wavelet]
-		#plt.plot(t_wav,waveR)
-		#plt.show()
+	# FFT of data once
+	dataX = np.fft.fft(y, nConv)
 
-		# Multiply the fourier transform of the wavelet by the fourier transform of the data
-		# then compute the inverse fourier transform to convert back to the time domain.
-		As = np.fft.ifft(np.multiply(waveletX,dataX),nConv)
-		As = As[int(half_wave)+1:-int(half_wave)]
-		#print(np.shape(tf[fi,:]))
-		#print(np.shape(As))
-		tf[fi,:] = abs(As)**2
+	# All wavelets at once: shape (num_frex, nKern)
+	s        = nCycs / (2 * np.pi * frex)                              # (num_frex,)
+	wavelets = (np.exp(2j * np.pi * frex[:, None] * t_wav[None, :])
+	            * np.exp(-t_wav[None, :]**2 / (2 * s[:, None]**2)))   # (num_frex, nKern)
 
-		# for i in range(1,num_frex):
-	   	#	tf[i,:] = 10*np.log10(np.divide(tf[i,:],np.mean(tf[i,:])))
-		#	tf[i,:] = 100 * np.divide(np.subtract(tf[i,:],np.mean(tf[i,:])), np.mean(tf[i,:]))
-		Spect_Out = [tf, frex, t_win[0:-1]]
+	# Batch FFT → multiply → batch IFFT
+	waveletX = np.fft.fft(wavelets, n=nConv, axis=1)                  # (num_frex, nConv)
+	As       = np.fft.ifft(waveletX * dataX[None, :], n=nConv, axis=1)# (num_frex, nConv)
+
+	# Trim edges identically to original per-frequency trim
+	tf = np.abs(As[:, hw + 1 : nConv - hw]) ** 2                      # (num_frex, nData-1)
+
+	Spect_Out = [tf, frex, t_win[0:-1]]
 	print('Test out: ',np.shape(Spect_Out[0]),np.shape(Spect_Out[2]))
 	return Spect_Out
 
 
 #Spect = spectrogram(Win_EEG_FF[0:-1:25],Win_T[0:-1:25])
 def Run_spectrogram(V_Signal,t_signal):
-	print("t:signal = ", t_signal)
-	# DownSample = int(0.001/np.diff(t_signal[0:2]))
-	dt = float(t_signal[1] - t_signal[0])     # Skalar
-	DownSample = int(round(0.001 / dt))
-	DownSample = max(1, DownSample)           # wichtig, sonst wird es bei dt>1ms zu 0
-
-	print(np.diff(t_signal[0:2]))
-	Spect = Compute_spectrogram(V_Signal,t_signal)#Win_T[0:-1:25])
+	Spect = Compute_spectrogram(V_Signal,t_signal)
 	# There are several outputs for spectrogram, we only want the first Spect[0]
 	TF = Spect[0]
-	# Normalise power for each frequency band
-	for m in range(1,num_frex):
-	#	tf[i,:] = 10*np.log10(np.divide(tf[i,:],np.mean(tf[i,:])))
-		TF[m,:] = 100 * np.divide(np.subtract(TF[m,:],np.mean(TF[m,:])), np.mean(TF[m,:]))
+	# Normalise power for each frequency band (skip row 0, vectorised)
+	means   = TF[1:].mean(axis=1, keepdims=True)
+	TF[1:] = 100 * (TF[1:] - means) / means
 	
 	#plt.contourf(t_signal[0:-1],frex,TF)
 	#plt.show()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sammelt alle UP-Amplitude-Trend-Daten aus Unterordnern von ROOT_DIR,
+Sammelt alle UP-Dauer-Trend-Daten aus Unterordnern von ROOT_DIR,
 zeichnet pro Parent-Ordner einen Trend-Plot (mit Foldernamen als Überschrift)
 und speichert alles in eine einzige PDF unter ROOT_DIR.
 """
@@ -15,9 +15,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-ROOT_DIR  = "/run/media/ananym/7FBA-F71B/invivo/hM4Di"
-OUT_PDF   = os.path.join(ROOT_DIR, "ALL_trend_amplitude.pdf")
-UNIT_LABEL = "µV/mm²"
+ROOT_DIR = "/run/media/ananym/7FBA-F71B/invivo/hM4Di"
+OUT_PDF  = os.path.join(ROOT_DIR, "ALL_trend_duration.pdf")
 
 
 def _nat_session_key(sess_name):
@@ -28,28 +27,28 @@ def _nat_session_key(sess_name):
 
 
 def load_trend_rows(parent_dir):
-    """Lädt pro Session den mittleren Amplitude-Wert (spont & trig)."""
+    """Lädt pro Session den mittleren Dauer-Wert (spont & trig)."""
     session_dirs = sorted(
         [d for d in os.scandir(parent_dir) if d.is_dir()],
         key=lambda e: _nat_session_key(e.name)
     )
     rows = []
     for entry in session_dirs:
-        amp_files = sorted(glob.glob(os.path.join(entry.path, "*__upstate_amplitudes.csv")), key=os.path.getmtime)
+        dur_files = sorted(glob.glob(os.path.join(entry.path, "*__upstate_durations.csv")), key=os.path.getmtime)
         spont = np.array([], dtype=float)
         trig  = np.array([], dtype=float)
-        if amp_files:
+        if dur_files:
             try:
-                dfm = pd.read_csv(amp_files[-1])
+                dfm = pd.read_csv(dur_files[-1])
                 st = (dfm.get("group", pd.Series([], dtype=str))
                          .astype(str).str.lower().str.strip()
                          .replace({"spont": "spontaneous", "trig": "triggered",
                                    "trigger": "triggered"}))
-                amp = pd.to_numeric(
-                    dfm.get("amplitude", pd.Series([], dtype=float)), errors="coerce"
+                dur = pd.to_numeric(
+                    dfm.get("duration_s", pd.Series([], dtype=float)), errors="coerce"
                 ).to_numpy(float)
-                spont = amp[(st.to_numpy() == "spontaneous") & np.isfinite(amp)]
-                trig  = amp[(st.to_numpy() == "triggered")   & np.isfinite(amp)]
+                spont = dur[(st.to_numpy() == "spontaneous") & np.isfinite(dur)]
+                trig  = dur[(st.to_numpy() == "triggered")   & np.isfinite(dur)]
             except Exception:
                 pass
         rows.append({
@@ -61,7 +60,6 @@ def load_trend_rows(parent_dir):
             "spont_raw":  spont.tolist(),
             "trig_raw":   trig.tolist(),
         })
-    # nur Zeilen mit mindestens einem Wert
     rows = [r for r in rows if np.isfinite(r["spont_mean"]) or np.isfinite(r["trig_mean"])]
     return rows
 
@@ -77,7 +75,6 @@ def plot_trend(ax, rows, folder_name):
     sp_ok = np.isfinite(spont_vals)
     tr_ok = np.isfinite(trig_vals)
 
-    # Einzelwerte als kleine, halbtransparente Punkte
     for i, r in enumerate(rows):
         raw_sp = r.get("spont_raw", [])
         raw_tr = r.get("trig_raw",  [])
@@ -88,7 +85,6 @@ def plot_trend(ax, rows, folder_name):
             ax.scatter([i] * len(raw_tr), raw_tr,
                        color="#F58518", alpha=0.25, s=12, zorder=2, linewidths=0)
 
-    # Mittelwert als großer Punkt mit Standardabweichung
     if sp_ok.any():
         ax.errorbar(x[sp_ok], spont_vals[sp_ok], yerr=spont_stds[sp_ok],
                     color="#4C78A8", marker="o", linewidth=1.5, markersize=8,
@@ -109,7 +105,7 @@ def plot_trend(ax, rows, folder_name):
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
-    ax.set_ylabel(f"Amplitude ({UNIT_LABEL})")
+    ax.set_ylabel("Dauer (s)")
     ax.set_title(folder_name, fontsize=12, fontweight="bold", pad=8)
     ax.grid(alpha=0.2, linestyle=":")
     ax.legend(fontsize=9)
@@ -128,7 +124,7 @@ def main():
             entries.append((os.path.basename(pd_path), rows))
 
     if not entries:
-        print("Keine Amplitude-Daten gefunden.")
+        print("Keine Dauer-Daten gefunden.")
         return
 
     print(f"Gefundene Parent-Ordner mit Daten: {len(entries)}")

@@ -2527,3 +2527,121 @@ def ttl_on_off_from_nev(ts_us, ttl, *, bitmask=None):
     # guard: ensure off > on
     good = off_us > on_us
     return on_us[good], off_us[good]
+
+
+def export_mua_html(
+    base_tag, save_dir, time_s, lfp_signal,
+    spike_times_s,
+    up_spont=None, up_trig=None, up_assoc=None,
+    bin_s=1.0,
+    title="MUA (interaktiv)",
+    y_label="LFP (µV)",
+    max_lfp_points=600_000,
+    max_spike_markers=100_000,
+):
+    """Two-panel interactive HTML: LFP + spike markers (top), binned MUA rate (bottom)."""
+    t = np.asarray(time_s, dtype=float)
+    x = np.asarray(lfp_signal, dtype=float)
+    spk = np.asarray(spike_times_s, dtype=float)
+    spk = spk[(spk >= t[0]) & (spk <= t[-1])] if t.size > 0 else spk
+
+    # Downsample LFP trace for rendering
+    if t.size > max_lfp_points:
+        step = int(np.ceil(t.size / max_lfp_points))
+        t_plot, x_plot = t[::step], x[::step]
+    else:
+        t_plot, x_plot = t, x
+
+    # Binned MUA rate
+    if t.size > 0 and spk.size > 0:
+        bins = np.arange(float(t[0]), float(t[-1]) + bin_s, bin_s)
+        counts, edges = np.histogram(spk, bins=bins)
+        bin_centers = 0.5 * (edges[:-1] + edges[1:])
+        rates = counts.astype(float) / bin_s
+    else:
+        bin_centers = np.array([])
+        rates = np.array([])
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.65, 0.35],
+        vertical_spacing=0.06,
+        subplot_titles=("LFP + Spike-Ereignisse", f"MUA Rate ({bin_s}s Bins)"),
+    )
+
+    # --- LFP trace ---
+    fig.add_trace(go.Scatter(
+        x=t_plot, y=x_plot, mode="lines", name="LFP",
+        line=dict(color="#1f77b4", width=0.7),
+    ), row=1, col=1)
+
+    # --- Spike markers (WebGL scatter, fixed y at bottom of LFP panel) ---
+    if spk.size > 0:
+        rng = float(np.nanmax(x_plot) - np.nanmin(x_plot)) or 1.0
+        y_spk = float(np.nanmin(x_plot)) - 0.08 * rng
+        if spk.size > max_spike_markers:
+            rng_seed = np.random.default_rng(0)
+            spk_plot = np.sort(rng_seed.choice(spk, max_spike_markers, replace=False))
+        else:
+            spk_plot = spk
+        fig.add_trace(go.Scattergl(
+            x=spk_plot,
+            y=np.full(spk_plot.size, y_spk),
+            mode="markers",
+            marker=dict(symbol="line-ns", size=10, color="rgba(220,40,40,0.45)",
+                        line=dict(width=1, color="rgba(220,40,40,0.45)")),
+            name=f"Spikes (n={spk.size:,})",
+        ), row=1, col=1)
+
+    # --- Binned rate bars ---
+    if bin_centers.size > 0:
+        fig.add_trace(go.Bar(
+            x=bin_centers, y=rates, name=f"Rate ({bin_s}s)",
+            marker_color="#2ca02c", opacity=0.75,
+        ), row=2, col=1)
+
+    # --- UP-state shading (yref=paper spans both panels) ---
+    def _mk_intervals(UP, DOWN):
+        if UP is None or DOWN is None:
+            return []
+        UP, DOWN = np.asarray(UP, int), np.asarray(DOWN, int)
+        m = min(len(UP), len(DOWN))
+        if m == 0:
+            return []
+        UP, DOWN = UP[:m], DOWN[:m]
+        n = len(time_s)
+        out = []
+        for u, d in zip(UP[np.argsort(UP)], DOWN[np.argsort(UP)]):
+            if 0 <= u < n and 0 < d <= n and d > u:
+                out.append((float(time_s[u]), float(time_s[d - 1])))
+        return out
+
+    shapes = []
+    for ivs, color in [
+        (_mk_intervals(*(up_spont  or (None, None))), "rgba(46,204,113,0.18)"),
+        (_mk_intervals(*(up_trig   or (None, None))), "rgba(31,119,180,0.18)"),
+        (_mk_intervals(*(up_assoc  or (None, None))), "rgba(255,127,14,0.18)"),
+    ]:
+        for t0s, t1s in ivs:
+            shapes.append(dict(
+                type="rect", xref="x", yref="paper",
+                x0=t0s, x1=t1s, y0=0, y1=1,
+                fillcolor=color, line_width=0, layer="below",
+            ))
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14)),
+        shapes=shapes,
+        height=680,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+        bargap=0.05,
+    )
+    fig.update_yaxes(title_text=y_label, row=1, col=1)
+    fig.update_yaxes(title_text="Rate (Hz)", row=2, col=1)
+    fig.update_xaxes(title_text="Zeit (s)", row=2, col=1)
+
+    out_path = os.path.join(save_dir, f"{base_tag}__mua_interactive.html")
+    plotly_offline_plot(fig, filename=out_path, auto_open=False, include_plotlyjs="cdn")
+    print(f"[MUA-HTML] {out_path}  (spikes={spk.size:,})")

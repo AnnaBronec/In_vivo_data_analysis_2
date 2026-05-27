@@ -214,9 +214,9 @@ def _clip_events_to_bounds(pulse_times, time_s, pre_s, post_s):
 
 
 
-def _upstate_amplitudes(signal, up_idx, down_idx, p_hi=95, p_lo=5):
+def _upstate_amplitudes(signal, up_idx, down_idx):
     """
-    Misst pro UP-Event die Amplitude als p95–p5 des Segments (robust gegen Spikes).
+    Misst pro UP-Event die Amplitude als max - min des Segments (in µV).
     up_idx/down_idx: Sample-Indizes in 'signal' (wie aus classify_states).
     Rückgabe: np.ndarray [n_events] (float), NaN-frei gefiltert.
     """
@@ -241,7 +241,7 @@ def _upstate_amplitudes(signal, up_idx, down_idx, p_hi=95, p_lo=5):
         seg = seg[np.isfinite(seg)]
         if seg.size == 0:
             continue
-        amps.append(float(np.percentile(seg, p_hi) - np.percentile(seg, p_lo)))
+        amps.append(float(np.max(seg) - np.min(seg)))
     return np.array(amps, dtype=float)
 
 
@@ -251,6 +251,29 @@ def _sem(x):
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
     return np.nanstd(x) / np.sqrt(max(1, x.size)) if x.size else np.nan
+
+def compute_mua_rate(signal_raw, fs_raw=32000.0, hp_hz=300.0, threshold_sigma=3.5, return_times=False):
+    """Threshold-Crossing MUA aus Rohdaten (32 kHz).
+    HP >hp_hz Hz → negative Kreuzungen bei -threshold_sigma × MAD → Firing-Rate [Hz].
+    Mit return_times=True: gibt (rate, spike_times_s) zurück, Zeiten relativ zum Signalstart."""
+    from scipy.signal import butter, sosfiltfilt
+    _nan = (np.nan, np.array([], dtype=float)) if return_times else np.nan
+    sig = np.asarray(signal_raw, dtype=float)
+    sig = sig[np.isfinite(sig)]
+    if sig.size < int(fs_raw * 0.5):
+        return _nan
+    sos = butter(3, hp_hz / (fs_raw / 2.0), btype="high", output="sos")
+    filt = sosfiltfilt(sos, sig)
+    noise = np.median(np.abs(filt)) / 0.6745
+    if noise < 1e-12:
+        return (0.0, np.array([], dtype=float)) if return_times else 0.0
+    thr = -threshold_sigma * noise
+    crossing_idx = np.where((filt[:-1] > thr) & (filt[1:] <= thr))[0] + 1
+    rate = float(crossing_idx.size / (sig.size / fs_raw))
+    if return_times:
+        return rate, crossing_idx.astype(float) / fs_raw
+    return rate
+
 
 def _even_subsample(idx, k):
     idx = np.asarray(idx, int)
@@ -1332,7 +1355,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         for sp in sorted(summary_files, key=_nat_session_key):
             sess_dir = os.path.dirname(sp)
             sess_name = os.path.basename(sess_dir)
-            amp_files = sorted(glob.glob(os.path.join(sess_dir, "*__upstate_amplitudes.csv")))
+            amp_files = sorted(glob.glob(os.path.join(sess_dir, "*__upstate_amplitudes.csv")), key=os.path.getmtime)
             spont = np.array([], dtype=float)
             trig = np.array([], dtype=float)
             if amp_files:
@@ -1404,6 +1427,48 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 plt.close(fig)
         print(f"[SUMMARY][UP-AMP][PDF] {out_pdf}")
 
+    def _write_parent_mua_trend_pdf(parent_dir, summary_files):
+        def _nat_key(p):
+            s = os.path.basename(os.path.dirname(p))
+            m = re.match(r"^\s*(\d+)", s)
+            return (0, int(m.group(1)), s.lower()) if m else (1, s.lower())
+
+        rows = []
+        for sp in sorted(summary_files, key=_nat_key):
+            sess_name = os.path.basename(os.path.dirname(sp))
+            try:
+                df = pd.read_csv(sp, sep=None, engine="python")
+                rate = pd.to_numeric(df.get("MUA rate [Hz]", pd.Series([np.nan])), errors="coerce").iloc[-1]
+            except Exception:
+                rate = np.nan
+            rows.append({"session_name": sess_name, "mua_hz": float(rate) if pd.notna(rate) else np.nan})
+
+        rows = [r for r in rows if np.isfinite(r["mua_hz"])]
+        if not rows:
+            return
+
+        labels = [r["session_name"] for r in rows]
+        x      = np.arange(len(labels))
+        vals   = np.array([r["mua_hz"] for r in rows])
+
+        fig_w = max(8, len(labels) * 0.9)
+        fig, ax = plt.subplots(figsize=(fig_w, 5))
+        ax.plot(x, vals, color="#2ca02c", marker="o", linewidth=1.5, markersize=7, label="MUA rate")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
+        ax.set_ylabel("MUA Firing Rate (Hz)")
+        ax.set_title("MUA Firing Rate pro Session", fontsize=11)
+        ymax = float(np.nanpercentile(vals, 99))
+        yspan = max(ymax, 1e-6)
+        ax.set_ylim(0, ymax + 0.20 * yspan)
+        ax.grid(alpha=0.2, linestyle=":")
+        ax.legend(fontsize=9)
+        fig.tight_layout()
+        out_pdf = os.path.join(parent_dir, "upstate_summary_ALL_parent__mua_trend.pdf")
+        fig.savefig(out_pdf, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[SUMMARY][MUA-TREND][PDF] {out_pdf}")
+
     def _write_parent_up_amplitude_trend_pdf(parent_dir, summary_files):
         def _nat_session_key(path_str):
             sess = os.path.basename(os.path.dirname(path_str))
@@ -1416,7 +1481,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         for sp in sorted(summary_files, key=_nat_session_key):
             sess_dir = os.path.dirname(sp)
             sess_name = os.path.basename(sess_dir)
-            amp_files = sorted(glob.glob(os.path.join(sess_dir, "*__upstate_amplitudes.csv")))
+            amp_files = sorted(glob.glob(os.path.join(sess_dir, "*__upstate_amplitudes.csv")), key=os.path.getmtime)
             spont = np.array([], dtype=float)
             trig = np.array([], dtype=float)
             if amp_files:
@@ -1433,6 +1498,10 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 "session_name": sess_name,
                 "spont_mean": float(np.nanmean(spont)) if spont.size else np.nan,
                 "trig_mean":  float(np.nanmean(trig))  if trig.size  else np.nan,
+                "spont_std":  float(np.nanstd(spont))  if spont.size else np.nan,
+                "trig_std":   float(np.nanstd(trig))   if trig.size  else np.nan,
+                "spont_raw":  spont.tolist(),
+                "trig_raw":   trig.tolist(),
             })
 
         if not rows:
@@ -1443,11 +1512,12 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         spont_vals = np.array([r["spont_mean"] for r in rows])
         trig_vals  = np.array([r["trig_mean"]  for r in rows])
 
-        all_vals = np.concatenate([spont_vals[np.isfinite(spont_vals)],
-                                   trig_vals[np.isfinite(trig_vals)]])
-        if all_vals.size:
-            vmax = float(np.nanpercentile(all_vals, 99))
-            vmin = float(np.nanmin(all_vals))
+        all_raw = np.array([v for r in rows
+                            for v in r.get("spont_raw", []) + r.get("trig_raw", [])
+                            if np.isfinite(v)])
+        if all_raw.size:
+            vmax = float(np.nanpercentile(all_raw, 99))
+            vmin = float(np.nanmin(all_raw))
             span = max(vmax - vmin, 1e-6)
             ylim = (min(0.0, vmin - 0.05 * span), vmax + 0.20 * span)
         else:
@@ -1456,15 +1526,36 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         fig_w = max(8, len(labels) * 0.9)
         fig, ax = plt.subplots(figsize=(fig_w, 5))
 
-        ax.plot(x[np.isfinite(spont_vals)], spont_vals[np.isfinite(spont_vals)],
-                color="#4C78A8", marker="o", linewidth=1.5, markersize=7, label="Spontan")
-        ax.plot(x[np.isfinite(trig_vals)], trig_vals[np.isfinite(trig_vals)],
-                color="#F58518", marker="o", linewidth=1.5, markersize=7, label="Getriggert")
+        spont_stds = np.array([r.get("spont_std", np.nan) for r in rows])
+        trig_stds  = np.array([r.get("trig_std",  np.nan) for r in rows])
+        sp_ok = np.isfinite(spont_vals)
+        tr_ok = np.isfinite(trig_vals)
+
+        # Einzelwerte als kleine, halbtransparente Punkte
+        for i, r in enumerate(rows):
+            raw_sp = r.get("spont_raw", [])
+            raw_tr = r.get("trig_raw",  [])
+            if raw_sp:
+                ax.scatter([i] * len(raw_sp), raw_sp,
+                           color="#4C78A8", alpha=0.25, s=12, zorder=2, linewidths=0)
+            if raw_tr:
+                ax.scatter([i] * len(raw_tr), raw_tr,
+                           color="#F58518", alpha=0.25, s=12, zorder=2, linewidths=0)
+
+        # Mittelwert als großer Punkt mit Standardabweichung
+        if sp_ok.any():
+            ax.errorbar(x[sp_ok], spont_vals[sp_ok], yerr=spont_stds[sp_ok],
+                        color="#4C78A8", marker="o", linewidth=1.5, markersize=8,
+                        capsize=3, label="Spontan", zorder=3)
+        if tr_ok.any():
+            ax.errorbar(x[tr_ok], trig_vals[tr_ok], yerr=trig_stds[tr_ok],
+                        color="#F58518", marker="o", linewidth=1.5, markersize=8,
+                        capsize=3, label="Getriggert", zorder=3)
 
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
-        ax.set_ylabel(f"Mean Amplitude ({UNIT_LABEL})")
-        ax.set_title("UP Amplitude (mean) pro Session", fontsize=11)
+        ax.set_ylabel(f"Amplitude ({UNIT_LABEL})")
+        ax.set_title("UP Amplitude pro Session", fontsize=11)
         if ylim:
             ax.set_ylim(ylim)
         ax.grid(alpha=0.2, linestyle=":")
@@ -1495,7 +1586,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             )
             rows = []
             for entry in session_dirs:
-                amp_files = sorted(glob.glob(os.path.join(entry.path, "*__upstate_amplitudes.csv")))
+                amp_files = sorted(glob.glob(os.path.join(entry.path, "*__upstate_amplitudes.csv")), key=os.path.getmtime)
                 spont = np.array([], dtype=float)
                 trig  = np.array([], dtype=float)
                 if amp_files:
@@ -1515,8 +1606,15 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 spont_mean = float(np.nanmean(spont)) if spont.size else np.nan
                 trig_mean  = float(np.nanmean(trig))  if trig.size  else np.nan
                 if np.isfinite(spont_mean) or np.isfinite(trig_mean):
-                    rows.append({"session_name": entry.name,
-                                 "spont_mean": spont_mean, "trig_mean": trig_mean})
+                    rows.append({
+                        "session_name": entry.name,
+                        "spont_mean": spont_mean,
+                        "trig_mean":  trig_mean,
+                        "spont_std":  float(np.nanstd(spont)) if spont.size else np.nan,
+                        "trig_std":   float(np.nanstd(trig))  if trig.size  else np.nan,
+                        "spont_raw":  spont.tolist(),
+                        "trig_raw":   trig.tolist(),
+                    })
             if rows:
                 entries.append((os.path.basename(pd_path), rows))
 
@@ -1530,13 +1628,17 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 x          = np.arange(len(labels))
                 spont_vals = np.array([r["spont_mean"] for r in rows])
                 trig_vals  = np.array([r["trig_mean"]  for r in rows])
+                spont_stds = np.array([r.get("spont_std", np.nan) for r in rows])
+                trig_stds  = np.array([r.get("trig_std",  np.nan) for r in rows])
                 sp_ok = np.isfinite(spont_vals)
                 tr_ok = np.isfinite(trig_vals)
 
-                all_vals = np.concatenate([spont_vals[sp_ok], trig_vals[tr_ok]])
-                if all_vals.size:
-                    vmax = float(np.nanpercentile(all_vals, 99))
-                    vmin = float(np.nanmin(all_vals))
+                all_raw = np.array([v for r in rows
+                                    for v in r.get("spont_raw", []) + r.get("trig_raw", [])
+                                    if np.isfinite(v)])
+                if all_raw.size:
+                    vmax = float(np.nanpercentile(all_raw, 99))
+                    vmin = float(np.nanmin(all_raw))
                     span = max(vmax - vmin, 1e-6)
                     ylim = (min(0.0, vmin - 0.05 * span), vmax + 0.20 * span)
                 else:
@@ -1544,15 +1646,31 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
 
                 fig_w = max(9, len(labels) * 0.9)
                 fig, ax = plt.subplots(figsize=(fig_w, 5))
+
+                # Einzelwerte als kleine, halbtransparente Punkte
+                for i, r in enumerate(rows):
+                    raw_sp = r.get("spont_raw", [])
+                    raw_tr = r.get("trig_raw",  [])
+                    if raw_sp:
+                        ax.scatter([i] * len(raw_sp), raw_sp,
+                                   color="#4C78A8", alpha=0.25, s=12, zorder=2, linewidths=0)
+                    if raw_tr:
+                        ax.scatter([i] * len(raw_tr), raw_tr,
+                                   color="#F58518", alpha=0.25, s=12, zorder=2, linewidths=0)
+
+                # Mittelwert als großer Punkt mit Standardabweichung
                 if sp_ok.any():
-                    ax.plot(x[sp_ok], spont_vals[sp_ok],
-                            color="#4C78A8", marker="o", linewidth=1.5, markersize=7, label="Spontan")
+                    ax.errorbar(x[sp_ok], spont_vals[sp_ok], yerr=spont_stds[sp_ok],
+                                color="#4C78A8", marker="o", linewidth=1.5, markersize=8,
+                                capsize=3, label="Spontan", zorder=3)
                 if tr_ok.any():
-                    ax.plot(x[tr_ok], trig_vals[tr_ok],
-                            color="#F58518", marker="o", linewidth=1.5, markersize=7, label="Getriggert")
+                    ax.errorbar(x[tr_ok], trig_vals[tr_ok], yerr=trig_stds[tr_ok],
+                                color="#F58518", marker="o", linewidth=1.5, markersize=8,
+                                capsize=3, label="Getriggert", zorder=3)
+
                 ax.set_xticks(x)
                 ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
-                ax.set_ylabel(f"Mean Amplitude ({UNIT_LABEL})")
+                ax.set_ylabel(f"Amplitude ({UNIT_LABEL})")
                 ax.set_title(folder_name, fontsize=12, fontweight="bold", pad=8)
                 if ylim:
                     ax.set_ylim(ylim)
@@ -1564,11 +1682,74 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
 
         print(f"[SUMMARY][ALL-TREND][PDF] {out_pdf}  ({len(entries)} Parent-Ordner)")
 
-    exp_dir       = os.path.dirname(summary_path)
-    parent_dir    = os.path.dirname(exp_dir)        
-    for_david_dir = os.path.dirname(parent_dir)     
+    def _write_global_mua_trend_pdf(root_dir):
+        """Eine PDF mit einem MUA-Trend-Plot pro Parent-Ordner, gespeichert in root_dir."""
+        def _name_key(name):
+            m = re.match(r"^\s*(\d+)", str(name))
+            return (0, int(m.group(1)), str(name).lower()) if m else (1, str(name).lower())
 
-    #Rollup pro Parent-Ordner 
+        parent_dirs = sorted(
+            [e.path for e in os.scandir(root_dir) if e.is_dir()],
+            key=lambda p: _name_key(os.path.basename(p))
+        )
+
+        entries = []
+        for pd_path in parent_dirs:
+            summary_files = sorted(glob.glob(os.path.join(pd_path, "*", "upstate_summary.csv")))
+            rows = []
+            for sp in summary_files:
+                sess_name = os.path.basename(os.path.dirname(sp))
+                try:
+                    df = pd.read_csv(sp, sep=None, engine="python")
+                    rate = pd.to_numeric(
+                        df.get("MUA rate [Hz]", pd.Series([np.nan])), errors="coerce"
+                    ).iloc[-1]
+                except Exception:
+                    rate = np.nan
+                if pd.notna(rate) and np.isfinite(float(rate)):
+                    rows.append({"session_name": sess_name, "mua_hz": float(rate)})
+            if rows:
+                entries.append((os.path.basename(pd_path), rows))
+
+        if not entries:
+            return
+
+        out_pdf = os.path.join(root_dir, "ALL_trend_mua.pdf")
+        with PdfPages(out_pdf) as pdf:
+            for folder_name, rows in entries:
+                labels = [r["session_name"] for r in rows]
+                x      = np.arange(len(labels))
+                vals   = np.array([r["mua_hz"] for r in rows])
+
+                fig_w = max(9, len(labels) * 0.9)
+                fig, ax = plt.subplots(figsize=(fig_w, 5))
+                ax.plot(x, vals, color="#2ca02c", marker="o",
+                        linewidth=1.5, markersize=7, label="MUA rate")
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
+                ax.set_ylabel("MUA Firing Rate (Hz)")
+                ax.set_title(folder_name, fontsize=12, fontweight="bold", pad=8)
+                ymax = float(np.nanpercentile(vals, 99))
+                ax.set_ylim(0, ymax + 0.20 * max(ymax, 1e-6))
+                ax.grid(alpha=0.2, linestyle=":")
+                ax.legend(fontsize=9)
+                fig.tight_layout()
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+        print(f"[SUMMARY][ALL-MUA-TREND][PDF] {out_pdf}  ({len(entries)} Parent-Ordner)")
+
+    def _needs_update(out_path, sources):
+        if not os.path.exists(out_path):
+            return True
+        t_out = os.path.getmtime(out_path)
+        return any(os.path.getmtime(s) > t_out for s in sources if os.path.exists(s))
+
+    exp_dir       = os.path.dirname(summary_path)
+    parent_dir    = os.path.dirname(exp_dir)
+    for_david_dir = os.path.dirname(parent_dir)
+
+    #Rollup pro Parent-Ordner
     files_parent = sorted(glob.glob(os.path.join(parent_dir, "*", "upstate_summary.csv")))
     dfs = [_read_any(p) for p in files_parent]
     if dfs:
@@ -1578,14 +1759,31 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         _write_semicolon(out_parent, r)
         print(f"[SUMMARY][ROLLUP Parent] {out_parent}  (Quellen: {len(files_parent)})")
         _write_group_compare(r, parent_dir, "upstate_summary_ALL_parent")
-        _write_parent_group_compare_pdf(parent_dir, files_parent)
-        _write_parent_up_rate_overview_pdf(parent_dir, files_parent)
-        _write_parent_up_amplitude_overview_pdf(parent_dir, files_parent)
-        _write_parent_up_amplitude_trend_pdf(parent_dir, files_parent)
+        _pdf_p = lambda n: os.path.join(parent_dir, n)
+        if _needs_update(_pdf_p("upstate_summary_ALL_parent__group_compare.pdf"), files_parent):
+            _write_parent_group_compare_pdf(parent_dir, files_parent)
+        else:
+            print("[SUMMARY][SKIP] group_compare PDF aktuell")
+        if _needs_update(_pdf_p("upstate_summary_ALL_parent__up_rate_panels.pdf"), files_parent):
+            _write_parent_up_rate_overview_pdf(parent_dir, files_parent)
+        else:
+            print("[SUMMARY][SKIP] up_rate PDF aktuell")
+        if _needs_update(_pdf_p("upstate_summary_ALL_parent__up_amplitude_panels.pdf"), files_parent):
+            _write_parent_up_amplitude_overview_pdf(parent_dir, files_parent)
+        else:
+            print("[SUMMARY][SKIP] up_amplitude PDF aktuell")
+        if _needs_update(_pdf_p("upstate_summary_ALL_parent__up_amplitude_trend.pdf"), files_parent):
+            _write_parent_up_amplitude_trend_pdf(parent_dir, files_parent)
+        else:
+            print("[SUMMARY][SKIP] amplitude_trend PDF aktuell")
+        if _needs_update(_pdf_p("upstate_summary_ALL_parent__mua_trend.pdf"), files_parent):
+            _write_parent_mua_trend_pdf(parent_dir, files_parent)
+        else:
+            print("[SUMMARY][SKIP] mua_trend PDF aktuell")
     else:
         print("[SUMMARY][ROLLUP Parent] keine Quellen gefunden")
 
-    # Rollup (alle Parents zusammen) 
+    # Rollup (alle Parents zusammen)
     files_all = sorted(glob.glob(os.path.join(for_david_dir, "*", "*", "upstate_summary.csv")))
     dfs_all = [_read_any(p) for p in files_all]
     if dfs_all:
@@ -1595,6 +1793,51 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         _write_semicolon(out_fd, r_all)
         print(f"[SUMMARY][ROLLUP For David] {out_fd}  (Quellen: {len(files_all)})")
         _write_group_compare(r_all, for_david_dir, "upstate_summary_ALL_global")
-        _write_global_all_trend_pdf(for_david_dir)
+        _pdf_fd = lambda n: os.path.join(for_david_dir, n)
+        if _needs_update(_pdf_fd("ALL_trend_amplitude.pdf"), files_all):
+            _write_global_all_trend_pdf(for_david_dir)
+        else:
+            print("[SUMMARY][SKIP] ALL_trend_amplitude PDF aktuell")
+        if _needs_update(_pdf_fd("ALL_trend_mua.pdf"), files_all):
+            _write_global_mua_trend_pdf(for_david_dir)
+        else:
+            print("[SUMMARY][SKIP] ALL_trend_mua PDF aktuell")
+        try:
+            import importlib.util as _ilu
+            from pathlib import Path as _Path
+            _dur_path = _Path(__file__).with_name("merge_trend_duration_pdfs.py")
+            if _dur_path.exists():
+                _spec = _ilu.spec_from_file_location("merge_trend_duration_pdfs", str(_dur_path))
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _mod.ROOT_DIR = for_david_dir
+                _mod.OUT_PDF  = os.path.join(for_david_dir, "ALL_trend_duration.pdf")
+                _mod.main()
+        except Exception as _e:
+            print(f"[TREND-DURATION] übersprungen: {_e}")
+        try:
+            import importlib.util as _ilu
+            from pathlib import Path as _Path
+            _pca_path = _Path(__file__).with_name("pca_upstates.py")
+            if _pca_path.exists():
+                _spec = _ilu.spec_from_file_location("pca_upstates", str(_pca_path))
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _mod.ROOT_DIR = for_david_dir
+                _mod.OUT_PDF  = os.path.join(for_david_dir, "ALL_pca_upstates.pdf")
+                _mod.main()
+        except Exception as _e:
+            print(f"[PCA-UPSTATES] übersprungen: {_e}")
+        try:
+            import importlib.util as _ilu
+            from pathlib import Path as _Path
+            _ac_path = _Path(__file__).with_name("activity_compare.py")
+            if _ac_path.exists():
+                _spec = _ilu.spec_from_file_location("activity_compare", str(_ac_path))
+                _ac = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_ac)
+                _ac.run(_Path(for_david_dir))
+        except Exception as _e:
+            print(f"[ACTIVITY-COMPARE] übersprungen: {_e}")
     else:
         print("[SUMMARY][ROLLUP For David] keine Quellen gefunden")
