@@ -214,9 +214,9 @@ def _clip_events_to_bounds(pulse_times, time_s, pre_s, post_s):
 
 
 
-def _upstate_amplitudes(signal, up_idx, down_idx):
+def _upstate_amplitudes(signal, up_idx, down_idx, p_hi=95, p_lo=5):
     """
-    Misst pro UP-Event die Amplitude als max - min des Segments (in µV).
+    Misst pro UP-Event die Amplitude als p95–p5 des Segments (robust gegen Spikes).
     up_idx/down_idx: Sample-Indizes in 'signal' (wie aus classify_states).
     Rückgabe: np.ndarray [n_events] (float), NaN-frei gefiltert.
     """
@@ -241,7 +241,7 @@ def _upstate_amplitudes(signal, up_idx, down_idx):
         seg = seg[np.isfinite(seg)]
         if seg.size == 0:
             continue
-        amps.append(float(np.max(seg) - np.min(seg)))
+        amps.append(float(np.percentile(seg, p_hi) - np.percentile(seg, p_lo)))
     return np.array(amps, dtype=float)
 
 
@@ -252,9 +252,11 @@ def _sem(x):
     x = x[np.isfinite(x)]
     return np.nanstd(x) / np.sqrt(max(1, x.size)) if x.size else np.nan
 
-def compute_mua_rate(signal_raw, fs_raw=32000.0, hp_hz=300.0, threshold_sigma=3.5, return_times=False):
+def compute_mua_rate(signal_raw, fs_raw=32000.0, hp_hz=300.0, threshold_sigma=3.5,
+                     refractory_ms=1.0, return_times=False):
     """Threshold-Crossing MUA aus Rohdaten (32 kHz).
     HP >hp_hz Hz → negative Kreuzungen bei -threshold_sigma × MAD → Firing-Rate [Hz].
+    refractory_ms: Mindestabstand zwischen zwei Spikes (Standard 1 ms = 32 Samples bei 32 kHz).
     Mit return_times=True: gibt (rate, spike_times_s) zurück, Zeiten relativ zum Signalstart."""
     from scipy.signal import butter, sosfiltfilt
     _nan = (np.nan, np.array([], dtype=float)) if return_times else np.nan
@@ -269,10 +271,142 @@ def compute_mua_rate(signal_raw, fs_raw=32000.0, hp_hz=300.0, threshold_sigma=3.
         return (0.0, np.array([], dtype=float)) if return_times else 0.0
     thr = -threshold_sigma * noise
     crossing_idx = np.where((filt[:-1] > thr) & (filt[1:] <= thr))[0] + 1
+    if refractory_ms > 0 and crossing_idx.size > 1:
+        ref_samples = int(round(refractory_ms * fs_raw / 1000.0))
+        keep = np.ones(crossing_idx.size, dtype=bool)
+        last = crossing_idx[0]
+        for i in range(1, crossing_idx.size):
+            if crossing_idx[i] - last < ref_samples:
+                keep[i] = False
+            else:
+                last = crossing_idx[i]
+        crossing_idx = crossing_idx[keep]
     rate = float(crossing_idx.size / (sig.size / fs_raw))
     if return_times:
         return rate, crossing_idx.astype(float) / fs_raw
     return rate
+
+
+def count_spikes_per_upstate(spike_times_s, up_idx, down_idx, time_s):
+    """
+    Zählt MUA-Spikes (Aktionspotenziale) innerhalb jedes Up-Zustands.
+
+    Parameter
+    ---------
+    spike_times_s : 1D-Array
+        Absolute Spike-Zeiten in Sekunden (Output von compute_mua_rate mit return_times=True).
+    up_idx, down_idx : int-Arrays
+        Indizes des Beginns (UP) und Endes (DOWN) jedes Up-Zustands in time_s.
+    time_s : 1D-Array
+        Zeitvektor in Sekunden.
+
+    Gibt zurück
+    -----------
+    counts : int-Array (Länge = min(len(up_idx), len(down_idx)))
+        Anzahl der Spikes pro Up-Zustand.
+    rates_hz : float-Array
+        Lokale Firing-Rate in Hz = counts / Dauer [s].
+    durations_s : float-Array
+        Dauer jedes Up-Zustands in Sekunden.
+    """
+    spike_times_s = np.sort(np.asarray(spike_times_s, float))
+    up_idx   = np.asarray(up_idx,   int)
+    down_idx = np.asarray(down_idx, int)
+    time_s   = np.asarray(time_s,   float)
+
+    m = min(len(up_idx), len(down_idx))
+    counts       = np.zeros(m, dtype=int)
+    rates_hz     = np.full(m, np.nan)
+    durations_s  = np.full(m, np.nan)
+
+    if m == 0:
+        return counts, rates_hz, durations_s
+
+    n_time = len(time_s)
+    up_idx   = np.clip(up_idx[:m],   0, n_time - 1)
+    down_idx = np.clip(down_idx[:m], 0, n_time - 1)
+
+    if spike_times_s.size > 0:
+        for i in range(m):
+            t_start = float(time_s[up_idx[i]])
+            t_end   = float(time_s[down_idx[i]])
+            dur = t_end - t_start
+            if dur <= 0:
+                continue
+            durations_s[i] = dur
+            i_lo = int(np.searchsorted(spike_times_s, t_start, side="left"))
+            i_hi = int(np.searchsorted(spike_times_s, t_end,   side="left"))
+            counts[i]   = i_hi - i_lo
+            rates_hz[i] = float(counts[i]) / dur
+    else:
+        for i in range(m):
+            t_start = float(time_s[up_idx[i]])
+            t_end   = float(time_s[down_idx[i]])
+            dur = t_end - t_start
+            if dur > 0:
+                durations_s[i] = dur
+
+    return counts, rates_hz, durations_s
+
+
+def mua_spikes_per_upstate_hist_ax(
+    spont_counts, spont_rates=None,
+    ax=None,
+    title="MUA: Aktionspotenziale pro spontanem Up-Zustand",
+):
+    """
+    Histogramm der Spike-Anzahl pro spontanem Up-Zustand (eine Session).
+    Zeigt Median, Mittelwert und n.  spont_rates optional für zweite Achse.
+    """
+    counts = np.asarray(spont_counts, float)
+    valid  = counts[np.isfinite(counts)]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.5, 3.4))
+    else:
+        fig = ax.figure
+
+    if valid.size == 0:
+        ax.text(0.5, 0.5, "keine MUA-Spike-Daten",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return fig
+
+    # Ganzzahlige Bins (Spike-Anzahl = integer)
+    max_c = int(valid.max())
+    bins = np.arange(-0.5, max_c + 1.5, 1.0)
+    ax.hist(valid, bins=bins, color="#4C78A8", alpha=0.80, edgecolor="white", linewidth=0.5)
+
+    mean_v   = float(np.nanmean(valid))
+    median_v = float(np.nanmedian(valid))
+    ax.axvline(mean_v,   color="#E15759", lw=1.8, linestyle="--", label=f"Mittel={mean_v:.1f}")
+    ax.axvline(median_v, color="#59A14F", lw=1.8, linestyle=":",  label=f"Median={median_v:.1f}")
+
+    ax.set_xlabel("Spikes pro Up-Zustand")
+    ax.set_ylabel("Anzahl Up-Zustände")
+    ax.set_title(title, fontsize=9)
+    ax.legend(fontsize=8, frameon=False)
+    ax.grid(axis="y", alpha=0.18, linestyle=":")
+
+    # Textbox: Kennzahlen
+    sem_v = float(np.nanstd(valid) / np.sqrt(valid.size))
+    txt = (
+        f"n={valid.size}\n"
+        f"µ={mean_v:.1f} ± {sem_v:.1f} (SEM)\n"
+        f"Median={median_v:.1f}\n"
+        f"Min={int(valid.min())}  Max={int(valid.max())}"
+    )
+    if spont_rates is not None:
+        rates = np.asarray(spont_rates, float)
+        r_val = rates[np.isfinite(rates)]
+        if r_val.size:
+            txt += f"\nFiring-Rate (µ)={np.nanmean(r_val):.1f} Hz"
+    ax.text(
+        0.97, 0.96, txt,
+        transform=ax.transAxes, ha="right", va="top",
+        fontsize=8, bbox=dict(boxstyle="round", fc="white", alpha=0.78),
+    )
+    return fig
 
 
 def _even_subsample(idx, k):
@@ -1118,6 +1252,38 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 except Exception:
                     continue
 
+            elif metric == "mua_spikes_spont":
+                # Spikes pro spontanem Up-Zustand – nur spontaneous
+                files = sorted(glob.glob(os.path.join(sess_dir, "*__mua_spikes_per_upstate.csv")))
+                if not files:
+                    continue
+                try:
+                    dfm = pd.read_csv(files[-1])
+                    st  = dfm.get("group", pd.Series([], dtype=str)).astype(str).str.lower().str.strip()
+                    val = pd.to_numeric(dfm.get("n_spikes", pd.Series([], dtype=float)), errors="coerce")
+                    mask = np.isfinite(val) & (st == "spontaneous")
+                    for v in val[mask]:
+                        rows.append({"session_dir": sess_dir, "group": grp, "state": "spontaneous",
+                                     metric: float(v)})
+                except Exception:
+                    continue
+
+            elif metric == "mua_rate_hz_spont":
+                # Firing-Rate innerhalb spontaner Up-Zustände
+                files = sorted(glob.glob(os.path.join(sess_dir, "*__mua_spikes_per_upstate.csv")))
+                if not files:
+                    continue
+                try:
+                    dfm = pd.read_csv(files[-1])
+                    st  = dfm.get("group", pd.Series([], dtype=str)).astype(str).str.lower().str.strip()
+                    val = pd.to_numeric(dfm.get("firing_rate_hz", pd.Series([], dtype=float)), errors="coerce")
+                    mask = np.isfinite(val) & (st == "spontaneous")
+                    for v in val[mask]:
+                        rows.append({"session_dir": sess_dir, "group": grp, "state": "spontaneous",
+                                     metric: float(v)})
+                except Exception:
+                    continue
+
         return pd.DataFrame(rows)
 
     def _group_pair_box_scatter(ax, df, col, title, ylabel):
@@ -1196,11 +1362,90 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         ax.plot([], [], color="#1f77b4", lw=2, label="Triggered")
         ax.legend(loc="best", frameon=False, fontsize=8)
 
+    def _group_spont_box_scatter(ax, df, col, title, ylabel):
+        """
+        Boxplot + Scatterplot einer Metrik für spontane Up-Zustände,
+        eine Box pro Bedingungsgruppe (Ordnernamen → TLX, DRD, WT etc.).
+        Jeder Punkt = ein Up-Zustand-Event.
+        """
+        if df is None or df.empty or col not in df.columns:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return
+
+        d = df.copy()
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d[np.isfinite(d[col])]
+        if d.empty:
+            ax.text(0.5, 0.5, "no valid values", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return
+
+        # Gruppen nach Anzahl Sessions absteigend sortieren
+        groups = sorted(
+            d["group"].dropna().unique().tolist(),
+            key=lambda g: (-(d.loc[d["group"] == g, "session_dir"].nunique()), str(g)),
+        )
+        if not groups:
+            ax.text(0.5, 0.5, "no groups", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            return
+
+        # Eine Farbe pro Gruppe
+        cmap = plt.get_cmap("tab10")
+        base_x = np.arange(len(groups), dtype=float)
+        rng = np.random.default_rng(0)
+
+        plot_data, plot_pos, plot_colors = [], [], []
+        for i, g in enumerate(groups):
+            arr = pd.to_numeric(d.loc[d["group"] == g, col], errors="coerce").to_numpy(float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                continue
+            color = cmap(i % 10)
+            plot_data.append(arr)
+            plot_pos.append(base_x[i])
+            plot_colors.append(color)
+
+        if not plot_data:
+            ax.set_axis_off()
+            return
+
+        bp = ax.boxplot(
+            plot_data, positions=plot_pos, widths=0.45,
+            whis=[5, 95], showfliers=False, patch_artist=True,
+        )
+        for patch, color in zip(bp["boxes"], plot_colors):
+            patch.set(facecolor=color, alpha=0.30, edgecolor=color)
+        for med, color in zip(bp["medians"], plot_colors):
+            med.set(color=color, linewidth=2.0)
+        for el in bp["whiskers"] + bp["caps"]:
+            el.set(linewidth=1.2, color="gray")
+
+        for pos, arr, color in zip(plot_pos, plot_data, plot_colors):
+            xx = np.full(arr.size, pos) + (rng.random(arr.size) - 0.5) * 0.22
+            ax.scatter(xx, arr, s=14, alpha=0.55, color=color, linewidths=0, zorder=3)
+            n_sess = d.loc[d["group"] == groups[int(round(pos))], "session_dir"].nunique()
+            ax.text(pos, np.nanmax(arr),
+                    f"n_ev={arr.size}\nn_sess={n_sess}",
+                    ha="center", va="bottom", fontsize=7, color=color)
+
+        ax.set_title(title, fontsize=9)
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(base_x)
+        ax.set_xticklabels(groups, rotation=15, ha="right")
+        ax.grid(axis="y", alpha=0.25, ls=":")
+
     def _write_parent_group_compare_pdf(parent_dir, summary_files):
-        d_dur = _load_metric_events(summary_files, "up_duration_s")
-        d_amp = _load_metric_events(summary_files, "up_amplitude")
-        d_mah = _load_metric_events(summary_files, "mahal_k3")
-        if d_dur.empty and d_amp.empty and d_mah.empty:
+        d_dur     = _load_metric_events(summary_files, "up_duration_s")
+        d_amp     = _load_metric_events(summary_files, "up_amplitude")
+        d_mah     = _load_metric_events(summary_files, "mahal_k3")
+        d_spk     = _load_metric_events(summary_files, "mua_spikes_spont")
+        d_spk_hz  = _load_metric_events(summary_files, "mua_rate_hz_spont")
+
+        any_data = not (d_dur.empty and d_amp.empty and d_mah.empty
+                        and d_spk.empty and d_spk_hz.empty)
+        if not any_data:
             print("[SUMMARY][GROUP][PDF] skipped: no event-level rows")
             return
 
@@ -1216,9 +1461,18 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             out_csv = os.path.join(parent_dir, "upstate_summary_ALL_parent__group_event_mahal.csv")
             _write_semicolon(out_csv, d_mah)
             print(f"[SUMMARY][GROUP][PDF] {out_csv}")
+        if not d_spk.empty:
+            out_csv = os.path.join(parent_dir, "upstate_summary_ALL_parent__group_mua_spikes_spont.csv")
+            _write_semicolon(out_csv, d_spk)
+            print(f"[SUMMARY][GROUP][PDF] {out_csv}")
+        if not d_spk_hz.empty:
+            out_csv = os.path.join(parent_dir, "upstate_summary_ALL_parent__group_mua_rate_hz_spont.csv")
+            _write_semicolon(out_csv, d_spk_hz)
+            print(f"[SUMMARY][GROUP][PDF] {out_csv}")
 
         out_pdf = os.path.join(parent_dir, "upstate_summary_ALL_parent__group_compare.pdf")
         with PdfPages(out_pdf) as pdf:
+            # Seite 1: Dauer / Amplitude / Mahalanobis (bisherige Plots)
             fig, axs = plt.subplots(3, 1, figsize=(10, 12))
             _group_pair_box_scatter(
                 axs[0], d_dur, "up_duration_s",
@@ -1239,6 +1493,25 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             fig.tight_layout(rect=[0, 0, 1, 0.98])
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
+
+            # Seite 2: MUA Spikes pro spontanem Up-Zustand (Gruppenvergleich)
+            if not d_spk.empty or not d_spk_hz.empty:
+                fig2, axs2 = plt.subplots(2, 1, figsize=(10, 9))
+                _group_spont_box_scatter(
+                    axs2[0], d_spk, "mua_spikes_spont",
+                    "MUA: Aktionspotenziale pro spontanem Up-Zustand (Gruppenvergleich)",
+                    "Spikes pro Up-Zustand"
+                )
+                _group_spont_box_scatter(
+                    axs2[1], d_spk_hz, "mua_rate_hz_spont",
+                    "MUA: Firing-Rate in spontanen Up-Zuständen (Gruppenvergleich)",
+                    "Firing-Rate [Hz]"
+                )
+                fig2.suptitle("MUA Spikes in spontanen Up-Zuständen – Gruppenvergleich", y=0.995)
+                fig2.tight_layout(rect=[0, 0, 1, 0.98])
+                pdf.savefig(fig2, bbox_inches="tight")
+                plt.close(fig2)
+
         print(f"[SUMMARY][GROUP][PDF] {out_pdf}")
 
     def _up_rate_overview_ax(ax, rate_per_min, rate_hz, title, y_limits=None):
@@ -1739,6 +2012,190 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
 
         print(f"[SUMMARY][ALL-MUA-TREND][PDF] {out_pdf}  ({len(entries)} Parent-Ordner)")
 
+    def _load_mua_spikes_rows_for_sessions(session_dirs):
+        """
+        Hilfsfunktion: Liest *__mua_spikes_per_upstate.csv für jede Session,
+        filtert auf spontaneous, gibt sortierte Liste von Row-Dicts zurück.
+        """
+        def _nat_key(path_str):
+            s = os.path.basename(os.path.dirname(str(path_str)))
+            m = re.match(r"^\s*(\d+)", s)
+            return (0, int(m.group(1)), s.lower()) if m else (1, s.lower())
+
+        rows = []
+        for sess_dir in sorted(session_dirs, key=_nat_key):
+            sess_name = os.path.basename(sess_dir)
+            spk_files = sorted(
+                glob.glob(os.path.join(sess_dir, "*__mua_spikes_per_upstate.csv")),
+                key=os.path.getmtime,
+            )
+            counts = np.array([], dtype=float)
+            rates  = np.array([], dtype=float)
+            if spk_files:
+                try:
+                    dfm = pd.read_csv(spk_files[-1])
+                    st  = dfm.get("group", pd.Series([], dtype=str)).astype(str).str.lower().str.strip()
+                    mask_sp = (st == "spontaneous")
+                    counts = pd.to_numeric(
+                        dfm.get("n_spikes", pd.Series([], dtype=float)), errors="coerce"
+                    ).to_numpy(float)[mask_sp]
+                    rates  = pd.to_numeric(
+                        dfm.get("firing_rate_hz", pd.Series([], dtype=float)), errors="coerce"
+                    ).to_numpy(float)[mask_sp]
+                    counts = counts[np.isfinite(counts)]
+                    rates  = rates[np.isfinite(rates)]
+                except Exception:
+                    pass
+            rows.append({
+                "session_name": sess_name,
+                "mean":     float(np.nanmean(counts)) if counts.size else np.nan,
+                "std":      float(np.nanstd(counts))  if counts.size else np.nan,
+                "raw":      counts.tolist(),
+                "rate_mean": float(np.nanmean(rates)) if rates.size else np.nan,
+                "rate_std":  float(np.nanstd(rates))  if rates.size else np.nan,
+                "rate_raw":  rates.tolist(),
+            })
+        return rows
+
+    def _draw_mua_spikes_trend_ax(ax, rows, title, ylabel="Spikes pro spontanem Up-Zustand"):
+        """
+        Zeichnet den Trend-Plot (Einzelpunkte + Mittelwert±SD) in ax.
+        Analog zu _write_parent_up_amplitude_trend_pdf.
+        """
+        if not rows:
+            ax.text(0.5, 0.5, "keine Daten", ha="center", va="center",
+                    transform=ax.transAxes)
+            ax.set_axis_off()
+            return
+
+        labels = [r["session_name"] for r in rows]
+        x      = np.arange(len(labels))
+        means  = np.array([r["mean"] for r in rows])
+        stds   = np.array([r["std"]  for r in rows])
+
+        all_raw = np.array([v for r in rows for v in r.get("raw", []) if np.isfinite(v)])
+        if all_raw.size:
+            vmax = float(np.nanpercentile(all_raw, 99))
+            vmin = max(0.0, float(np.nanmin(all_raw)))
+            span = max(vmax - vmin, 1e-6)
+            ylim = (max(0.0, vmin - 0.05 * span), vmax + 0.25 * span)
+        else:
+            ylim = None
+
+        # Einzelwerte (halbtransparent)
+        for i, r in enumerate(rows):
+            raw = r.get("raw", [])
+            if raw:
+                ax.scatter([i] * len(raw), raw,
+                           color="#4C78A8", alpha=0.22, s=14, zorder=2, linewidths=0)
+
+        # Mittelwert ± SD
+        ok = np.isfinite(means)
+        if ok.any():
+            ax.errorbar(x[ok], means[ok], yerr=stds[ok],
+                        color="#4C78A8", marker="o", linewidth=1.8, markersize=8,
+                        capsize=3, label="Spontan (µ ± SD)", zorder=3)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=11, fontweight="bold", pad=6)
+        if ylim:
+            ax.set_ylim(ylim)
+        ax.set_ylim(bottom=0)
+        ax.grid(alpha=0.2, linestyle=":")
+        ax.legend(fontsize=9, frameon=False)
+
+    def _write_parent_mua_spikes_trend_pdf(parent_dir, summary_files):
+        """
+        Trend-PDF pro Parent-Ordner: Ø MUA-Spikes pro spontanem Up-Zustand, Session für Session.
+        Gespeichert als upstate_summary_ALL_parent__mua_spikes_trend.pdf
+        """
+        sess_dirs = [os.path.dirname(sp) for sp in summary_files]
+        rows = _load_mua_spikes_rows_for_sessions(sess_dirs)
+        rows = [r for r in rows if np.isfinite(r["mean"]) or r["raw"]]
+        if not rows:
+            print("[SUMMARY][MUA-SPIKES-TREND] keine Daten → PDF übersprungen")
+            return
+
+        fig_w = max(8, len(rows) * 0.9)
+        fig, axes = plt.subplots(2, 1, figsize=(fig_w, 9))
+
+        _draw_mua_spikes_trend_ax(
+            axes[0], rows,
+            title="MUA Spikes pro spontanem Up-Zustand",
+            ylabel="Spikes / Up-Zustand",
+        )
+        # zweite Achse: Firing-Rate
+        rows_hz = [{**r, "mean": r["rate_mean"], "std": r["rate_std"], "raw": r["rate_raw"]}
+                   for r in rows]
+        _draw_mua_spikes_trend_ax(
+            axes[1], rows_hz,
+            title="MUA Firing-Rate in spontanen Up-Zuständen",
+            ylabel="Firing-Rate [Hz]",
+        )
+
+        fig.suptitle(os.path.basename(parent_dir), fontsize=13, fontweight="bold")
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        out_pdf = os.path.join(parent_dir, "upstate_summary_ALL_parent__mua_spikes_trend.pdf")
+        fig.savefig(out_pdf, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[SUMMARY][MUA-SPIKES-TREND][PDF] {out_pdf}")
+
+    def _write_global_mua_spikes_trend_pdf(root_dir):
+        """
+        Globale Trend-PDF (analog ALL_trend_amplitude.pdf):
+        Eine Seite pro Parent-Ordner, zeigt Ø MUA-Spikes/spontaner Up-Zustand pro Session.
+        Gespeichert als ALL_trend_mua_spikes.pdf in root_dir.
+        """
+        def _name_key(name):
+            m = re.match(r"^\s*(\d+)", str(name))
+            return (0, int(m.group(1)), str(name).lower()) if m else (1, str(name).lower())
+
+        parent_dirs = sorted(
+            [e.path for e in os.scandir(root_dir) if e.is_dir()],
+            key=lambda p: _name_key(os.path.basename(p)),
+        )
+
+        entries = []
+        for pd_path in parent_dirs:
+            sess_dirs = sorted(
+                [e.path for e in os.scandir(pd_path) if e.is_dir()],
+                key=lambda p: _name_key(os.path.basename(p)),
+            )
+            rows = _load_mua_spikes_rows_for_sessions(sess_dirs)
+            rows = [r for r in rows if np.isfinite(r["mean"]) or r["raw"]]
+            if rows:
+                entries.append((os.path.basename(pd_path), rows))
+
+        if not entries:
+            print("[SUMMARY][ALL-MUA-SPIKES-TREND] keine Daten → PDF übersprungen")
+            return
+
+        out_pdf = os.path.join(root_dir, "ALL_trend_mua_spikes.pdf")
+        with PdfPages(out_pdf) as pdf:
+            for folder_name, rows in entries:
+                fig_w = max(9, len(rows) * 0.9)
+                fig, axes = plt.subplots(2, 1, figsize=(fig_w, 9))
+                _draw_mua_spikes_trend_ax(
+                    axes[0], rows,
+                    title="MUA Spikes pro spontanem Up-Zustand",
+                    ylabel="Spikes / Up-Zustand",
+                )
+                rows_hz = [{**r, "mean": r["rate_mean"], "std": r["rate_std"], "raw": r["rate_raw"]}
+                           for r in rows]
+                _draw_mua_spikes_trend_ax(
+                    axes[1], rows_hz,
+                    title="MUA Firing-Rate in spontanen Up-Zuständen",
+                    ylabel="Firing-Rate [Hz]",
+                )
+                fig.suptitle(folder_name, fontsize=13, fontweight="bold")
+                fig.tight_layout(rect=[0, 0, 1, 0.97])
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+        print(f"[SUMMARY][ALL-MUA-SPIKES-TREND][PDF] {out_pdf}  ({len(entries)} Parent-Ordner)")
+
     def _needs_update(out_path, sources):
         if not os.path.exists(out_path):
             return True
@@ -1780,6 +2237,10 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             _write_parent_mua_trend_pdf(parent_dir, files_parent)
         else:
             print("[SUMMARY][SKIP] mua_trend PDF aktuell")
+        if _needs_update(_pdf_p("upstate_summary_ALL_parent__mua_spikes_trend.pdf"), files_parent):
+            _write_parent_mua_spikes_trend_pdf(parent_dir, files_parent)
+        else:
+            print("[SUMMARY][SKIP] mua_spikes_trend PDF aktuell")
     else:
         print("[SUMMARY][ROLLUP Parent] keine Quellen gefunden")
 
@@ -1802,6 +2263,10 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             _write_global_mua_trend_pdf(for_david_dir)
         else:
             print("[SUMMARY][SKIP] ALL_trend_mua PDF aktuell")
+        if _needs_update(_pdf_fd("ALL_trend_mua_spikes.pdf"), files_all):
+            _write_global_mua_spikes_trend_pdf(for_david_dir)
+        else:
+            print("[SUMMARY][SKIP] ALL_trend_mua_spikes PDF aktuell")
         try:
             import importlib.util as _ilu
             from pathlib import Path as _Path
@@ -1828,16 +2293,5 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 _mod.main()
         except Exception as _e:
             print(f"[PCA-UPSTATES] übersprungen: {_e}")
-        try:
-            import importlib.util as _ilu
-            from pathlib import Path as _Path
-            _ac_path = _Path(__file__).with_name("activity_compare.py")
-            if _ac_path.exists():
-                _spec = _ilu.spec_from_file_location("activity_compare", str(_ac_path))
-                _ac = _ilu.module_from_spec(_spec)
-                _spec.loader.exec_module(_ac)
-                _ac.run(_Path(for_david_dir))
-        except Exception as _e:
-            print(f"[ACTIVITY-COMPARE] übersprungen: {_e}")
     else:
         print("[SUMMARY][ROLLUP For David] keine Quellen gefunden")

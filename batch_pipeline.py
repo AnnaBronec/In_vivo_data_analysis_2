@@ -141,9 +141,9 @@ def _looks_like_session_dir(p: Path) -> bool:
     )
 
 def _find_sessions(root: Path, recursive: bool) -> list[Path]:
-    out: list[Path] = []
     if _looks_like_session_dir(root):
-        out.append(root)
+        return [root]
+    out: list[Path] = []
     if recursive:
         for sub in root.rglob("*"):
             if _looks_like_session_dir(sub):

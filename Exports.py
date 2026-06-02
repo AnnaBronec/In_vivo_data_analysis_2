@@ -404,7 +404,7 @@ def export_interactive_lfp_html(
         ),
         yaxis=yaxis_cfg,
         shapes=shapes,
-        margin=dict(l=60, r=20, t=50, b=50),
+        margin=dict(l=60, r=20, t=85, b=50),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
     )
@@ -640,7 +640,7 @@ def export_interactive_dual_lfp_html(
     fig.update_layout(
         title=title,
         shapes=shapes,
-        margin=dict(l=60, r=20, t=50, b=50),
+        margin=dict(l=60, r=20, t=85, b=50),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
@@ -696,8 +696,11 @@ def export_interactive_dual_lfp_html(
         yy = yy[np.isfinite(yy)]
         if yy.size == 0:
             return
-        y0 = float(np.nanmin(yy))
-        y1 = float(np.nanmax(yy))
+        y0 = float(np.nanpercentile(yy, 1))
+        y1 = float(np.nanpercentile(yy, 99))
+        if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
+            y0 = float(np.nanmin(yy))
+            y1 = float(np.nanmax(yy))
         if not np.isfinite(y0) or not np.isfinite(y1):
             return
         if y1 <= y0:
@@ -854,7 +857,7 @@ def export_interactive_two_channel_lfp_html(
     fig.update_layout(
         title=title,
         shapes=shapes,
-        margin=dict(l=60, r=20, t=50, b=50),
+        margin=dict(l=60, r=20, t=85, b=50),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
@@ -909,8 +912,11 @@ def export_interactive_two_channel_lfp_html(
         yy = yy[np.isfinite(yy)]
         if yy.size == 0:
             return
-        y0 = float(np.nanmin(yy))
-        y1 = float(np.nanmax(yy))
+        y0 = float(np.nanpercentile(yy, 1))
+        y1 = float(np.nanpercentile(yy, 99))
+        if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
+            y0 = float(np.nanmin(yy))
+            y1 = float(np.nanmax(yy))
         if not np.isfinite(y0) or not np.isfinite(y1):
             return
         if y1 <= y0:
@@ -1160,7 +1166,7 @@ def export_interactive_three_channel_lfp_html(
     fig.update_layout(
         title=title,
         shapes=shapes,
-        margin=dict(l=60, r=20, t=50, b=50),
+        margin=dict(l=60, r=20, t=85, b=50),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
@@ -1192,8 +1198,11 @@ def export_interactive_three_channel_lfp_html(
         yy = yy[np.isfinite(yy)]
         if yy.size == 0:
             return
-        y0 = float(np.nanmin(yy))
-        y1 = float(np.nanmax(yy))
+        y0 = float(np.nanpercentile(yy, 1))
+        y1 = float(np.nanpercentile(yy, 99))
+        if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
+            y0 = float(np.nanmin(yy))
+            y1 = float(np.nanmax(yy))
         if not np.isfinite(y0) or not np.isfinite(y1):
             return
         if y1 <= y0:
@@ -1452,7 +1461,7 @@ def export_interactive_four_channel_lfp_html(
     fig.update_layout(
         title=title,
         shapes=shapes,
-        margin=dict(l=60, r=20, t=50, b=50),
+        margin=dict(l=60, r=20, t=85, b=50),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
@@ -1478,8 +1487,11 @@ def export_interactive_four_channel_lfp_html(
         yy = yy[np.isfinite(yy)]
         if yy.size == 0:
             return
-        y0 = float(np.nanmin(yy))
-        y1 = float(np.nanmax(yy))
+        y0 = float(np.nanpercentile(yy, 1))
+        y1 = float(np.nanpercentile(yy, 99))
+        if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
+            y0 = float(np.nanmin(yy))
+            y1 = float(np.nanmax(yy))
         if not np.isfinite(y0) or not np.isfinite(y1):
             return
         if y1 <= y0:
@@ -1661,8 +1673,11 @@ def export_pulse_qa_four_channel_html(
         yy = yy[np.isfinite(yy)]
         if yy.size == 0:
             return
-        y0 = float(np.nanmin(yy))
-        y1 = float(np.nanmax(yy))
+        y0 = float(np.nanpercentile(yy, 1))
+        y1 = float(np.nanpercentile(yy, 99))
+        if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
+            y0 = float(np.nanmin(yy))
+            y1 = float(np.nanmax(yy))
         if y1 <= y0:
             pad = max(abs(y0) * 0.1, 1.0)
         else:
@@ -1788,7 +1803,7 @@ def export_pulse_qa_four_channel_html(
                 + (f" | offset +{(float(off) - p):.3f}s" if show_pulse_durations and off is not None and off > p else "")
             ),
             shapes=shapes,
-            margin=dict(l=68, r=20, t=42, b=42),
+            margin=dict(l=68, r=20, t=80, b=42),
             template="plotly_white",
             height=760 if has_raw_swr else 640,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
@@ -1878,8 +1893,11 @@ def export_pulse_qa_four_channel_html(
                 finite = np.asarray(yy, float)
                 finite = finite[np.isfinite(finite)]
                 if finite.size:
-                    y0 = float(np.nanmin(finite))
-                    y1 = float(np.nanmax(finite))
+                    y0 = float(np.nanpercentile(finite, 1))
+                    y1 = float(np.nanpercentile(finite, 99))
+                    if not np.isfinite(y0) or not np.isfinite(y1) or y1 <= y0:
+                        y0 = float(np.nanmin(finite))
+                        y1 = float(np.nanmax(finite))
                     pad = max(abs(y0) * 0.1, 1.0) if y1 <= y0 else 0.08 * (y1 - y0)
                     ax.set_ylim(y0 - pad, y1 + pad)
             axes[-1].set_xlabel("Time from pulse onset (s)")
@@ -2118,7 +2136,7 @@ def export_interactive_spectrogram_html(
             mirror="allticks",
         ),
         shapes=shapes,
-        margin=dict(l=60, r=60, t=50, b=50),
+        margin=dict(l=60, r=60, t=85, b=50),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
@@ -2376,7 +2394,7 @@ def export_interactive_swr_scan_html(
 
     fig.update_layout(
         title=title,
-        margin=dict(l=70, r=20, t=55, b=50),
+        margin=dict(l=70, r=20, t=85, b=50),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         hovermode="x unified",
@@ -2645,3 +2663,156 @@ def export_mua_html(
     out_path = os.path.join(save_dir, f"{base_tag}__mua_interactive.html")
     plotly_offline_plot(fig, filename=out_path, auto_open=False, include_plotlyjs="cdn")
     print(f"[MUA-HTML] {out_path}  (spikes={spk.size:,})")
+
+
+def export_mua_ap_raw_html(
+    base_tag, save_dir, raw_signal, spike_times_s,
+    fs_raw=32000.0, hp_hz=300.0, threshold_sigma=3.5,
+    t0=0.0,
+    title="MUA – HP-Signal + AP-Detektion (Rohsignal)",
+    max_display_hz=8000.0,
+    spont_counts=None,
+):
+    """
+    Interaktives HTML des HP-gefilterten Rohsignals mit Schwellenlinie und
+    markierten Threshold-Crossings (Aktionspotenziale).
+
+    Zeigt drei übereinanderliegende Panels:
+      1. HP-gefiltertes Signal + Schwelle + AP-Marker (groß, für Überblick)
+      2. Gleiche Daten – vorgezoomt auf die ersten ~2 Sekunden (für Detailcheck)
+      3. Histogramm APs/Up-Zustand (spontan) – falls spont_counts übergeben;
+         sonst Histogramm der AP-Amplituden
+
+    Parameters
+    ----------
+    raw_signal      : 1D-Array, Rohsignal bei fs_raw Hz
+    spike_times_s   : absolute Spike-Zeiten in Sekunden
+    spont_counts    : 1D-Array mit AP-Anzahl pro spontanem Up-Zustand (optional)
+    t0              : Zeitstempel des ersten Samples
+    max_display_hz  : Abtastrate für die HTML-Darstellung (Downsample für Rendering)
+    """
+    from scipy.signal import butter, sosfiltfilt
+
+    sig = np.asarray(raw_signal, dtype=float)
+    n   = sig.size
+    if n == 0:
+        print("[MUA-AP-HTML] leeres Signal – übersprungen")
+        return
+
+    # ── 1. HP-filtern (identisch mit compute_mua_rate) ──────────────────────
+    sos  = butter(3, hp_hz / (fs_raw / 2.0), btype="high", output="sos")
+    filt = sosfiltfilt(sos, sig)
+
+    noise = np.median(np.abs(filt)) / 0.6745
+    thr   = -threshold_sigma * noise          # negative Schwelle
+
+    # ── 2. Relative Zeit (0 = Aufnahme-Start) ───────────────────────────────
+    dur_s = n / fs_raw
+    t_rel = np.arange(n, dtype=float) / fs_raw   # 0 … dur_s
+
+    # spike_times_s kommen immer 0-basiert (t0=0.0 wird aus Main übergeben)
+    spk = np.sort(np.asarray(spike_times_s, dtype=float))
+
+    # ── 3. Min-Max-Envelope-Downsampling für Panel 1 ────────────────────────
+    # Einfaches Stride-Downsampling (filt[::4]) lässt 1ms-Spikes verschwinden:
+    # ein Spike hat bei 32kHz ~32 Proben, liegt aber oft zwischen zwei
+    # angezeigten 8kHz-Proben → im Display unsichtbar, Tick-Marker aber korrekt.
+    # Mit Min-Max-Envelope wird pro 4-Proben-Fenster sowohl Minimum als auch
+    # Maximum angezeigt → echte Schwellenkreuzungen sind immer sichtbar.
+    ds = max(1, int(np.ceil(fs_raw / max_display_hz)))
+    if ds > 1:
+        n_win  = n // ds
+        _trim  = filt[:n_win * ds].reshape(n_win, ds)
+        _t_win = t_rel[:n_win * ds:ds]         # Fenster-Startzeit
+        _emin  = _trim.min(axis=1)
+        _emax  = _trim.max(axis=1)
+        # Interleave: [max₀, min₀, max₁, min₁, …]  →  zeigt vollen Wertebereich
+        t_ds    = np.empty(n_win * 2)
+        t_ds[0::2] = _t_win
+        t_ds[1::2] = _t_win + (ds - 1) / fs_raw   # Fenster-Endzeit
+        filt_ds = np.empty(n_win * 2)
+        filt_ds[0::2] = _emax
+        filt_ds[1::2] = _emin
+    else:
+        t_ds    = t_rel
+        filt_ds = filt
+
+    # ── 4. AP-Marker: Amplitude am Crossing-Sample ──────────────────────────
+    spk_valid = spk[(spk >= 0) & (spk <= dur_s)]
+    spk_idx   = np.clip((spk_valid * fs_raw).astype(int), 0, n - 1)
+    spk_amps  = filt[spk_idx]
+
+    # ── 5. Statistik: ∅ APs pro spontanem Up-Zustand ────────────────────────
+    _sc = np.asarray(spont_counts, dtype=float) if spont_counts is not None else np.array([])
+    _sc_int = _sc[np.isfinite(_sc)].astype(int)
+    if _sc_int.size > 0:
+        _mean_c = float(np.mean(_sc_int))
+        _std_c  = float(np.std(_sc_int))
+        _med_c  = float(np.median(_sc_int))
+        _stats_line = (
+            f"∅ <b>{_mean_c:.1f}</b> APs/UP  ±{_std_c:.1f} SD  |  "
+            f"Median {_med_c:.0f}  |  n={_sc_int.size} Up-Zustände"
+        )
+    else:
+        _stats_line = f"Gesamt-Spikes: {spk_valid.size:,}  |  keine Up-Zustand-Daten"
+
+    # ── 6. Plotly-Figure (1 Panel: Signalüberblick) ──────────────────────────
+    fig = go.Figure()
+
+    # HP-Signal (Min-Max-Envelope, downgesampelt)
+    fig.add_trace(go.Scattergl(
+        x=t_ds, y=filt_ds, mode="lines",
+        line=dict(color="#1f77b4", width=0.6),
+        name="HP-Signal",
+    ))
+    # Schwellenlinie
+    fig.add_trace(go.Scatter(
+        x=[float(t_ds[0]), float(t_ds[-1])],
+        y=[thr, thr],
+        mode="lines",
+        line=dict(color="rgba(214,39,40,0.8)", width=1.5, dash="dash"),
+        name=f"Schwelle (−{threshold_sigma}×MAD = {thr:.2f})",
+    ))
+    # Spike-Tick-Marker knapp unter der Schwelle
+    if spk_valid.size > 0:
+        _max_mk = 80_000
+        _st = spk_valid[np.linspace(0, spk_valid.size-1, _max_mk).astype(int)] \
+              if spk_valid.size > _max_mk else spk_valid
+        _y_tick = thr - 0.15 * abs(thr)
+        fig.add_trace(go.Scattergl(
+            x=_st, y=np.full(_st.size, _y_tick), mode="markers",
+            marker=dict(color="rgba(214,39,40,0.75)", size=9,
+                        symbol="line-ns", line=dict(width=1.5)),
+            name=f"Erkannte APs (n={spk_valid.size:,})",
+            hovertemplate="AP bei t=%{x:.4f} s<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=13)),
+        height=520,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+        xaxis=dict(title="Zeit ab Aufnahme-Start (s)"),
+        yaxis=dict(title="HP-Signal (AU)"),
+        # Statistik als sichtbare Beschriftung unter dem Plot
+        annotations=[dict(
+            text=_stats_line,
+            xref="paper", yref="paper",
+            x=0.5, y=-0.10,
+            showarrow=False,
+            font=dict(size=14),
+            xanchor="center",
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="rgba(150,150,150,0.5)",
+            borderwidth=1,
+        )],
+    )
+
+    out_path = os.path.join(save_dir, f"{base_tag}__mua_ap_raw.html")
+    plotly_offline_plot(fig, filename=out_path, auto_open=False, include_plotlyjs="cdn")
+    print(
+        f"[MUA-AP-HTML] {out_path}  "
+        f"(n_spikes={spk_valid.size:,}, thr={thr:.3f}, noise={noise:.3f})"
+    )
+
+

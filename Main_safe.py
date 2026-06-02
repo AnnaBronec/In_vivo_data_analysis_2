@@ -45,6 +45,7 @@ from Exports import (
     export_interactive_three_channel_lfp_html,
     export_interactive_swr_scan_html,
     export_mua_html,
+    export_mua_ap_raw_html,
     log,
      _nan_stats,
      _rms
@@ -71,6 +72,8 @@ from processing import (
     _as_valid_idx,
     _build_rollups,
     compute_mua_rate,
+    count_spikes_per_upstate,
+    mua_spikes_per_upstate_hist_ax,
     )
         
 #Konstanten
@@ -448,6 +451,12 @@ def load_parts_to_array_streaming_with_ttl(
     if not part_files:
         raise FileNotFoundError(f"Keine Parts unter {parts_dir} gefunden.")
 
+    # Anti-Aliasing: Butterworth-Tiefpass vor Dezimierung (wenn DOWNSAMPLE_ANTIALIAS=1)
+    aa_enabled = str(os.environ.get("DOWNSAMPLE_ANTIALIAS", "0")).strip().lower() not in ("0", "false", "no", "off")
+    aa_sos = None        # wird beim ersten Chunk initialisiert
+    aa_zi  = None        # Filter-Zustand (stateful über Chunks)
+    aa_failed = False    # ein Fehler → stille Deaktivierung
+
     time_chunks = []
     data_chunks = []
     stim_cols_in_file = None
@@ -607,12 +616,47 @@ def load_parts_to_array_streaming_with_ttl(
         if time_col_name != "time":
             df_lfp = df_lfp.rename(columns={time_col_name: "time"})
 
-        if ds_factor and ds_factor > 1:
-            df_lfp = df_lfp.iloc[::int(ds_factor), :].reset_index(drop=True)
+        t_full_lfp = pd.to_numeric(df_lfp["time"], errors="coerce").to_numpy(float)
+        x_full_lfp = df_lfp[chan_cols].to_numpy(dtype=float)
 
-        t_ds = pd.to_numeric(df_lfp["time"], errors="coerce").to_numpy(float)
+        if aa_enabled and not aa_failed and ds_factor and int(ds_factor) > 1:
+            try:
+                if aa_sos is None:
+                    raw_dt = float(np.nanmedian(np.diff(t_full_lfp))) if t_full_lfp.size > 1 else 1.0
+                    if not np.isfinite(raw_dt) or raw_dt <= 0:
+                        raw_dt = 1.0
+                    fs_raw = (DEFAULT_FS_XDAT / raw_dt) if raw_dt > 0.5 else (1.0 / raw_dt)
+                    fs_ds  = fs_raw / float(ds_factor)
+                    nyq_ds = 0.5 * fs_ds
+                    cutoff_hz = float(os.environ.get("DOWNSAMPLE_ANTIALIAS_CUTOFF_HZ", str(0.92 * nyq_ds)))
+                    cutoff_hz = max(1.0, min(cutoff_hz, 0.98 * nyq_ds, 0.45 * fs_raw))
+                    order = int(os.environ.get("DOWNSAMPLE_ANTIALIAS_ORDER", "6"))
+                    aa_sos = signal.butter(order, cutoff_hz, btype="lowpass", fs=fs_raw, output="sos")
+                    print(
+                        "[STREAM-AA] "
+                        f"Butterworth LP vor Dezimierung: order={order} "
+                        f"cutoff={cutoff_hz:g}Hz fs_raw={fs_raw:g}Hz fs_ds={fs_ds:g}Hz "
+                        f"factor={int(ds_factor)}"
+                    )
+                col_med = np.nanmedian(x_full_lfp, axis=0)
+                col_med = np.where(np.isfinite(col_med), col_med, 0.0)
+                x_full_lfp = np.where(np.isfinite(x_full_lfp), x_full_lfp, col_med)
+                if aa_zi is None:
+                    aa_zi = signal.sosfilt_zi(aa_sos)[:, :, None] * x_full_lfp[0][None, None, :]
+                x_full_lfp, aa_zi = signal.sosfilt(aa_sos, x_full_lfp, axis=0, zi=aa_zi)
+            except Exception as e:
+                aa_failed = True
+                print(f"[STREAM-AA][WARN] Anti-Aliasing-Filter fehlgeschlagen: {e}; verwende ungefilterte Dezimierung")
+
+        if ds_factor and int(ds_factor) > 1:
+            t_ds     = t_full_lfp[::int(ds_factor)]
+            x_ds     = x_full_lfp[::int(ds_factor)]
+        else:
+            t_ds = t_full_lfp
+            x_ds = x_full_lfp
+
         time_chunks.append(t_ds)
-        data_chunks.append(df_lfp[chan_cols].to_numpy(dtype=dtype))
+        data_chunks.append(x_ds.astype(dtype, copy=False))
 
         del df, df_lfp
 
@@ -874,13 +918,24 @@ if nev_path is not None and os.path.exists(nev_path):
                     break
 
         if t0_us is None:
-            # Fallback: verankere NEV an der **vollen** LFP-Zeitbasis (vor Crop/DS),
-            # nicht an time_s (bereits beschnitten). So vermeiden wir späte Pulse.
+            # Bevorzuge: ersten NCS-Hardware-Timestamp (gleiche Referenz wie neuralynx_rawio_to_csv.py).
+            # ts_us[0] (erster NEV-Event) kann vom ersten NCS-Sample abweichen -> Verschiebung.
+            try:
+                from neuralynx_rawio_to_csv import _first_ncs_timestamp_us as _ncs_t0_fn
+                _ncs_t0 = _ncs_t0_fn(Path(BASE_PATH))
+            except Exception:
+                _ncs_t0 = None
             try:
                 t_ref = float(time_full[0]) if 'time_full' in locals() else float(time_s[0])
             except Exception:
                 t_ref = float(time_s[0])
-            t0_us = int(ts_us[0] - t_ref * 1e6)
+            if _ncs_t0 is not None:
+                t0_us = int(_ncs_t0 - t_ref * 1e6)
+                print(f"[NEV][T0] using NCS start timestamp: {_ncs_t0} (t_ref={t_ref:.6f}s)")
+            else:
+                # letzter Fallback: erster NEV-Event als Referenz (kann Offset haben!)
+                t0_us = int(ts_us[0] - t_ref * 1e6)
+                print(f"[NEV][T0][WARN] NCS t0 nicht lesbar -> fallback auf ts_us[0]={ts_us[0]}")
 
         pulse_times_1_full     = (on_us  - t0_us) / 1e6
         pulse_times_1_off_full = (off_us - t0_us) / 1e6
@@ -927,9 +982,12 @@ else:
     NUM_CHANNELS = LFP_array.shape[0]
     chan_cols = chan_cols  
 
-CALIB_MODE = "counts"   # "counts" | "volts" | "uV"
-ADC_BITS   = 16         # bit
-ADC_VPP    = 10.0       # Peak-to-Peak des ADC in Volt 
+CALIB_MODE = "uV"       # "counts" | "volts" | "uV"
+# NOTE: Allego/xdat stores float32 values already in µV (ADC resolution ~0.195 µV/step).
+# universal_converter.py writes these directly to CSV without any unit conversion.
+# -> CALIB_MODE must be "uV". "counts" would apply an extra x0.1526 factor (WRONG).
+ADC_BITS   = 16         # bit (kept for reference, only used if CALIB_MODE="counts")
+ADC_VPP    = 10.0       # Peak-to-Peak des ADC in Volt (kept for reference)
 PREAMP_GAIN = 1000.0    # Gesamt-Gain vor dem ADC. Falls kanal-spezifisch, unten 'PER_CH_GAIN' nutzen.
 
 
@@ -1115,13 +1173,21 @@ if not FROM_STREAM:
     NUM_CHANNELS = len(chan_cols)
 
     # MUA aus Rohdaten (vor Downsampling, 32 kHz)
+    _mua_spk_rel = np.array([], dtype=float)   # relative Spike-Zeiten (0-basiert, immer verfügbar)
     try:
         _mua_ch = min(int(os.environ.get("MAIN_UP_CH", "0")), NUM_CHANNELS - 1)
         _raw_sig = LFP_df_ds[f"pri_{_mua_ch}"].to_numpy(dtype=float)
-        _t0_raw = float(time_full[0]) if len(time_full) > 0 else 0.0
-        mua_rate_hz, _mua_spk_rel = compute_mua_rate(_raw_sig, fs_raw=DEFAULT_FS_XDAT, return_times=True)
+        _t0_raw_raw = float(time_full[0]) if len(time_full) > 0 else 0.0
+        # time_full kann in Sample-Counts (> 1e6) ODER bereits in Sekunden vorliegen.
+        # _mua_spk_rel ist immer in Sekunden (0-basiert ab Rohsignal-Start).
+        # → _t0_raw muss ebenfalls in Sekunden sein, damit mua_spike_times
+        #   mit time_s (das bei > 1e6 durch DEFAULT_FS_XDAT geteilt wird) übereinstimmt.
+        _t0_raw = _t0_raw_raw / DEFAULT_FS_XDAT if _t0_raw_raw > 1e6 else _t0_raw_raw
+        mua_rate_hz, _mua_spk_rel = compute_mua_rate(
+            _raw_sig, fs_raw=DEFAULT_FS_XDAT, refractory_ms=1.0, return_times=True
+        )
         mua_spike_times = _mua_spk_rel + _t0_raw
-        print(f"[MUA] ch=pri_{_mua_ch}  rate={mua_rate_hz:.2f} Hz  spikes={len(mua_spike_times):,}  (HP>300Hz, thr=-3.5×MAD)")
+        print(f"[MUA] ch=pri_{_mua_ch}  rate={mua_rate_hz:.2f} Hz  spikes={len(mua_spike_times):,}  (HP>300Hz, thr=-3.5×MAD, ref=1ms)")
     except Exception as _e_mua:
         mua_rate_hz = np.nan
         mua_spike_times = np.array([], dtype=float)
@@ -2342,6 +2408,43 @@ if _waveforms:
     np.save(_wf_path, _wf_array)
     print(f"[NPY] Upstate-Wellenformen gespeichert: {_wf_path}  ({_wf_array.shape})")
 
+# --- Triggered Upstate-Wellenformen speichern (für PCA spont vs. trig) ---
+_trig_waveforms = []
+_twf_U = np.asarray(Pulse_triggered_UP, int)
+_twf_D = np.asarray(Pulse_triggered_DOWN, int)
+_twf_m = min(_twf_U.size, _twf_D.size)
+if _twf_m > 0:
+    _twf_U, _twf_D = _twf_U[:_twf_m], _twf_D[:_twf_m]
+    _twf_ord = np.argsort(_twf_U)
+    _twf_U, _twf_D = _twf_U[_twf_ord], _twf_D[_twf_ord]
+    for _u, _d in zip(_twf_U, _twf_D):
+        if not (0 <= _u < _n_sig and 0 < _d <= _n_sig and _d > _u):
+            continue
+        _seg = np.asarray(_wf_sig[_u:_d], float)
+        _seg = _seg[np.isfinite(_seg)]
+        if _seg.size < 2:
+            continue
+        _xold = np.linspace(0, 1, _seg.size)
+        _xnew = np.linspace(0, 1, _N_PCA)
+        _trig_waveforms.append(np.interp(_xnew, _xold, _seg))
+if _trig_waveforms:
+    _twf_array = np.array(_trig_waveforms)
+    _twf_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__trig_waveforms.npy")
+    np.save(_twf_path, _twf_array)
+    print(f"[NPY] Triggered-Wellenformen gespeichert: {_twf_path}  ({_twf_array.shape})")
+
+# --- Mahalanobis-PDF in FOR ANNA IN VIVO automatisch aktualisieren ---
+try:
+    import importlib.util as _ilu
+    _pca_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pca_upstates.py")
+    _spec = _ilu.spec_from_file_location("pca_upstates", _pca_path)
+    _pca_mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_pca_mod)
+    _pca_mod.mahal_summary(_pca_mod.ANNA_DIR)
+    _pca_mod.mean_waveform_summary(_pca_mod.ANNA_DIR)
+except Exception as _e:
+    print(f"[WARN] mahal_summary konnte nicht aktualisiert werden: {_e}")
+
 
 # --- separate SVG mit dem Amplitudenvergleich ---
 amp_svg_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_amplitude_compare.svg")
@@ -2355,6 +2458,90 @@ fig_amp.savefig(amp_svg_path, format="svg", bbox_inches="tight")
 plt.close(fig_amp)
 print("[SVG] amplitude compare:", amp_svg_path)
 del fig_amp
+
+
+# --- MUA Spikes pro Up-Zustand zählen ---
+try:
+    _sp_counts, _sp_rates, _sp_durs = count_spikes_per_upstate(
+        mua_spike_times, Spontaneous_UP, Spontaneous_DOWN, time_s
+    )
+    _tr_counts, _tr_rates, _tr_durs = count_spikes_per_upstate(
+        mua_spike_times, Pulse_triggered_UP, Pulse_triggered_DOWN, time_s
+    )
+
+    # CSV: Spikes pro Up-Zustand
+    _mua_up_rows = []
+    for _i, (_c, _r, _d) in enumerate(zip(_sp_counts, _sp_rates, _sp_durs)):
+        _u_idx = int(Spontaneous_UP[_i])   if _i < len(Spontaneous_UP)   else -1
+        _d_idx = int(Spontaneous_DOWN[_i]) if _i < len(Spontaneous_DOWN) else -1
+        _t_s   = float(time_s[_u_idx]) if 0 <= _u_idx < len(time_s) else np.nan
+        _t_e   = float(time_s[_d_idx]) if 0 <= _d_idx < len(time_s) else np.nan
+        _mua_up_rows.append({
+            "group": "spontaneous",
+            "upstate_idx": _i,
+            "t_start_s": round(_t_s, 5),
+            "t_end_s":   round(_t_e, 5),
+            "duration_s": round(float(_d), 5) if np.isfinite(_d) else "",
+            "n_spikes":   int(_c),
+            "firing_rate_hz": round(float(_r), 4) if np.isfinite(_r) else "",
+        })
+    for _i, (_c, _r, _d) in enumerate(zip(_tr_counts, _tr_rates, _tr_durs)):
+        _u_idx = int(Pulse_triggered_UP[_i])   if _i < len(Pulse_triggered_UP)   else -1
+        _d_idx = int(Pulse_triggered_DOWN[_i]) if _i < len(Pulse_triggered_DOWN) else -1
+        _t_s   = float(time_s[_u_idx]) if 0 <= _u_idx < len(time_s) else np.nan
+        _t_e   = float(time_s[_d_idx]) if 0 <= _d_idx < len(time_s) else np.nan
+        _mua_up_rows.append({
+            "group": "triggered",
+            "upstate_idx": _i,
+            "t_start_s": round(_t_s, 5),
+            "t_end_s":   round(_t_e, 5),
+            "duration_s": round(float(_d), 5) if np.isfinite(_d) else "",
+            "n_spikes":   int(_c),
+            "firing_rate_hz": round(float(_r), 4) if np.isfinite(_r) else "",
+        })
+
+    _mua_up_csv = os.path.join(SAVE_DIR, f"{BASE_TAG}__mua_spikes_per_upstate.csv")
+    pd.DataFrame(_mua_up_rows).to_csv(_mua_up_csv, index=False)
+    print(f"[CSV] MUA Spikes/UP geschrieben: {_mua_up_csv}  "
+          f"(spont={len(_sp_counts)}, trig={len(_tr_counts)})")
+
+    # Zusammenfassung für upstate_summary
+    mua_spikes_mean_spont   = float(np.nanmean(_sp_counts)) if _sp_counts.size else np.nan
+    mua_spikes_mean_trig    = float(np.nanmean(_tr_counts)) if _tr_counts.size else np.nan
+    mua_rate_hz_spont_mean  = float(np.nanmean(_sp_rates[np.isfinite(_sp_rates)])) \
+                              if np.isfinite(_sp_rates).any() else np.nan
+    mua_rate_hz_trig_mean   = float(np.nanmean(_tr_rates[np.isfinite(_tr_rates)])) \
+                              if np.isfinite(_tr_rates).any() else np.nan
+
+    print(f"[MUA-UP] spont: µ={mua_spikes_mean_spont:.1f} Spikes/UP, "
+          f"rate µ={mua_rate_hz_spont_mean:.1f} Hz  | "
+          f"trig: µ={mua_spikes_mean_trig:.1f} Spikes/UP, "
+          f"rate µ={mua_rate_hz_trig_mean:.1f} Hz")
+
+    # SVG: Histogramm der spontanen Spike-Counts (für diese Session)
+    _mua_up_svg = os.path.join(SAVE_DIR, f"{BASE_TAG}__mua_spikes_per_upstate.svg")
+    fig_mua_up, ax_mua_up = plt.subplots(figsize=(6.5, 3.4))
+    _sp_rates_finite = _sp_rates if np.isfinite(_sp_rates).any() else None
+    mua_spikes_per_upstate_hist_ax(
+        _sp_counts.astype(float),
+        spont_rates=_sp_rates_finite,
+        ax=ax_mua_up,
+        title=f"MUA Spikes/spontanem Up-Zustand — {BASE_TAG}",
+    )
+    fig_mua_up.tight_layout()
+    fig_mua_up.savefig(_mua_up_svg, format="svg", bbox_inches="tight")
+    plt.close(fig_mua_up)
+    print("[SVG] MUA Spikes/UP Histogramm:", _mua_up_svg)
+    del fig_mua_up
+
+except Exception as _e_mua_up:
+    _sp_counts = np.array([], int)
+    _tr_counts = np.array([], int)
+    mua_spikes_mean_spont  = np.nan
+    mua_spikes_mean_trig   = np.nan
+    mua_rate_hz_spont_mean = np.nan
+    mua_rate_hz_trig_mean  = np.nan
+    print(f"[MUA-UP][WARN] {_e_mua_up}")
 
 
 def _pair_up_down_indices(up_idx, down_idx, n_time):
@@ -3692,6 +3879,18 @@ else:
 # Standard: pro Plot/Channel autoskalieren (robuster bei einzelnen Noisy-Kanälen).
 # Optional kann per HTML_SHARED_Y_RANGE=1 eine gemeinsame Parent-Skalierung erzwungen werden.
 html_sig_src = main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel
+try:
+    _raw_for_filt = np.asarray(html_sig_src, float)
+    _finite_mask = np.isfinite(_raw_for_filt)
+    _sos_lp = signal.butter(5, HIGH_CUTOFF, btype="low", fs=1.0 / dt, output="sos")
+    _tmp = _raw_for_filt.copy()
+    _tmp[~_finite_mask] = 0.0
+    _filt = signal.sosfiltfilt(_sos_lp, _tmp)
+    _filt[~_finite_mask] = np.nan
+    html_sig_src = _filt
+    print(f"[HTML] main channel lowpass-filtered ({HIGH_CUTOFF} Hz, SOS) for HTML export")
+except Exception as _e_filt:
+    print(f"[HTML] lowpass filter for HTML skipped: {_e_filt}")
 html_y_range = None
 use_shared_html_y = str(os.environ.get("HTML_SHARED_Y_RANGE", "0")).strip().lower() in ("1", "true", "yes", "on")
 if use_shared_html_y:
@@ -3759,7 +3958,7 @@ else:
 # Interaktive HTML (mit UP-Schattierung) 
 export_interactive_lfp_html(
     BASE_TAG, SAVE_DIR, time_s,
-    main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
+    html_sig_src,
 
     pulse_times_1=pulse_times_1_html,
     pulse_times_2=pulse_times_2_html_export,
@@ -3772,7 +3971,7 @@ export_interactive_lfp_html(
     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
     spindle_intervals=None,
     limit_to_last_pulse=False,
-    title=f"{BASE_TAG} — Main LFP (interaktiv)",
+    title=f"{BASE_TAG} — Main LFP ch{ch_idx_used} (interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=(not PULSE_ONSET_ONLY),
     y_range=html_y_range,
@@ -3781,7 +3980,7 @@ export_interactive_lfp_html(
 # Zusatz-HTML: nur Signal + Pulse (keine UP-/Spindle-Markierungen)
 export_interactive_lfp_html(
     f"{BASE_TAG}__pulse_only", SAVE_DIR, time_s,
-    main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
+    html_sig_src,
     pulse_times_1=pulse_times_1_html,
     pulse_times_2=pulse_times_2_html_export,
     pulse_times_1_off=pulse_times_1_off_html_plot,
@@ -3793,7 +3992,7 @@ export_interactive_lfp_html(
     up_assoc=None,
     spindle_intervals=None,
     limit_to_last_pulse=False,
-    title=f"{BASE_TAG} — Signal + Pulse (ohne Marker, interaktiv)",
+    title=f"{BASE_TAG} — Signal + Pulse ch{ch_idx_used} (ohne Marker, interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=(not PULSE_ONSET_ONLY),
     y_range=html_y_range,
@@ -3838,7 +4037,7 @@ export_interactive_lfp_html(
     up_spont_label="Spindle spontaneous",
     up_trig_label="Spindle triggered",
     up_assoc_label="Spindle associated",
-    title=f"{BASE_TAG} — Spindle classification (10-15 Hz, interaktiv)",
+    title=f"{BASE_TAG} — Spindle classification ch{ch_idx_used} (10-15 Hz, interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=False,
     y_range=html_y_range,
@@ -3846,7 +4045,7 @@ export_interactive_lfp_html(
 
 export_interactive_lfp_html(
     f"{BASE_TAG}__upstate_spindle_overlay", SAVE_DIR, time_s,
-    main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
+    html_sig_src,
     pulse_times_1=pulse_times_1_html,
     pulse_times_2=pulse_times_2_html_export,
     pulse_times_1_off=pulse_times_1_off_html_plot,
@@ -3865,7 +4064,7 @@ export_interactive_lfp_html(
     ripple_spont_label="SWR spontaneous",
     ripple_trig_label="SWR triggered",
     ripple_assoc_label="SWR associated",
-    title=f"{BASE_TAG} — UP states + Spindles + Sharp-wave ripples (Overlay, interaktiv)",
+    title=f"{BASE_TAG} — UP+Spindle+SWR Overlay ch{ch_idx_used} (interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=(not PULSE_ONSET_ONLY),
     y_range=html_y_range,
@@ -3875,7 +4074,7 @@ export_interactive_dual_lfp_html(
     f"{BASE_TAG}__lfp_plus_main_10_15hz", SAVE_DIR,
     time_s,
     main_channel_bp_10_15,
-    main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
+    html_sig_src,
     pulse_times_1=pulse_times_1_html,
     pulse_times_2=pulse_times_2_html_export,
     pulse_times_1_off=pulse_times_1_off_html_plot,
@@ -3888,7 +4087,7 @@ export_interactive_dual_lfp_html(
     bottom_spont=(Spontaneous_UP, Spontaneous_DOWN),
     bottom_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     bottom_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
-    title=f"{BASE_TAG} — Main LFP + 10-15 Hz bandpass (interaktiv)",
+    title=f"{BASE_TAG} — Main LFP + 10-15 Hz bandpass ch{ch_idx_used} (interaktiv)",
     top_y_label=("10-15 Hz bandpass (µV)" if HTML_IN_uV else f"10-15 Hz bandpass ({UNIT_LABEL})"),
     bottom_y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     y_range_top=None,
@@ -4114,7 +4313,7 @@ try:
     export_interactive_two_channel_lfp_html(
         f"{BASE_TAG}__two_good_channels", SAVE_DIR,
         time_s,
-        main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
+        html_sig_src,
         second_channel_uV if (HTML_IN_uV and second_channel_uV is not None) else second_channel,
         pulse_times_1=pulse_times_1_html,
         pulse_times_2=pulse_times_2_html_export,
@@ -4122,7 +4321,7 @@ try:
         pulse_times_2_off=pulse_times_2_off_html_export,
         pulse_intervals_1=ttl1_intervals,
         pulse_intervals_2=ttl2_intervals_export,
-        title=f"{BASE_TAG} — 2 good channels (ohne Spindle, interaktiv)",
+        title=f"{BASE_TAG} — 2 good channels ch{ch_idx_used} + ch{second_ch_idx} (ohne Spindle, interaktiv)",
         top_name=f"Main channel (pri_{ch_idx_used})",
         bottom_name=f"Deeper good channel (pri_{second_ch_idx})",
         top_y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
@@ -4142,18 +4341,40 @@ try:
             f"{BASE_TAG}__mua",
             SAVE_DIR,
             time_s,
-            main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel,
+            html_sig_src,
             spike_times_s=mua_spike_times,
             up_spont=(Spontaneous_UP, Spontaneous_DOWN),
             up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
             up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
-            title=f"{BASE_TAG} — MUA (HP>300Hz, thr=-3.5×MAD)",
+            title=f"{BASE_TAG} — MUA ch{_mua_ch} (HP>300Hz, thr=-3.5×MAD)",
             y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
         )
     else:
         print("[MUA-HTML] keine Spikes → HTML übersprungen")
 except Exception as _e_mua_html:
     print(f"[MUA-HTML][WARN] {_e_mua_html}")
+
+# MUA Rohsignal-HTML: HP-gefiltertes Signal + Schwelle + AP-Crossings
+# _mua_spk_rel: immer 0-basiert (Sekunden ab Rohsignal-Start) → kein Offset-Problem
+try:
+    _raw_for_html   = globals().get("_raw_sig",   None)
+    _spk_for_html   = _mua_spk_rel   # 0-basiert, immer konsistent mit dem Rohsignal
+    _cnt_for_html   = globals().get("_sp_counts", None)   # AP/Up-Zustand (spontan)
+    if _raw_for_html is not None and _spk_for_html.size > 0:
+        export_mua_ap_raw_html(
+            f"{BASE_TAG}__mua",
+            SAVE_DIR,
+            _raw_for_html,
+            _spk_for_html,          # 0-basiert → t0=0.0
+            fs_raw=DEFAULT_FS_XDAT,
+            t0=0.0,
+            title=f"{BASE_TAG} — HP-Signal ch{_mua_ch} + AP-Detektion (HP>300Hz, thr=-3.5×MAD)",
+            spont_counts=_cnt_for_html,
+        )
+    else:
+        print("[MUA-AP-HTML] Rohsignal nicht verfügbar oder keine Spikes → übersprungen")
+except Exception as _e_ap_html:
+    print(f"[MUA-AP-HTML][WARN] {_e_ap_html}")
 
 
 # Extras für Plots
@@ -5035,6 +5256,7 @@ def _save_all_channels_svg_from_array(time_s, LFP_array, chan_labels, out_svg, *
         spread = np.nanpercentile(y, 95) - np.nanpercentile(y, 5)
         scale = spread if np.isfinite(spread) and spread > 0 else (np.nanstd(y) or 1.0)
         y_norm = (y - (med if np.isfinite(med) else 0.0)) / scale
+        y_norm = np.clip(y_norm, -1.2, 1.2)
         off = i * 2.5
         offsets.append(off)
         ax.plot(t_ds, y_norm + off, lw=0.6)
@@ -7565,6 +7787,16 @@ layout_rows = [
         ax=ax,
         title="UP rate (total): [/min] vs [Hz]"
     )],
+
+    # ========================================================
+    # REIHE 19: MUA Spikes pro spontanem Up-Zustand – Histogramm (volle Breite)
+    # ========================================================
+    [lambda ax: mua_spikes_per_upstate_hist_ax(
+        _sp_counts.astype(float),
+        spont_rates=(_sp_rates if np.isfinite(_sp_rates).any() else None),
+        ax=ax,
+        title="MUA: Aktionspotenziale pro spontanem Up-Zustand",
+    )],
 ]
 
 # Compact UP-state report for cross-subfolder summary:
@@ -7646,6 +7878,10 @@ def _write_summary_csv():
         "UP rate total [Hz]",
         "UP rate total [/min]",
         "MUA rate [Hz]",
+        "MUA Spikes/UP spont (mean)",
+        "MUA Spikes/UP trig (mean)",
+        "MUA Firing Rate in UP spont [Hz]",
+        "MUA Firing Rate in UP trig [Hz]",
     ]
 
     # Helfer: numpy/NaN -> plain
@@ -7713,6 +7949,22 @@ def _write_summary_csv():
         "UP rate total [Hz]": rates["rate_total_hz"],
         "UP rate total [/min]": rates["rate_total_per_min"],
         "MUA rate [Hz]": mua_rate_hz if (isinstance(mua_rate_hz, float) and mua_rate_hz == mua_rate_hz) else "",
+        "MUA Spikes/UP spont (mean)":
+            round(mua_spikes_mean_spont, 2)
+            if (isinstance(mua_spikes_mean_spont, float) and mua_spikes_mean_spont == mua_spikes_mean_spont)
+            else "",
+        "MUA Spikes/UP trig (mean)":
+            round(mua_spikes_mean_trig, 2)
+            if (isinstance(mua_spikes_mean_trig, float) and mua_spikes_mean_trig == mua_spikes_mean_trig)
+            else "",
+        "MUA Firing Rate in UP spont [Hz]":
+            round(mua_rate_hz_spont_mean, 2)
+            if (isinstance(mua_rate_hz_spont_mean, float) and mua_rate_hz_spont_mean == mua_rate_hz_spont_mean)
+            else "",
+        "MUA Firing Rate in UP trig [Hz]":
+            round(mua_rate_hz_trig_mean, 2)
+            if (isinstance(mua_rate_hz_trig_mean, float) and mua_rate_hz_trig_mean == mua_rate_hz_trig_mean)
+            else "",
     }
 
     # Debug: zeig die Zeile im Log
