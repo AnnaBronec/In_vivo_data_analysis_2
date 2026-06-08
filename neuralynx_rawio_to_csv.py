@@ -307,14 +307,37 @@ def main(session_dir, out_csv=None):
     exclude_list = [f.name for f in Path(p).iterdir()
                     if f.is_file() and f.suffix.lower() in skip_suffixes]
 
-    print("Excluding files:", exclude_list)  # optional zum Debuggen
+    print("Excluding files:", exclude_list)
 
-    rr = NeuralynxRawIO(
-        dirname=str(p),
-        exclude_filename=exclude_list,   # << genau hier!
-        keep_original_times=False        # oder True, falls du absolute Zeiten willst
-    )
-    rr.parse_header()
+    import neo
+    _neo_ver = tuple(int(x) for x in getattr(neo, "__version__", "0.0.0").split(".")[:3] if x.isdigit())
+    _exclude_kwarg = "exclude_filenames" if _neo_ver >= (0, 13, 0) else "exclude_filename"
+
+    def _make_rr(excl):
+        rr = NeuralynxRawIO(dirname=str(p), **{_exclude_kwarg: excl}, keep_original_times=False)
+        rr.parse_header()
+        return rr
+
+    try:
+        rr = _make_rr(exclude_list)
+    except (IOError, OSError) as _e:
+        if "different sections" not in str(_e):
+            raise
+        # One or more NCS files have a different block structure than the majority.
+        # Find them by comparing file sizes (each NCS record = 1044 bytes after a 16384-byte header).
+        from collections import Counter
+        ncs_files = sorted(
+            [f for f in p.iterdir() if f.suffix.lower() == ".ncs" and f.name not in exclude_list]
+        )
+        sizes = [(f.stat().st_size, f.name) for f in ncs_files]
+        size_counts = Counter(s for s, _ in sizes)
+        dominant_size = max(size_counts, key=size_counts.get)
+        outliers = [name for size, name in sizes if size != dominant_size]
+        if not outliers:
+            raise
+        print(f"[NCS-COMPAT] Excluding {len(outliers)} size-outlier NCS file(s) with different block count: {outliers}")
+        exclude_list = exclude_list + outliers
+        rr = _make_rr(exclude_list)
 
     streams = _streams_from_header(rr)
     chans   = _channels_from_header(rr)
@@ -339,7 +362,13 @@ def main(session_dir, out_csv=None):
         # NEU: lokale Indizes für Neo (0..n_stream_ch-1)
         ch_idx_local = list(range(len(ch_idx)))
 
-        chunk = _get_chunk(rr, si, 0, n, ch_idx_local)  # shape (n, n_ch)
+        try:
+            chunk = _get_chunk(rr, si, 0, n, ch_idx_local)
+        except IndexError:
+            # neo over-reports signal size by 1 for recordings with an incomplete last block
+            n -= 1
+            time = time[:n]
+            chunk = _get_chunk(rr, si, 0, n, ch_idx_local)
 
         # Column names (robust gegen UNKNOWN: erst sinnvollen Namen versuchen, sonst CSC1..N)
         names = []
@@ -433,24 +462,30 @@ def main(session_dir, out_csv=None):
                 t = df_all["time"].to_numpy(dtype=np.float64)
                 t0 = float(t[0]) if t.size else 0.0
 
-                # Anchor NEV event times to NCS timeline using first NCS timestamp.
-                # This avoids the old ref0->t0 fallback that could place pulses wrongly.
-                ncs_t0_us = _first_ncs_timestamp_us(p)
-                if ncs_t0_us is not None:
-                    on_s = (np.asarray(on_us, dtype=np.float64) - float(ncs_t0_us)) / 1e6 + t0
-                    off_s = (np.asarray(off_us, dtype=np.float64) - float(ncs_t0_us)) / 1e6 + t0
-                    print(f"[NEV->CSV][T0] using NCS start timestamp: {ncs_t0_us}")
+                # Anchor NEV timestamps to neo's own time reference.
+                # rr.global_t_start is the same origin neo uses for the LFP time array
+                # (minimum t_start across all signals), so both are in the identical frame.
+                _neo_t0 = getattr(rr, "global_t_start", None)
+                if _neo_t0 is not None and np.isfinite(float(_neo_t0)):
+                    on_s  = np.asarray(on_us,  dtype=np.float64) / 1e6 - float(_neo_t0)
+                    off_s = np.asarray(off_us, dtype=np.float64) / 1e6 - float(_neo_t0)
+                    print(f"[NEV->CSV][T0] using neo global_t_start={float(_neo_t0):.6f}s (t[0]={t0:.6f}s)")
                 else:
-                    on_s = np.asarray(on_us, dtype=np.float64) / 1e6
-                    off_s = np.asarray(off_us, dtype=np.float64) / 1e6
-                    # Last-resort timeline alignment only when absolute scales clearly differ.
-                    if on_s.size and t.size:
-                        in_range = (np.nanmax(on_s) >= t[0]) and (np.nanmin(on_s) <= t[-1])
-                        if not in_range:
-                            on_s = on_s - float(on_s[0]) + t0
-                            if off_s.size:
-                                off_s = off_s - float(off_s[0]) + t0
-                            print("[NEV->CSV][T0][WARN] fallback alignment used (no NCS t0)")
+                    # Fallback: anchor via first NCS block timestamp (legacy method)
+                    ncs_t0_us = _first_ncs_timestamp_us(p)
+                    if ncs_t0_us is not None:
+                        on_s  = (np.asarray(on_us,  dtype=np.float64) - float(ncs_t0_us)) / 1e6 + t0
+                        off_s = (np.asarray(off_us, dtype=np.float64) - float(ncs_t0_us)) / 1e6 + t0
+                        print(f"[NEV->CSV][T0] fallback NCS timestamp: {ncs_t0_us}")
+                    else:
+                        on_s  = np.asarray(on_us,  dtype=np.float64) / 1e6
+                        off_s = np.asarray(off_us, dtype=np.float64) / 1e6
+                        if on_s.size and t.size:
+                            in_range = (np.nanmax(on_s) >= t[0]) and (np.nanmin(on_s) <= t[-1])
+                            if not in_range:
+                                on_s  = on_s  - float(on_s[0])  + t0
+                                off_s = off_s - float(off_s[0]) + t0 if off_s.size else off_s
+                                print("[NEV->CSV][T0][WARN] fallback alignment used (no NCS t0)")
                 df_all["stim"] = _build_stim_from_on_off(on_s, off_s, t)
                 df_all["stim_on"] = _build_stim_onset_impulses(on_s, t)
                 df_all["stim_off"] = _build_stim_onset_impulses(off_s, t) if off_s.size else np.zeros_like(df_all["stim"])

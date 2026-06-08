@@ -872,28 +872,35 @@ if nev_path is not None and os.path.exists(nev_path):
         ts_us, ttl_words, _ = read_nev_timestamps_and_ttl(nev_path)
 
         # TTL bit automatisch wählen: möglichst viele gepaarte ON/OFF-Edges.
+        # Auch invertierte TTL-Kodierung testen (Bit startet HIGH, geht bei Puls LOW).
         cand = []
-        max_pairs = 0
         for bit in range(16):
             _on, _off = ttl_to_on_off(ts_us, ttl_words, bit=bit)
-            n_pair = min(len(_on), len(_off))
-            max_pairs = max(max_pairs, n_pair)
-            med_w_s = np.nan
-            if n_pair > 0:
-                w_s = (np.asarray(_off[:n_pair], float) - np.asarray(_on[:n_pair], float)) / 1e6
+            for _a, _b, inverted in [(_on, _off, False), (_off, _on, True)]:
+                n_pair = min(len(_a), len(_b))
+                if n_pair == 0:
+                    continue
+                w_s = (np.asarray(_b[:n_pair], float) - np.asarray(_a[:n_pair], float)) / 1e6
                 w_s = w_s[np.isfinite(w_s) & (w_s > 0)]
-                if w_s.size:
-                    med_w_s = float(np.median(w_s))
-            cand.append((bit, _on, _off, n_pair, med_w_s))
+                med_w_s = float(np.median(w_s)) if w_s.size else np.nan
+                cand.append((bit, _a, _b, n_pair, med_w_s, inverted))
 
         best = None
         if cand:
-            best = max(cand, key=lambda c: (c[3], len(c[1]), -c[0]))
+            # Bevorzuge: viele Paare, positive Pulsbreite, normale Polarität
+            best = max(cand, key=lambda c: (
+                c[3],                          # n_pairs (mehr = besser)
+                np.isfinite(c[4]),             # hat gültige Breite
+                not c[5],                      # normale Polarität bevorzugt
+                -c[0]                          # niedrigeres Bit bevorzugt
+            ))
+            if best[5]:
+                print(f"[NEV] invertiertes TTL erkannt (bit={best[0]}) — on/off vertauscht")
 
         if best is None:
             on_us, off_us, best_bit = np.array([], float), np.array([], float), None
         else:
-            best_bit, on_us, off_us, n_pair_best, med_w_best_s = best
+            best_bit, on_us, off_us, n_pair_best, med_w_best_s, _nev_inverted = best
 
         if best_bit is not None:
             if np.isfinite(med_w_best_s):
@@ -2378,72 +2385,55 @@ amp_df.to_csv(amp_csv_path, index=False)
 print(f"[CSV] UP-Amplituden geschrieben: {amp_csv_path}  (spont={len(spont_amp)}, trig={len(trig_amp)})")
 
 
-# --- Upstate-Wellenformen speichern (für PCA) ---
-_N_PCA = 100
+# --- Upstate-Wellenformen speichern: fixes Fenster um Onset ---
+# Fenster: 300ms vor bis 1000ms nach Onset, resampelt auf 130 Punkte
+# Normierung: Baseline-Subtraktion (erste 250ms = Punkte 0-24 = Down-State)
+_WF_PRE_S  = 0.30   # s vor Onset
+_WF_POST_S = 1.00   # s nach Onset
+_N_PCA     = 130    # Punkte gesamt (≈ 10ms/Punkt)
+_WF_BL_END = 25     # Baseline-Fenster: Punkte 0-24 (-300ms bis -50ms)
+
 _wf_sig_raw = main_channel_uV if main_channel_uV is not None else main_channel
 from scipy.signal import filtfilt as _filtfilt
-_wf_sig = _filtfilt(b_lp, a_lp, np.asarray(_wf_sig_raw, float))
-_wf_U = np.asarray(Spontaneous_UP, int)
-_wf_D = np.asarray(Spontaneous_DOWN, int)
-_wf_m = min(_wf_U.size, _wf_D.size)
-_waveforms = []
-if _wf_m > 0:
-    _wf_U, _wf_D = _wf_U[:_wf_m], _wf_D[:_wf_m]
-    _wf_ord = np.argsort(_wf_U)
-    _wf_U, _wf_D = _wf_U[_wf_ord], _wf_D[_wf_ord]
-    _n_sig = len(_wf_sig)
-    for _u, _d in zip(_wf_U, _wf_D):
-        if not (0 <= _u < _n_sig and 0 < _d <= _n_sig and _d > _u):
+_wf_sig  = _filtfilt(b_lp, a_lp, np.asarray(_wf_sig_raw, float))
+_n_sig   = len(_wf_sig)
+_pre_s   = max(1, int(round(_WF_PRE_S  / dt)))
+_post_s  = max(1, int(round(_WF_POST_S / dt)))
+_xnew    = np.linspace(0, 1, _N_PCA)
+
+def _extract_wf(onsets):
+    wfs = []
+    for _u in np.asarray(onsets, int):
+        _s, _e = _u - _pre_s, _u + _post_s
+        if _s < 0 or _e > _n_sig:
             continue
-        _seg = np.asarray(_wf_sig[_u:_d], float)
-        _seg = _seg[np.isfinite(_seg)]
-        if _seg.size < 2:
+        _seg = np.asarray(_wf_sig[_s:_e], float)
+        if not np.all(np.isfinite(_seg)):
             continue
         _xold = np.linspace(0, 1, _seg.size)
-        _xnew = np.linspace(0, 1, _N_PCA)
-        _waveforms.append(np.interp(_xnew, _xold, _seg))
+        _seg_r = np.interp(_xnew, _xold, _seg)
+        _bl = _seg_r[:_WF_BL_END].mean()
+        wfs.append(_seg_r - _bl)
+    return wfs
+
+_waveforms = _extract_wf(Spontaneous_UP)
 if _waveforms:
     _wf_array = np.array(_waveforms)
     _wf_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__upstate_waveforms.npy")
     np.save(_wf_path, _wf_array)
     print(f"[NPY] Upstate-Wellenformen gespeichert: {_wf_path}  ({_wf_array.shape})")
 
-# --- Triggered Upstate-Wellenformen speichern (für PCA spont vs. trig) ---
-_trig_waveforms = []
-_twf_U = np.asarray(Pulse_triggered_UP, int)
-_twf_D = np.asarray(Pulse_triggered_DOWN, int)
-_twf_m = min(_twf_U.size, _twf_D.size)
-if _twf_m > 0:
-    _twf_U, _twf_D = _twf_U[:_twf_m], _twf_D[:_twf_m]
-    _twf_ord = np.argsort(_twf_U)
-    _twf_U, _twf_D = _twf_U[_twf_ord], _twf_D[_twf_ord]
-    for _u, _d in zip(_twf_U, _twf_D):
-        if not (0 <= _u < _n_sig and 0 < _d <= _n_sig and _d > _u):
-            continue
-        _seg = np.asarray(_wf_sig[_u:_d], float)
-        _seg = _seg[np.isfinite(_seg)]
-        if _seg.size < 2:
-            continue
-        _xold = np.linspace(0, 1, _seg.size)
-        _xnew = np.linspace(0, 1, _N_PCA)
-        _trig_waveforms.append(np.interp(_xnew, _xold, _seg))
+_trig_waveforms = _extract_wf(Pulse_triggered_UP)
 if _trig_waveforms:
     _twf_array = np.array(_trig_waveforms)
     _twf_path = os.path.join(SAVE_DIR, f"{BASE_TAG}__trig_waveforms.npy")
     np.save(_twf_path, _twf_array)
     print(f"[NPY] Triggered-Wellenformen gespeichert: {_twf_path}  ({_twf_array.shape})")
 
-# --- Mahalanobis-PDF in FOR ANNA IN VIVO automatisch aktualisieren ---
-try:
-    import importlib.util as _ilu
-    _pca_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pca_upstates.py")
-    _spec = _ilu.spec_from_file_location("pca_upstates", _pca_path)
-    _pca_mod = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_pca_mod)
-    _pca_mod.mahal_summary(_pca_mod.ANNA_DIR)
-    _pca_mod.mean_waveform_summary(_pca_mod.ANNA_DIR)
-except Exception as _e:
-    print(f"[WARN] mahal_summary konnte nicht aktualisiert werden: {_e}")
+# Mahalanobis- und Wellenform-Summaries werden NICHT mehr automatisch nach jeder
+# Session generiert, weil mahal_summary/mean_waveform_summary den gesamten ANNA_DIR
+# scannen und alle Sessions laden — das macht jeden Lauf unnötig langsam.
+# Manuell ausführen: python pca_upstates.py
 
 
 # --- separate SVG mit dem Amplitudenvergleich ---

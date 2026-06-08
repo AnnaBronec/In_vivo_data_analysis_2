@@ -74,6 +74,7 @@ def plot_pca(ax, coords, labels, session_names, folder_name):
     ax.set_xlabel("PC 1")
     ax.set_ylabel("PC 2")
     ax.set_title(folder_name, fontsize=12, fontweight="bold", pad=8)
+
     ax.grid(alpha=0.2, linestyle=":")
     ax.legend(fontsize=7, markerscale=2, loc="best")
 
@@ -113,8 +114,8 @@ def main():
 
             # PCA Scatter
             plot_pca(axes[0], coords, labels, session_names, folder_name)
-            axes[0].set_xlabel(f"PC 1 ({var_explained[0]:.1f}% Varianz)")
-            axes[0].set_ylabel(f"PC 2 ({var_explained[1]:.1f}% Varianz)" if len(var_explained) > 1 else "PC 2")
+            axes[0].set_xlabel(f"PC 1 ({var_explained[0]:.1f}% variance)")
+            axes[0].set_ylabel(f"PC 2 ({var_explained[1]:.1f}% variance)" if len(var_explained) > 1 else "PC 2")
 
             # Horizontales Balkendiagramm: % Abweichung zur Baseline-Session ("0_")
             cmap = plt.cm.get_cmap("tab10", len(session_names))
@@ -154,8 +155,8 @@ def main():
             ax2.axhline(0, color="black", linewidth=0.9, linestyle="--", alpha=0.6)
             ax2.set_xticks(x_pos)
             ax2.set_xticklabels(session_names, rotation=45, ha="right", fontsize=8)
-            ax2.set_ylabel(f"PC1-Abweichung von '{baseline_name}' (% der Gesamtstreuung)")
-            ax2.set_title(f"PCA – PC1-Abweichung von '{baseline_name}' ± SEM")
+            ax2.set_ylabel(f"PC1 deviation from '{baseline_name}' (% total variance)")
+            ax2.set_title(f"PCA – PC1 deviation from '{baseline_name}' ± SEM")
             ax2.grid(alpha=0.2, linestyle=":", axis="y")
 
             fig.tight_layout()
@@ -294,8 +295,8 @@ def mahal_summary(parent_dir, out_pdf=None, n_pc=5, smooth_window=12):
         ax.set_ylim(y_lim)
         ax.set_xticks(x)
         ax.set_xticklabels(names, rotation=40, ha="right", fontsize=8)
-        ax.set_ylabel(f"Mahalanobis-Distanz (erste {n_pc} PCs)", fontsize=11)
-        ax.set_title(f"{group_name}\nSpontaneous vs. Triggered — Mahalanobis-Distanz",
+        ax.set_ylabel(f"Mahalanobis distance (first {n_pc} PCs)", fontsize=11)
+        ax.set_title(f"{group_name}\nSpontaneous vs. Triggered — Mahalanobis Distance",
                      fontsize=11, fontweight="bold")
         ax.grid(alpha=0.25, linestyle=":", axis="y")
         ax.axhline(0, color="black", linewidth=0.8)
@@ -339,13 +340,33 @@ def mean_waveform_summary(parent_dir, out_pdf=None, smooth_window=12):
         print("[mean_waveform_summary] Keine Sessions gefunden.")
         return
 
-    x_norm = np.linspace(0, 100, 100)  # x-Achse: 0–100 % der Upstate-Dauer
+    _WF_PRE_MS  = 300
+    _WF_POST_MS = 1000
+    _N_NEW      = 130   # neues Format: fixes Onset-Fenster
+    _N_OLD      = 100   # altes Format: onset→offset resampelt
+
+    def _x_axis(n_pts):
+        if n_pts == _N_NEW:
+            return np.linspace(-_WF_PRE_MS, _WF_POST_MS, _N_NEW)
+        return np.linspace(0, 100, n_pts)  # altes Format: % der Upstate-Dauer
+
+    def _x_label(n_pts):
+        return "Time relative to onset (ms)" if n_pts == _N_NEW else "Upstate duration (%)"
 
     def _zscore_rows(arr):
-        mu  = arr.mean(axis=1, keepdims=True)
-        sig = arr.std(axis=1, keepdims=True)
-        sig[sig == 0] = 1.0
-        return (arr - mu) / sig
+        n_pts = arr.shape[1]
+        if n_pts == _N_NEW:
+            # Neues Format: Baseline bereits subtrahiert, nur durch Baseline-Std dividieren
+            n_bl = 25
+            sig = arr[:, :n_bl].std(axis=1, keepdims=True)
+            sig[sig < 1e-6] = 1.0
+            return arr / sig
+        else:
+            # Altes Format: per-Waveform z-score
+            mu  = arr.mean(axis=1, keepdims=True)
+            sig = arr.std(axis=1, keepdims=True)
+            sig[sig < 1e-6] = 1.0
+            return (arr - mu) / sig
 
     def _load_group_rows(session_paths):
         rows = []
@@ -395,7 +416,7 @@ def mean_waveform_summary(parent_dir, out_pdf=None, smooth_window=12):
             fig, axes = plt.subplots(nrows, ncols,
                                      figsize=(ncols * 4.5, nrows * 3.2),
                                      squeeze=False)
-            fig.suptitle(f"{group_name}\nMittlere Upstate-Wellenform: Spontaneous vs. Triggered",
+            fig.suptitle(f"{group_name}\nMean Upstate Waveform: Spontaneous vs. Triggered",
                          fontsize=12, fontweight="bold", y=1.01)
 
             for idx, (name, spont_z, trig_z) in enumerate(rows):
@@ -406,24 +427,27 @@ def mean_waveform_summary(parent_dir, out_pdf=None, smooth_window=12):
                 mu_t  = trig_z.mean(axis=0)
                 sem_t = trig_z.std(axis=0) / np.sqrt(trig_z.shape[0])
 
-                ax.fill_between(x_norm, mu_s - sem_s, mu_s + sem_s,
+                _x = _x_axis(spont_z.shape[1])
+                ax.fill_between(_x, mu_s - sem_s, mu_s + sem_s,
                                 color="#2ecc71", alpha=0.25)
-                ax.fill_between(x_norm, mu_t - sem_t, mu_t + sem_t,
+                ax.fill_between(_x, mu_t - sem_t, mu_t + sem_t,
                                 color="#2980b9", alpha=0.25)
-                ax.plot(x_norm, mu_s, color="#27ae60", linewidth=2.0,
-                        label=f"Spont (n={spont_z.shape[0]})")
-                ax.plot(x_norm, mu_t, color="#1a5276", linewidth=2.0,
-                        label=f"Trig (n={trig_z.shape[0]})")
+                ax.plot(_x, mu_s, color="#27ae60", linewidth=2.0,
+                        label=f"Spontaneous (n={spont_z.shape[0]})")
+                ax.plot(_x, mu_t, color="#1a5276", linewidth=2.0,
+                        label=f"Triggered (n={trig_z.shape[0]})")
 
                 r = float(np.corrcoef(mu_s, mu_t)[0, 1])
                 ax.set_ylim(y_lim)
-                ax.set_title(f"{name}\nr = {r:.2f}", fontsize=7.5, pad=4)
-                ax.set_xlabel("Upstate-Dauer (%)", fontsize=8)
-                ax.set_ylabel("z-score", fontsize=8)
+                ax.set_title(f"{name}\nPearson r = {r:.2f}", fontsize=7.5, pad=4)
+                ax.set_xlabel(_x_label(spont_z.shape[1]), fontsize=8)
+                ax.set_ylabel("µV (baseline norm.)" if spont_z.shape[1] == _N_NEW else "z-score", fontsize=7)
                 ax.tick_params(labelsize=7)
                 ax.legend(fontsize=7, loc="upper right")
                 ax.grid(alpha=0.2, linestyle=":")
                 ax.axhline(0, color="black", linewidth=0.5, linestyle="--", alpha=0.4)
+                if spont_z.shape[1] == _N_NEW:
+                    ax.axvline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
 
             for idx in range(len(rows), nrows * ncols):
                 axes[idx // ncols][idx % ncols].set_visible(False)

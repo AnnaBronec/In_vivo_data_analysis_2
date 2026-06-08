@@ -639,8 +639,10 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
     # Causal rule: triggered UPs must start in a window after the pulse offset.
     trig_interval_min_lat_s = float(os.environ.get("TRIG_INTERVAL_MIN_LAT_S", "0.00"))
     trig_interval_post_s = float(os.environ.get("TRIG_INTERVAL_POST_S", "0.40"))
+    trig_interval_pre_offset_s = float(os.environ.get("TRIG_INTERVAL_PRE_OFFSET_S", "0.00"))
     assoc_tail_s = float(os.environ.get("ASSOC_TAIL_S", "0.20"))
     assoc_min_delay_s = float(os.environ.get("ASSOC_MIN_DELAY_S", "0.20"))
+    assoc_pre_pulse_s = float(os.environ.get("ASSOC_PRE_PULSE_S", "0.00"))
     assoc_enable = os.environ.get("ASSOC_ENABLE", "1") == "1"
     assoc_onset_max_s = float(os.environ.get("ASSOC_ONSET_MAX_S", "0.80"))
     assoc_interval_max_width_s = float(os.environ.get("ASSOC_INTERVAL_MAX_WIDTH_S", "1.50"))
@@ -676,7 +678,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
         # weitere UPs im Pulsfenster -> associated.
         if assoc_enable and Pulse_intervals.size and intervals_reliable:
             for on_t, off_t in Pulse_intervals:
-                trig_lo = float(off_t) + max(0.0, trig_interval_min_lat_s)
+                trig_lo = float(off_t) - trig_interval_pre_offset_s + max(0.0, trig_interval_min_lat_s)
                 trig_hi = float(off_t) + trig_interval_post_s
                 trig_cand = np.where(
                     (~mask_trig) & (~mask_assoc) &
@@ -698,6 +700,32 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                 if trig_idx is not None:
                     mask_assoc[trig_idx] = False
 
+                # Pre-pulse window: Upstate startet kurz VOR Puls-Onset (Detektion-Lag)
+                if assoc_pre_pulse_s > 0:
+                    pre_cand = np.where(
+                        (~mask_trig) & (~mask_assoc) &
+                        (up_times >= float(on_t) - assoc_pre_pulse_s) &
+                        (up_times <  float(on_t))
+                    )[0]
+                    if pre_cand.size:
+                        mask_assoc[pre_cand] = True
+
+                # Overlap: Upstate enthält den Puls vollständig (start < on_t < end)
+                overlap_cand = np.where(
+                    (~mask_trig) & (~mask_assoc) &
+                    (up_times <= float(on_t)) &
+                    (dn_times  >= float(on_t))
+                )[0]
+                if overlap_cand.size:
+                    if trig_idx is None:
+                        # Noch kein triggered UP für diesen Puls gefunden —
+                        # ein UP das den Onset überspannt ist höchstwahrscheinlich
+                        # puls-getriggert (Feature-Zeitauflösung kann Onset leicht verschieben).
+                        trig_idx = int(overlap_cand[-1])
+                        mask_trig[trig_idx] = True
+                    else:
+                        mask_assoc[overlap_cand] = True
+
         # Fallback fuer verbleibende UPs (z. B. wenn keine gueltigen Intervalle vorliegen)
         if Pulse_times_array.size:
             open_idx = np.where(~(mask_trig | mask_assoc))[0]
@@ -709,9 +737,13 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                 # UP onset inside the causal post-offset window.
                 has_near_on = False
                 has_near_off = np.any(
-                    (Pulse_off_array <= t_up) &
-                    ((t_up - Pulse_off_array) >= 0.0) &
+                    ((t_up - Pulse_off_array) >= -trig_interval_pre_offset_s) &
                     ((t_up - Pulse_off_array) <= trig_win_off_s)
+                )
+                # Pre-pulse: Upstate startet kurz VOR Puls-Onset
+                has_pre_pulse = assoc_enable and assoc_pre_pulse_s > 0 and np.any(
+                    (Pulse_times_array >= t_up) &
+                    ((Pulse_times_array - t_up) <= assoc_pre_pulse_s)
                 )
                 assoc_hi = min(t_dn, t_up + assoc_onset_max_s)
                 has_assoc_late = assoc_enable and np.any(
@@ -721,7 +753,7 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
                 if has_near_on or has_near_off:
                     mask_trig[i] = True
-                elif has_assoc_late:
+                elif has_pre_pulse or has_assoc_late:
                     mask_assoc[i] = True
 
     # paar-konsistente Klassen
