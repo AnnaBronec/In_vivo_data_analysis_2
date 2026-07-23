@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m py_compile /home/ananym/Code/In_vivo_data_analysis/Source/Main_safe.py)",
+      "Bash(python3 -m py_compile Main_safe.py state_detection.py Exports.py)",
+      "Bash(python3 /tmp/claude-1000/-home-ananym-Code-In-vivo-data-analysis-Source/d10593a9-80c1-45f5-a5d8-5ad5a2916a59/scratchpad/find_dead_code.py)"
+    ]
+  }
+}

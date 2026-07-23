@@ -30,6 +30,7 @@ from TimeFreq_plot import Run_spectrogram
 from state_detection import (
     classify_states, extract_upstate_windows,
     compare_spectra, _up_onsets, Generate_CSD_mean_from_onsets,
+    detect_artifact_windows, interpolate_masked,
 )
 from pathlib import Path
 from plotter import (
@@ -96,6 +97,16 @@ CLUSTER_ENABLE = os.environ.get("CLUSTER_ENABLE", "0") == "1"
 AUTO_PULSE_EDGE_SHIFT = os.environ.get("AUTO_PULSE_EDGE_SHIFT", "0") == "1"
 AUTO_CLEAR_TINY_OFFSETS = os.environ.get("AUTO_CLEAR_TINY_OFFSETS", "0") == "1"
 AUTO_PULSE_ARTIFACT_ALIGN = os.environ.get("AUTO_PULSE_ARTIFACT_ALIGN", "0") == "1"
+# Automatische Erkennung & Ausschluss von kurzen Rauschtransienten (Bewegung/Elektrik)
+# im Main-Channel: Amplitude ODER Sample-zu-Sample-Sprung > k * robuste Sigma (aus
+# Median/MAD) gilt als Artefakt. k bewusst hoch gewaehlt (Default 20), da z.B. bei
+# starker optogenetischer Stimulation echte getriggerte UP-States schon 5-15x Sigma
+# erreichen koennen -- nur klare Ausreisser darueber sollen automatisch raus.
+# ARTIFACT_PAD_S = Padding in Sekunden fuer das Ein-/Ausschwingen um jeden Treffer.
+ARTIFACT_REJECT_ENABLE = os.environ.get("ARTIFACT_REJECT_ENABLE", "1") == "1"
+ARTIFACT_MAD_K = float(os.environ.get("ARTIFACT_MAD_K", "20.0"))
+ARTIFACT_DERIV_MAD_K = float(os.environ.get("ARTIFACT_DERIV_MAD_K", "20.0"))
+ARTIFACT_PAD_S = float(os.environ.get("ARTIFACT_PAD_S", "0.15"))
 FORCE_ONSET_ONLY_PLOTS = os.environ.get("FORCE_ONSET_ONLY_PLOTS", "1") == "1"
 SHOW_COMMENT_PULSE_OFFSETS = os.environ.get("SHOW_COMMENT_PULSE_OFFSETS", "1") == "1"
 IGNORE_PULSE_2 = os.environ.get("IGNORE_PULSE_2", "0") == "1"
@@ -1214,6 +1225,13 @@ if FROM_STREAM:
     pulse_times_2_html     = np.asarray(p2_on_full,  float)
     pulse_times_2_off_html = np.asarray(p2_off_full, float)
 
+    # Propagate streaming pulses into the _full arrays so the HTML-export
+    # block at line ~3690 (_ensure_seconds(pulse_times_1_full, ...)) finds them.
+    pulse_times_1_full     = np.asarray(p1_on_full,  float)
+    pulse_times_1_off_full = np.asarray(p1_off_full, float)
+    pulse_times_2_full     = np.asarray(p2_on_full,  float)
+    pulse_times_2_off_full = np.asarray(p2_off_full, float)
+
     pulse_times_1     = snap_times_to_timebase(pulse_times_1_html,     time_s)
     pulse_times_1_off = snap_times_to_timebase(pulse_times_1_off_html, time_s)
     pulse_times_2     = snap_times_to_timebase(pulse_times_2_html,     time_s)
@@ -1717,19 +1735,66 @@ if ch_idx_used != int(req_up_ch):
     print(f"[WARN] requested UP channel pri_{req_up_ch} not available -> using pri_{ch_idx_used}")
 main_channel = np.asarray(LFP_array[ch_idx_used], dtype=float)
 
+# --- Automatischer Ausschluss kurzer Rauschtransienten (z.B. Bewegungsartefakte) ---
+# Detektion laeuft auf einer tiefpassgefilterten Kopie (gleicher Cutoff wie der
+# HTML-Export), NICHT auf dem rohen main_channel: main_channel ist per simple-stride
+# Downsampling entstanden (kein Anti-Aliasing), wodurch hochfrequentes Rauschen
+# einfaltet und die robuste Baseline-Sigma stark aufbläht (in 6_washout z.B. 13.9
+# statt 4.5 nach Tiefpass) -- ein echtes, visuell klar erkennbares Artefakt würde
+# dadurch faelschlich unter der Schwelle bleiben. Die Maske wird danach auf den
+# echten (unsmoothed) main_channel angewendet.
+artifact_mask = np.zeros(main_channel.shape, dtype=bool)
+artifact_idx_intervals = []
+if ARTIFACT_REJECT_ENABLE:
+    try:
+        _sos_art = signal.butter(5, HIGH_CUTOFF, btype="low", fs=1.0 / dt, output="sos")
+        _art_finite = np.isfinite(main_channel)
+        _art_smooth_in = np.nan_to_num(main_channel, nan=float(np.nanmedian(main_channel)))
+        main_channel_smoothed_for_artifact_detect = signal.sosfiltfilt(_sos_art, _art_smooth_in)
+        main_channel_smoothed_for_artifact_detect[~_art_finite] = np.nan
+    except Exception as _e_art_smooth:
+        print(f"[ARTIFACT][WARN] smoothing for detection failed, using raw signal: {_e_art_smooth}")
+        main_channel_smoothed_for_artifact_detect = main_channel
+    artifact_mask, artifact_idx_intervals = detect_artifact_windows(
+        main_channel_smoothed_for_artifact_detect, dt,
+        mad_k=ARTIFACT_MAD_K, deriv_mad_k=ARTIFACT_DERIV_MAD_K, pad_s=ARTIFACT_PAD_S
+    )
+    if artifact_mask.any():
+        # Original (unbereinigt) fuer den Plot aufheben, damit man hinter der
+        # grauen Markierung die tatsaechlichen Rohwerte sehen kann.
+        main_channel_raw_for_plot = main_channel.copy()
+        main_channel = interpolate_masked(main_channel, artifact_mask)
+        for s, e in artifact_idx_intervals:
+            e_clip = min(e, len(time_s) - 1)
+            print(
+                f"[ARTIFACT] excluded window {time_s[s]:.3f}s-{time_s[e_clip]:.3f}s "
+                f"(samples {s}-{e}, mad_k={ARTIFACT_MAD_K:g}, pad={ARTIFACT_PAD_S:g}s) "
+                f"on pri_{ch_idx_used} -> interpolated for analysis"
+            )
+artifact_intervals_s = [
+    (float(time_s[s]), float(time_s[min(e, len(time_s) - 1)]))
+    for s, e in artifact_idx_intervals
+]
+
 # Für HTML: Main-Channel in µV (mit passendem Gain des globalen Kanals)
-main_channel_uV = None
-if HTML_IN_uV:
+def _to_uV(sig_counts):
     orig_name = chan_cols[ch_idx_used] if (0 <= ch_idx_used < len(chan_cols)) else None
     gain_used = PER_CH_GAIN.get(orig_name, PREAMP_GAIN)
     if CALIB_MODE == "counts":
-        main_channel_uV = _counts_to_uV(main_channel, ADC_BITS, ADC_VPP, gain_used)
+        return _counts_to_uV(sig_counts, ADC_BITS, ADC_VPP, gain_used)
     elif CALIB_MODE == "volts":
-        main_channel_uV = _volts_to_uV(main_channel)
-    elif CALIB_MODE == "uV":
-        main_channel_uV = main_channel.copy()
+        return _volts_to_uV(sig_counts)
     else:
-        main_channel_uV = main_channel.copy()
+        return sig_counts.copy()
+
+main_channel_uV = _to_uV(main_channel) if HTML_IN_uV else None
+# Rohwerte (vor Artefakt-Interpolation), passend zur gleichen Einheit wie
+# main_channel_uV/main_channel -- nur fuer die Plot-Darstellung hinter der
+# grauen Ausschluss-Markierung.
+if artifact_mask.any():
+    main_channel_uV_raw_for_plot = _to_uV(main_channel_raw_for_plot) if HTML_IN_uV else main_channel_raw_for_plot
+else:
+    main_channel_uV_raw_for_plot = main_channel_uV if HTML_IN_uV else main_channel
 
 print(f"[MAIN-CH] using fixed LFP/UP/SP channel: pri_{ch_idx_used}")
 swr_ch_idx_main = int(np.clip(req_swr_ch, 0, int(NUM_CHANNELS) - 1))
@@ -2341,12 +2406,30 @@ else:
     print("[INFO] keine Pulse→UP Latenzen gefunden (entweder keine Pulse oder keine Trigger-UPs)")
 
 
-# --- NEU: gecroppte Intervalle (0.3–1.0 s ab UP-Start) ---
+# --- Lichtpuls-Artefakt: am UP-Beginn so viel wegschneiden, wie der Lichtpuls dauert ---
+# (gleiche Schnittlänge bei spontanen UPs, damit beide Gruppen vergleichbar bleiben)
+def _median_pulse_width_s(_on, _off):
+    _on = np.asarray(_on, float); _off = np.asarray(_off, float)
+    _m = min(_on.size, _off.size)
+    if _m == 0:
+        return np.nan
+    _w = _off[:_m] - _on[:_m]
+    _w = _w[np.isfinite(_w) & (_w > 0)]
+    return float(np.median(_w)) if _w.size else np.nan
+
+_pw1 = _median_pulse_width_s(pulse_times_1, pulse_times_1_off)
+_pw2 = _median_pulse_width_s(pulse_times_2, pulse_times_2_off)
+_pulse_widths = [w for w in (_pw1, _pw2) if np.isfinite(w)]
+PULSE_ARTIFACT_CROP_S = float(np.median(_pulse_widths)) if _pulse_widths else 0.3
+_CROP_END_S = max(1.0, PULSE_ARTIFACT_CROP_S + 0.1)  # Analysefenster bleibt > Crop, auch bei langen Pulsen
+print(f"[PULSE-ARTIFACT] Crop ab UP-Start = {PULSE_ARTIFACT_CROP_S*1000:.1f} ms (aus Pulsbreite, Fallback=300ms)")
+
+# --- gecroppte Intervalle (Pulsdauer ab UP-Start, gleiche Crop-Länge für spont & trig) ---
 Spon_UP_crop, Spon_DOWN_crop = crop_up_intervals(
-    Spontaneous_UP, Spontaneous_DOWN, dt, start_s=0.3, end_s=1.0
+    Spontaneous_UP, Spontaneous_DOWN, dt, start_s=PULSE_ARTIFACT_CROP_S, end_s=_CROP_END_S
 )
 Trig_UP_crop, Trig_DOWN_crop = crop_up_intervals(
-    Pulse_triggered_UP, Pulse_triggered_DOWN, dt, start_s=0.3, end_s=1.0
+    Pulse_triggered_UP, Pulse_triggered_DOWN, dt, start_s=PULSE_ARTIFACT_CROP_S, end_s=_CROP_END_S
 )
 
 # --- UP-Dauern pro Event (ungecroppt) als CSV ---
@@ -3869,6 +3952,11 @@ else:
 # Standard: pro Plot/Channel autoskalieren (robuster bei einzelnen Noisy-Kanälen).
 # Optional kann per HTML_SHARED_Y_RANGE=1 eine gemeinsame Parent-Skalierung erzwungen werden.
 html_sig_src = main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel
+if artifact_mask.any():
+    # Im Plot bewusst die Rohwerte (vor Interpolation) zeigen, ueberlagert von
+    # einer halbtransparenten grauen Markierung -- so bleibt nachvollziehbar,
+    # ob der automatische Ausschluss an dieser Stelle berechtigt war.
+    html_sig_src = np.asarray(main_channel_uV_raw_for_plot, float).copy()
 try:
     _raw_for_filt = np.asarray(html_sig_src, float)
     _finite_mask = np.isfinite(_raw_for_filt)
@@ -3881,11 +3969,19 @@ try:
     print(f"[HTML] main channel lowpass-filtered ({HIGH_CUTOFF} Hz, SOS) for HTML export")
 except Exception as _e_filt:
     print(f"[HTML] lowpass filter for HTML skipped: {_e_filt}")
+# Werte aus ausgeschlossenen Artefakt-Fenstern sollen die Y-Achsen-Skalierung
+# nicht bestimmen (sonst wirkt der Rest des Signals winzig, nur weil an einer
+# Stelle ein einzelner grosser Ausreisser angezeigt wird).
+_html_sig_for_range = np.asarray(html_sig_src, float)
+if artifact_mask.any() and artifact_mask.size == _html_sig_for_range.size:
+    _html_sig_for_range = _html_sig_for_range.copy()
+    _html_sig_for_range[artifact_mask] = np.nan
+
 html_y_range = None
 use_shared_html_y = str(os.environ.get("HTML_SHARED_Y_RANGE", "0")).strip().lower() in ("1", "true", "yes", "on")
 if use_shared_html_y:
     try:
-        _yy = np.asarray(html_sig_src, float)
+        _yy = _html_sig_for_range
         _yy = _yy[np.isfinite(_yy)]
         if _yy.size:
             _ymin = float(np.min(_yy))
@@ -3939,6 +4035,28 @@ if use_shared_html_y:
         print(f"[WARN] fixed HTML y-range failed: {e}")
 else:
     print("[HTML] per-channel autoscale enabled (HTML_SHARED_Y_RANGE=0)")
+    if artifact_mask.any():
+        # Ohne explizite Range wuerde Plotly per Default ueber ALLE Punkte
+        # autoskalieren, inkl. des angezeigten (aber ausgeschlossenen) Artefakts.
+        try:
+            _yy = _html_sig_for_range[np.isfinite(_html_sig_for_range)]
+            if _yy.size:
+                _ymin, _ymax = float(np.min(_yy)), float(np.max(_yy))
+                if _ymax <= _ymin:
+                    _delta = max(abs(_ymin), 1.0) * 0.05
+                    _ymin -= _delta
+                    _ymax += _delta
+                else:
+                    _pad = 0.05 * (_ymax - _ymin)
+                    _ymin -= _pad
+                    _ymax += _pad
+                html_y_range = [_ymin, _ymax]
+                print(
+                    f"[HTML] y-range auf nicht-ausgeschlossene Werte beschraenkt: "
+                    f"[{html_y_range[0]:.3f}, {html_y_range[1]:.3f}]"
+                )
+        except Exception as e:
+            print(f"[WARN] artifact-excluded y-range failed: {e}")
 
 
 
@@ -3960,6 +4078,7 @@ export_interactive_lfp_html(
     up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
     up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
     spindle_intervals=None,
+    exclude_intervals=artifact_intervals_s,
     limit_to_last_pulse=False,
     title=f"{BASE_TAG} — Main LFP ch{ch_idx_used} (interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
@@ -3981,6 +4100,7 @@ export_interactive_lfp_html(
     up_trig=None,
     up_assoc=None,
     spindle_intervals=None,
+    exclude_intervals=artifact_intervals_s,
     limit_to_last_pulse=False,
     title=f"{BASE_TAG} — Signal + Pulse ch{ch_idx_used} (ohne Marker, interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
@@ -4005,9 +4125,11 @@ try:
     lo_bp = 10.0
     hi_bp = min(15.0, 0.95 * nyq_html)
     if lo_bp < hi_bp:
+        _bp_finite = np.isfinite(main_channel_bp_10_15)
         x_bp0 = np.nan_to_num(main_channel_bp_10_15, nan=float(np.nanmedian(main_channel_bp_10_15)))
         sos_bp = signal.butter(3, [lo_bp / nyq_html, hi_bp / nyq_html], btype="bandpass", output="sos")
         main_channel_bp_10_15 = signal.sosfilt(sos_bp, x_bp0)
+        main_channel_bp_10_15[~_bp_finite] = np.nan
     else:
         print(f"[WARN] 10-15 Hz bandpass skipped (Nyquist too low: {nyq_html:.2f} Hz)")
 except Exception as e:
@@ -4027,6 +4149,7 @@ export_interactive_lfp_html(
     up_spont_label="Spindle spontaneous",
     up_trig_label="Spindle triggered",
     up_assoc_label="Spindle associated",
+    exclude_intervals=artifact_intervals_s,
     title=f"{BASE_TAG} — Spindle classification ch{ch_idx_used} (10-15 Hz, interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=False,
@@ -4054,6 +4177,7 @@ export_interactive_lfp_html(
     ripple_spont_label="SWR spontaneous",
     ripple_trig_label="SWR triggered",
     ripple_assoc_label="SWR associated",
+    exclude_intervals=artifact_intervals_s,
     title=f"{BASE_TAG} — UP+Spindle+SWR Overlay ch{ch_idx_used} (interaktiv)",
     y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
     show_pulse_intervals=(not PULSE_ONSET_ONLY),
@@ -4229,6 +4353,22 @@ try:
         f"as={len(Ch40_Sp_Assoc_UP)}",
     )
 
+    _shared_top_mid_y_range = None
+    try:
+        _yy = np.concatenate([
+            np.asarray(ch9_plot, dtype=float).ravel(),
+            np.asarray(ch40_plot, dtype=float).ravel(),
+        ])
+        _yy = _yy[np.isfinite(_yy)]
+        if _yy.size:
+            _y0 = float(np.nanpercentile(_yy, 1))
+            _y1 = float(np.nanpercentile(_yy, 99))
+            if np.isfinite(_y0) and np.isfinite(_y1) and _y1 > _y0:
+                _pad = (_y1 - _y0) * 0.10
+                _shared_top_mid_y_range = [_y0 - _pad, _y1 + _pad]
+    except Exception as _e_shared_range:
+        print(f"[HTML-3P] shared y-range (ch9/ch40) skipped: {_e_shared_range}")
+
     export_interactive_three_channel_lfp_html(
         f"{BASE_TAG}__ch9_swr_ch40_up_spindle",
         SAVE_DIR,
@@ -4261,8 +4401,8 @@ try:
         top_y_label=(f"ch{swr_ch_idx} SWR (µV)" if HTML_IN_uV else f"ch{swr_ch_idx} SWR ({UNIT_LABEL})"),
         mid_y_label=(f"ch{up_ch_idx} LFP (µV)" if HTML_IN_uV else f"ch{up_ch_idx} LFP ({UNIT_LABEL})"),
         bottom_y_label=(f"ch{up_ch_idx} 10-15 Hz (µV)" if HTML_IN_uV else f"ch{up_ch_idx} 10-15 Hz ({UNIT_LABEL})"),
-        y_range_top=None,
-        y_range_mid=html_y_range,
+        y_range_top=_shared_top_mid_y_range,
+        y_range_mid=_shared_top_mid_y_range,
         y_range_bottom=None,
         show_pulse_intervals=(not PULSE_ONSET_ONLY),
     )
@@ -8065,6 +8205,13 @@ def export_with_layout(base_tag, save_dir, layout_rows, rows_per_page=4, also_sa
                     axR = fig.add_subplot(gs[r, 1])
                     draw_into_ax(axL, row[0])
                     draw_into_ax(axR, row[1])
+                    lbl_L = axL.get_ylabel()
+                    lbl_R = axR.get_ylabel()
+                    if lbl_L and lbl_R and lbl_L == lbl_R:
+                        ymin = min(axL.get_ylim()[0], axR.get_ylim()[0])
+                        ymax = max(axL.get_ylim()[1], axR.get_ylim()[1])
+                        axL.set_ylim(ymin, ymax)
+                        axR.set_ylim(ymin, ymax)
                 else:
                     ax = fig.add_subplot(gs[r, :])
                     ax.axis('off')

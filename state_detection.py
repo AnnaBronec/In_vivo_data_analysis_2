@@ -32,6 +32,111 @@ from scipy.signal import welch
 from scipy.ndimage import gaussian_filter
 
 
+def detect_artifact_windows(x, dt, mad_k=20.0, deriv_mad_k=20.0, pad_s=0.15, merge_gap_s=0.1):
+    """
+    Erkennt kurze Rauschtransienten (Bewegung/Elektrik) ueber zwei robuste
+    Kriterien (Median + k * MAD-Sigma), die ODER-verknuepft werden:
+
+      1) Amplitude:  |x - median(x)| > mad_k * sigma_amp
+      2) Ableitung:  |diff(x)|       > deriv_mad_k * sigma_deriv
+
+    Beide Kriterien werden gebraucht, weil sich ein und dasselbe Artefakt je
+    nach Abtastrate unterschiedlich zeigt: bei hoher Rate (z.B. rohes 32kHz
+    Signal) ist es ein einzelner, scharfer Sample-Sprung (Kriterium 2 greift,
+    Kriterium 1 evtl. nicht, falls die Baseline ohnehin schon variabel ist).
+    Nach Downsampling/Anti-Aliasing-Filterung (z.B. 640Hz Analyse-Signal)
+    verschmiert derselbe Transient zu einer glatten aber stark ueberhoehten
+    Rampe ueber mehrere Samples -- dort greift Kriterium 1 (grosse Amplitude
+    relativ zur lokalen Baseline), waehrend Kriterium 2 (Einzelschritt) ihn
+    verpassen wuerde. Physiologische UP-States bleiben bei beiden Kriterien
+    unauffaellig, da sie weder einen Einzelschritt-Sprung machen noch (auf
+    dem fuer State-Detection verwendeten Kanal) das Vielfache der lokalen
+    Baseline-Amplitude erreichen.
+
+    Treffer werden um pad_s Sekunden gepaddet (Ein-/Ausschwingen) und nahe
+    beieinanderliegende Fenster zusammengefasst.
+
+    Returns:
+        mask            - bool array (len(x)), True = Artefakt (inkl. Padding)
+        index_intervals - list[(start_idx, end_idx_exclusive)]
+    """
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    if n < 2 or not np.isfinite(dt) or dt <= 0:
+        return np.zeros(n, dtype=bool), []
+
+    finite = np.isfinite(x)
+    if finite.sum() < 2:
+        return np.zeros(n, dtype=bool), []
+
+    raw_mask = np.zeros(n, dtype=bool)
+
+    # --- Kriterium 1: Amplitude ---
+    med_x = float(np.nanmedian(x[finite]))
+    mad_x = float(np.nanmedian(np.abs(x[finite] - med_x)))
+    sigma_x = mad_x / 0.6745 if mad_x > 1e-12 else float(np.nanstd(x[finite]))
+    if np.isfinite(sigma_x) and sigma_x > 1e-12:
+        raw_mask |= finite & (np.abs(x - med_x) > (mad_k * sigma_x))
+
+    # --- Kriterium 2: Ableitung (Sample-zu-Sample-Sprung) ---
+    d = np.diff(x)
+    d_finite = finite[:-1] & finite[1:]
+    if d_finite.any():
+        med_d = float(np.nanmedian(d[d_finite]))
+        mad_d = float(np.nanmedian(np.abs(d[d_finite] - med_d)))
+        sigma_d = mad_d / 0.6745 if mad_d > 1e-12 else float(np.nanstd(d[d_finite]))
+        if np.isfinite(sigma_d) and sigma_d > 1e-12:
+            raw_mask_d = d_finite & (np.abs(d - med_d) > (deriv_mad_k * sigma_d))
+            if raw_mask_d.any():
+                jump_idx = np.flatnonzero(raw_mask_d)
+                raw_mask[jump_idx] = True
+                raw_mask[jump_idx + 1] = True
+
+    if not raw_mask.any():
+        return np.zeros(n, dtype=bool), []
+
+    pad = max(1, int(round(pad_s / dt)))
+    mask = np.zeros(n, dtype=bool)
+    for i in np.flatnonzero(raw_mask):
+        mask[max(0, i - pad):min(n, i + pad + 1)] = True
+
+    # Zusammenhaengende Fenster extrahieren und nah beieinanderliegende mergen
+    padded = np.concatenate(([False], mask, [False]))
+    edges = np.flatnonzero(np.diff(padded.astype(np.int8)))
+    starts, ends = edges[0::2], edges[1::2]
+
+    merge_gap = max(0, int(round(merge_gap_s / dt)))
+    merged_starts, merged_ends = [], []
+    for s, e in zip(starts, ends):
+        if merged_ends and (s - merged_ends[-1]) <= merge_gap:
+            merged_ends[-1] = e
+        else:
+            merged_starts.append(s)
+            merged_ends.append(e)
+
+    mask[:] = False
+    index_intervals = []
+    for s, e in zip(merged_starts, merged_ends):
+        mask[s:e] = True
+        index_intervals.append((int(s), int(e)))
+
+    return mask, index_intervals
+
+
+def interpolate_masked(x, mask):
+    """Linear interpoliert die mit mask==True markierten Samples weg (z.B. Artefakte)."""
+    x = np.asarray(x, dtype=float).copy()
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return x
+    good = ~mask
+    if good.sum() < 2:
+        return x
+    idx = np.arange(x.size)
+    x[mask] = np.interp(idx[mask], idx[good], x[good])
+    return x
+
+
 def _save_svg(fig, hint, out_dir=None, dpi=200):
     if out_dir is None:
         out_dir = os.getcwd()
@@ -680,9 +785,12 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
             for on_t, off_t in Pulse_intervals:
                 trig_lo = float(off_t) - trig_interval_pre_offset_s + max(0.0, trig_interval_min_lat_s)
                 trig_hi = float(off_t) + trig_interval_post_s
+                onset_lo = float(on_t) - trig_win_s
+                onset_hi = float(on_t) + trig_win_s
                 trig_cand = np.where(
                     (~mask_trig) & (~mask_assoc) &
-                    (up_times >= trig_lo) & (up_times <= trig_hi)
+                    (((up_times >= trig_lo) & (up_times <= trig_hi)) |
+                     ((up_times >= onset_lo) & (up_times <= onset_hi)))
                 )[0]
                 trig_idx = None
                 if trig_cand.size:
@@ -717,14 +825,9 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                     (dn_times  >= float(on_t))
                 )[0]
                 if overlap_cand.size:
-                    if trig_idx is None:
-                        # Noch kein triggered UP für diesen Puls gefunden —
-                        # ein UP das den Onset überspannt ist höchstwahrscheinlich
-                        # puls-getriggert (Feature-Zeitauflösung kann Onset leicht verschieben).
-                        trig_idx = int(overlap_cand[-1])
-                        mask_trig[trig_idx] = True
-                    else:
-                        mask_assoc[overlap_cand] = True
+                    # UP lief bereits vor dem Puls-Onset -> nicht stimulus-ausgelöst,
+                    # sondern bestenfalls "associated" (Puls fällt in eine laufende UP).
+                    mask_assoc[overlap_cand] = True
 
         # Fallback fuer verbleibende UPs (z. B. wenn keine gueltigen Intervalle vorliegen)
         if Pulse_times_array.size:
@@ -734,8 +837,9 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
                 t_dn = float(dn_times[i])
 
                 # Fallback without reliable ON/OFF intervals: triggered means
-                # UP onset inside the causal post-offset window.
-                has_near_on = False
+                # UP onset near the pulse onset (±trig_win_s) or inside the
+                # causal post-offset window.
+                has_near_on = np.any(np.abs(t_up - Pulse_times_array) <= trig_win_s)
                 has_near_off = np.any(
                     ((t_up - Pulse_off_array) >= -trig_interval_pre_offset_s) &
                     ((t_up - Pulse_off_array) <= trig_win_off_s)

@@ -88,9 +88,14 @@ def main():
     entries = []
     for pd_path in parent_dirs:
         waveforms, labels, session_names = load_waveforms(pd_path)
-        if waveforms is None or len(session_names) < 1:
-            continue
-        entries.append((os.path.basename(pd_path), waveforms, labels, session_names))
+        if waveforms is not None and len(session_names) >= 1:
+            entries.append((os.path.basename(pd_path), waveforms, labels, session_names))
+        else:
+            for sub_path in sorted([e.path for e in os.scandir(pd_path) if e.is_dir()],
+                                   key=lambda p: _nat_session_key(os.path.basename(p))):
+                sub_wf, sub_lbl, sub_sess = load_waveforms(sub_path)
+                if sub_wf is not None and len(sub_sess) >= 1:
+                    entries.append((os.path.basename(sub_path), sub_wf, sub_lbl, sub_sess))
 
     if not entries:
         print("Keine Wellenform-Daten gefunden. Bitte zuerst Main_safe.py laufen lassen.")
@@ -100,15 +105,48 @@ def main():
     for name, wf, _, sess in entries:
         print(f"  {name}: {wf.shape[0]} Upstates, {len(sess)} Sessions")
 
-    with PdfPages(OUT_PDF) as pdf:
-        for folder_name, waveforms, labels, session_names in entries:
-            # z-score pro Upstate (Wellenform-Variabilität normalisieren)
-            scaler = StandardScaler()
-            wf_scaled = scaler.fit_transform(waveforms)
+    # Pass 1: PCA berechnen und globales y-Max für Balkendiagramme bestimmen
+    pca_results = []
+    global_bar_ymax = 0.0
+    for folder_name, waveforms, labels, session_names in entries:
+        scaler = StandardScaler()
+        wf_scaled = scaler.fit_transform(waveforms)
+        pca = PCA(n_components=min(N_COMPONENTS, wf_scaled.shape[1], wf_scaled.shape[0]))
+        coords = pca.fit_transform(wf_scaled)
+        var_explained = pca.explained_variance_ratio_ * 100
 
-            pca = PCA(n_components=min(N_COMPONENTS, wf_scaled.shape[1], wf_scaled.shape[0]))
-            coords = pca.fit_transform(wf_scaled)
-            var_explained = pca.explained_variance_ratio_ * 100
+        baseline_name = next(
+            (n for n in session_names if n.startswith("0_")),
+            session_names[0],
+        )
+        pc1_global_std = coords[:, 0].std(ddof=1) or 1.0
+        per_upstate = {n: coords[labels == n, 0] for n in session_names}
+        bl_vals = per_upstate[baseline_name]
+        bl_mu   = bl_vals.mean()
+        bl_se   = bl_vals.std(ddof=1) / np.sqrt(max(bl_vals.size, 1))
+
+        pct_devs, sem_pcts = [], []
+        for name in session_names:
+            vals = per_upstate[name]
+            mu_i = vals.mean()
+            se_i = vals.std(ddof=1) / np.sqrt(max(vals.size, 1))
+            pct = (mu_i - bl_mu) / pc1_global_std * 100
+            sem = 0.0 if name == baseline_name else \
+                  np.sqrt(se_i**2 + bl_se**2) / pc1_global_std * 100
+            pct_devs.append(pct)
+            sem_pcts.append(sem)
+
+        pca_results.append((folder_name, coords, labels, session_names, var_explained,
+                            baseline_name, pct_devs, sem_pcts))
+        local_max = max((abs(p) + s) for p, s in zip(pct_devs, sem_pcts))
+        global_bar_ymax = max(global_bar_ymax, local_max)
+
+    bar_ylim = (0, global_bar_ymax * 1.15) if global_bar_ymax > 0 else (0, 1)
+
+    # Pass 2: plotten mit einheitlicher Y-Achse für Balkendiagramme
+    with PdfPages(OUT_PDF) as pdf:
+        for (folder_name, coords, labels, session_names, var_explained,
+             baseline_name, pct_devs, sem_pcts) in pca_results:
 
             fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -117,42 +155,15 @@ def main():
             axes[0].set_xlabel(f"PC 1 ({var_explained[0]:.1f}% variance)")
             axes[0].set_ylabel(f"PC 2 ({var_explained[1]:.1f}% variance)" if len(var_explained) > 1 else "PC 2")
 
-            # Horizontales Balkendiagramm: % Abweichung zur Baseline-Session ("0_")
+            # Balkendiagramm mit globalem y-Limit
             cmap = plt.cm.get_cmap("tab10", len(session_names))
-            baseline_name = next(
-                (n for n in session_names if n.startswith("0_")),
-                session_names[0],
-            )
-
-            # Pro Upstate: PC1-Score aus der PCA oben
-            pc1_global_std = coords[:, 0].std(ddof=1) or 1.0  # Normalisierung
-            per_upstate = {}
-            for name in session_names:
-                mask = labels == name
-                per_upstate[name] = coords[mask, 0]  # PC1-Scores dieser Session
-
-            bl_vals = per_upstate[baseline_name]
-            bl_mu   = bl_vals.mean()
-            bl_se   = bl_vals.std(ddof=1) / np.sqrt(max(bl_vals.size, 1))
-
-            # Abweichung normalisiert durch globale PC1-Streuung (bl_mu kann ~0 sein)
-            pct_devs, sem_pcts = [], []
-            for name in session_names:
-                vals = per_upstate[name]
-                mu_i = vals.mean()
-                se_i = vals.std(ddof=1) / np.sqrt(max(vals.size, 1))
-                pct = (mu_i - bl_mu) / pc1_global_std * 100
-                sem = 0.0 if name == baseline_name else \
-                      np.sqrt(se_i**2 + bl_se**2) / pc1_global_std * 100
-                pct_devs.append(pct)
-                sem_pcts.append(sem)
-
             x_pos  = np.arange(len(session_names))
             ax2    = axes[1]
             colors = [cmap(i) for i in range(len(session_names))]
             ax2.bar(x_pos, np.abs(pct_devs), yerr=sem_pcts, color=colors, alpha=0.8,
                     error_kw=dict(ecolor="black", capsize=4, linewidth=1.2))
             ax2.axhline(0, color="black", linewidth=0.9, linestyle="--", alpha=0.6)
+            ax2.set_ylim(bar_ylim)
             ax2.set_xticks(x_pos)
             ax2.set_xticklabels(session_names, rotation=45, ha="right", fontsize=8)
             ax2.set_ylabel(f"PC1 deviation from '{baseline_name}' (% total variance)")

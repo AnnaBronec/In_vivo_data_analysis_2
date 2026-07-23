@@ -1966,8 +1966,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             key=lambda p: _name_key(os.path.basename(p))
         )
 
-        entries = []
-        for pd_path in parent_dirs:
+        def _load_mua_rows(pd_path):
             summary_files = sorted(glob.glob(os.path.join(pd_path, "*", "upstate_summary.csv")))
             rows = []
             for sp in summary_files:
@@ -1981,13 +1980,29 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                     rate = np.nan
                 if pd.notna(rate) and np.isfinite(float(rate)):
                     rows.append({"session_name": sess_name, "mua_hz": float(rate)})
+            return rows
+
+        entries = []
+        for pd_path in parent_dirs:
+            rows = _load_mua_rows(pd_path)
             if rows:
                 entries.append((os.path.basename(pd_path), rows))
+            else:
+                for sub_path in sorted([e.path for e in os.scandir(pd_path) if e.is_dir()],
+                                       key=lambda p: _name_key(os.path.basename(p))):
+                    sub_rows = _load_mua_rows(sub_path)
+                    if sub_rows:
+                        entries.append((os.path.basename(sub_path), sub_rows))
 
         if not entries:
             return
 
         out_pdf = os.path.join(root_dir, "ALL_trend_mua.pdf")
+        global_mua_ymax = max(
+            (float(np.nanpercentile(np.array([r["mua_hz"] for r in rows]), 99))
+             for _, rows in entries),
+            default=1.0,
+        )
         with PdfPages(out_pdf) as pdf:
             for folder_name, rows in entries:
                 labels = [r["session_name"] for r in rows]
@@ -2002,8 +2017,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                 ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
                 ax.set_ylabel("MUA Firing Rate (Hz)")
                 ax.set_title(folder_name, fontsize=12, fontweight="bold", pad=8)
-                ymax = float(np.nanpercentile(vals, 99))
-                ax.set_ylim(0, ymax + 0.20 * max(ymax, 1e-6))
+                ax.set_ylim(0, global_mua_ymax + 0.20 * max(global_mua_ymax, 1e-6))
                 ax.grid(alpha=0.2, linestyle=":")
                 ax.legend(fontsize=9)
                 fig.tight_layout()
@@ -2057,7 +2071,8 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             })
         return rows
 
-    def _draw_mua_spikes_trend_ax(ax, rows, title, ylabel="Spikes pro spontanem Up-Zustand"):
+    def _draw_mua_spikes_trend_ax(ax, rows, title, ylabel="Spikes pro spontanem Up-Zustand",
+                                  ylim=None):
         """
         Zeichnet den Trend-Plot (Einzelpunkte + Mittelwert±SD) in ax.
         Analog zu _write_parent_up_amplitude_trend_pdf.
@@ -2072,15 +2087,6 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         x      = np.arange(len(labels))
         means  = np.array([r["mean"] for r in rows])
         stds   = np.array([r["std"]  for r in rows])
-
-        all_raw = np.array([v for r in rows for v in r.get("raw", []) if np.isfinite(v)])
-        if all_raw.size:
-            vmax = float(np.nanpercentile(all_raw, 99))
-            vmin = max(0.0, float(np.nanmin(all_raw)))
-            span = max(vmax - vmin, 1e-6)
-            ylim = (max(0.0, vmin - 0.05 * span), vmax + 0.25 * span)
-        else:
-            ylim = None
 
         # Einzelwerte (halbtransparent)
         for i, r in enumerate(rows):
@@ -2100,8 +2106,15 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
         ax.set_xticklabels(labels, rotation=40, ha="right", fontsize=8)
         ax.set_ylabel(ylabel)
         ax.set_title(title, fontsize=11, fontweight="bold", pad=6)
-        if ylim:
+        if ylim is not None:
             ax.set_ylim(ylim)
+        else:
+            all_raw = np.array([v for r in rows for v in r.get("raw", []) if np.isfinite(v)])
+            if all_raw.size:
+                vmax = float(np.nanpercentile(all_raw, 99))
+                vmin = max(0.0, float(np.nanmin(all_raw)))
+                span = max(vmax - vmin, 1e-6)
+                ax.set_ylim(max(0.0, vmin - 0.05 * span), vmax + 0.25 * span)
         ax.set_ylim(bottom=0)
         ax.grid(alpha=0.2, linestyle=":")
         ax.legend(fontsize=9, frameon=False)
@@ -2157,20 +2170,42 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
             key=lambda p: _name_key(os.path.basename(p)),
         )
 
-        entries = []
-        for pd_path in parent_dirs:
+        def _load_spikes_for_parent(pd_path):
             sess_dirs = sorted(
                 [e.path for e in os.scandir(pd_path) if e.is_dir()],
                 key=lambda p: _name_key(os.path.basename(p)),
             )
             rows = _load_mua_spikes_rows_for_sessions(sess_dirs)
-            rows = [r for r in rows if np.isfinite(r["mean"]) or r["raw"]]
+            return [r for r in rows if np.isfinite(r["mean"]) or r["raw"]]
+
+        entries = []
+        for pd_path in parent_dirs:
+            rows = _load_spikes_for_parent(pd_path)
             if rows:
                 entries.append((os.path.basename(pd_path), rows))
+            else:
+                for sub_path in sorted([e.path for e in os.scandir(pd_path) if e.is_dir()],
+                                       key=lambda p: _name_key(os.path.basename(p))):
+                    sub_rows = _load_spikes_for_parent(sub_path)
+                    if sub_rows:
+                        entries.append((os.path.basename(sub_path), sub_rows))
 
         if not entries:
             print("[SUMMARY][ALL-MUA-SPIKES-TREND] keine Daten → PDF übersprungen")
             return
+
+        # Globale y-Limits für Spikes und Rate berechnen
+        def _global_ylim(raw_lists):
+            all_v = np.array([v for vals in raw_lists for v in vals if np.isfinite(v)])
+            if not all_v.size:
+                return None
+            vmax = float(np.nanpercentile(all_v, 99))
+            vmin = max(0.0, float(np.nanmin(all_v)))
+            span = max(vmax - vmin, 1e-6)
+            return (max(0.0, vmin - 0.05 * span), vmax + 0.25 * span)
+
+        spikes_ylim = _global_ylim([r.get("raw", [])      for _, rows in entries for r in rows])
+        rate_ylim   = _global_ylim([r.get("rate_raw", []) for _, rows in entries for r in rows])
 
         out_pdf = os.path.join(root_dir, "ALL_trend_mua_spikes.pdf")
         with PdfPages(out_pdf) as pdf:
@@ -2181,6 +2216,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                     axes[0], rows,
                     title="MUA Spikes pro spontanem Up-Zustand",
                     ylabel="Spikes / Up-Zustand",
+                    ylim=spikes_ylim,
                 )
                 rows_hz = [{**r, "mean": r["rate_mean"], "std": r["rate_std"], "raw": r["rate_raw"]}
                            for r in rows]
@@ -2188,6 +2224,7 @@ def _build_rollups(summary_path, out_name="upstate_summary_ALL.csv"):
                     axes[1], rows_hz,
                     title="MUA Firing-Rate in spontanen Up-Zuständen",
                     ylabel="Firing-Rate [Hz]",
+                    ylim=rate_ylim,
                 )
                 fig.suptitle(folder_name, fontsize=13, fontweight="bold")
                 fig.tight_layout(rect=[0, 0, 1, 0.97])

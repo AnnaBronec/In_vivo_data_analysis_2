@@ -1,9 +1,54 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
+import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+
+def _load_xdat_chan_names(prefix: Path, n_ch: int) -> list[str]:
+    """Read channel names from .xdat.json sidecar; falls back to ch00..chNN.
+
+    The returned names are designed so Main_safe.py can find pulse channels by
+    name (din_1 / din_2) while still sorting correctly via _key_num (which picks
+    the trailing integer).  Non-din channels are mapped to a dense chNN sequence
+    so the numeric sort order stays intact regardless of how many aux/dout
+    channels are present.
+
+    Layout strategy:
+      pri_N  ->  chNN  (N=0,1,... keeps original index)
+      din_N  ->  din_N (recognised as stim cols by Main_safe.py; not added to
+                        the running ch-counter so pri_N keeps its original chNN)
+      aux/dout -> chNN (continue counter after pri channels)
+    """
+    json_path = prefix.with_name(prefix.name + ".xdat.json")
+    if json_path.is_file():
+        try:
+            with open(json_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            raw_names = (
+                meta.get("sapiens_base", {})
+                    .get("biointerface_map", {})
+                    .get("chan_name", [])
+            )
+            if len(raw_names) >= n_ch:
+                raw_names = raw_names[:n_ch]
+                result = []
+                ch_idx = 0
+                for name in raw_names:
+                    if name.startswith("din_"):
+                        result.append(name)          # keep as din_1 / din_2
+                    else:
+                        result.append(f"ch{ch_idx:02d}")
+                        ch_idx += 1
+                print(f"[XDAT] Kanalnamen aus JSON: {', '.join(result[:6])} ... (din-Spalten: {[r for r in result if r.startswith('din')]})")
+                return result
+            print(f"[XDAT][WARN] JSON chan_name hat {len(raw_names)} Einträge, erwartet {n_ch} -> fallback ch00..chNN")
+        except Exception as e:
+            print(f"[XDAT][WARN] JSON-Lesen fehlgeschlagen: {e} -> fallback ch00..chNN")
+    return [f"ch{c:02d}" for c in range(n_ch)]
+
 
 # Deine XDAT-Konvertierung als Funktion
 def _xdat_convert_pair(prefix: Path, out_csv: Path, fs: float | None = None, chunk_rows: int = 200_000):
@@ -76,7 +121,8 @@ def _xdat_convert_pair(prefix: Path, out_csv: Path, fs: float | None = None, chu
     # ab hier passen Längen garantiert:
     assert data.size == n_ts * n_ch, "interner Längenfehler nach Tail-Fix"
 
-    header = ["time"] + [f"ch{c:02d}" for c in range(n_ch)]
+    col_names = _load_xdat_chan_names(prefix, n_ch)
+    header = ["time"] + col_names
     out_tmp = out_csv.with_suffix(out_csv.suffix + ".part")
 
     # Header schreiben

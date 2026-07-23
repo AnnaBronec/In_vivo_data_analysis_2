@@ -46,6 +46,7 @@ def export_interactive_lfp_html(
     ripple_trig_label="SWR triggered",
     ripple_assoc_label="SWR associated",
     ripple_intervals=None,  # list[(t0, t1)] in Sekunden
+    exclude_intervals=None,  # list[(t0, t1)] in Sekunden, z.B. automatisch erkannte Artefakte
     max_points=600_000,
     title="LFP (interaktiv)",
     limit_to_last_pulse=False,
@@ -200,16 +201,10 @@ def export_interactive_lfp_html(
                 line=dict(width=0),
                 fillcolor="rgba(220, 20, 60, 0.22)"
             ))
-        # --- Pulse-Intervalle (Onset->Offset) als rote Fläche, bewusst NACH den UP-Flächen
-    def _add_pulse_intervals(intervals, fill):
-        if intervals is None or len(intervals) == 0:
-            return
-        if len(intervals) > 2000:
-            step = int(np.ceil(len(intervals)/2000))
-            intervals = intervals[::step]
-        for (t0, t1) in intervals:
+    if exclude_intervals:
+        for (t0, t1) in exclude_intervals:
             t0 = float(t0); t1 = float(t1)
-            if t1 <= t0:
+            if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
                 continue
             if len(t) and (t1 < t[0] or t0 > t[-1]):
                 continue
@@ -218,14 +213,10 @@ def export_interactive_lfp_html(
                 x0=t0, x1=t1,
                 y0=0, y1=1,
                 xref="x", yref="paper",
-                line=dict(width=0),
-                fillcolor=fill
+                line=dict(width=1, color="rgba(80, 80, 80, 0.6)"),
+                fillcolor="rgba(120, 120, 120, 0.6)",
+                layer="above",  # ueber der Kurve, damit sie schwach durchscheint
             ))
-
-    # deutlich sichtbarer als vorher
-    if show_pulse_intervals:
-        _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.28)")
-        _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.28)")
 
     # --- Pulse-Linien
     def _add_pulses(ts, dash):
@@ -292,8 +283,8 @@ def export_interactive_lfp_html(
             ))
 
     if show_pulse_intervals:
-        _add_pulse_intervals(pulse_intervals_1, "rgba(255, 0, 0, 0.12)")   # rot transparent
-        _add_pulse_intervals(pulse_intervals_2, "rgba(255, 0, 0, 0.12)")   # optional: 2. Spur etwas schwächer
+        _add_pulse_intervals(pulse_intervals_1, "rgba(255, 50, 50, 0.45)")
+        _add_pulse_intervals(pulse_intervals_2, "rgba(255, 50, 50, 0.45)")
 
 
     
@@ -343,6 +334,14 @@ def export_interactive_lfp_html(
             name="Sharp-wave ripples",
             showlegend=True
         ))
+    if exclude_intervals:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="lines",
+            line=dict(width=12, color="rgba(120, 120, 120, 0.6)"),
+            name="Artifact (excluded)",
+            showlegend=True
+        ))
     if pulse_times_1 is not None and len(pulse_times_1):
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="lines",
@@ -373,7 +372,7 @@ def export_interactive_lfp_html(
     ):
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="lines",
-            line=dict(width=12, color="rgba(255, 0, 0, 0.12)"),
+            line=dict(width=12, color="rgba(255, 50, 50, 0.45)"),
             name="Pulse duration (ON→OFF)"
         ))
 
