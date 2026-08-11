@@ -6,6 +6,7 @@ Batch: Neuralynx -> CSV -> Analyse über viele Sessions.
 """
 
 import argparse
+import os
 import importlib
 import importlib.util
 import sys
@@ -446,7 +447,19 @@ def _teardown_memory():
 def main():
     ap = argparse.ArgumentParser(description="Batch convert+analyze all sessions in a folder.")
     ap.add_argument("root_dir")
-    ap.add_argument("--recursive", action="store_true")
+    ap.add_argument(
+        "--recursive",
+        dest="recursive",
+        action="store_true",
+        default=True,
+        help="Recurse into subfolders looking for sessions (default: on).",
+    )
+    ap.add_argument(
+        "--no-recursive",
+        dest="recursive",
+        action="store_false",
+        help="Only scan root_dir itself, not its subfolders.",
+    )
     ap.add_argument("--out-csv", default=None)
     ap.add_argument(
         "--skip-convert-if-exists",
@@ -463,18 +476,35 @@ def main():
     )
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max-workers", type=int, default=1)
+    ap.add_argument(
+        "--experiment", default=None,
+        help="Named experiment profile from experiments.env (section name) to "
+             "apply to every session found under root_dir. Sets ANALYSIS_EXPERIMENT "
+             "for this run; a session's own analysis_config.env can still override "
+             "individual keys.",
+    )
 
     ap.add_argument("--converter-module", default=None)
-    ap.add_argument("--converter-path", default=None)
+    ap.add_argument(
+        "--converter-path",
+        default=str(Path(__file__).resolve().with_name("universal_converter.py")),
+    )
     ap.add_argument("--converter-func", default="main")
 
     ap.add_argument("--analysis-module", default=None)
-    ap.add_argument("--analysis-path", default=None)
+    ap.add_argument(
+        "--analysis-path",
+        default=str(Path(__file__).resolve().with_name("analysis_wrapper.py")),
+    )
     ap.add_argument("--analysis-func", default="main_safe")
 
     ap.add_argument("--report-csv", default=None)
 
     args = ap.parse_args()
+
+    if args.experiment:
+        os.environ["ANALYSIS_EXPERIMENT"] = args.experiment
+        print(f"[INFO] Using experiment profile: {args.experiment}")
 
     root = Path(args.root_dir).expanduser().resolve()
     if not root.is_dir():

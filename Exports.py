@@ -20,6 +20,21 @@ SAVE_DIR = BASE_PATH
 LOGFILE = os.path.join(SAVE_DIR, "runlog.txt")
 
 
+def _write_plotly_html(fig, out_html, title):
+    # stamps the browser-tab <title> with the plot title so the channel is visible across tabs
+    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    title_text = title.get("text") if isinstance(title, dict) else title
+    if title_text:
+        with open(out_html, "r", encoding="utf-8") as f:
+            content = f.read()
+        if "<title>" not in content:
+            content = content.replace(
+                "<head>", f"<head><title>{html.escape(str(title_text))}</title>", 1
+            )
+            with open(out_html, "w", encoding="utf-8") as f:
+                f.write(content)
+
+
 def export_interactive_lfp_html(
     base_tag, save_dir, time_s, y,
     pulse_times_1=None, pulse_times_2=None,
@@ -419,7 +434,7 @@ def export_interactive_lfp_html(
 
 
     out_html = os.path.join(save_dir, f"{base_tag}__lfp_interactive.html")
-    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    _write_plotly_html(fig, out_html, title)
     print(f"[HTML] interaktiver LFP-Plot: {out_html}")
 
     return out_html
@@ -713,7 +728,7 @@ def export_interactive_dual_lfp_html(
     _apply_y_range(y_range_bottom, 2, data=x_bottom, pad_frac=0.08)
 
     out_html = os.path.join(save_dir, f"{base_tag}__dual_lfp_interactive.html")
-    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    _write_plotly_html(fig, out_html, title)
     print(f"[HTML] dual interaktiver LFP-Plot: {out_html}")
 
     return out_html
@@ -726,6 +741,18 @@ def export_interactive_two_channel_lfp_html(
     pulse_times_1_off=None, pulse_times_2_off=None,
     pulse_intervals_1=None, pulse_intervals_2=None,
     *,
+    top_spont=None,
+    top_trig=None,
+    top_assoc=None,
+    bottom_spont=None,
+    bottom_trig=None,
+    bottom_assoc=None,
+    top_spont_label="UP spontaneous",
+    top_trig_label="UP triggered",
+    top_assoc_label="UP associated",
+    bottom_spont_label="UP spontaneous",
+    bottom_trig_label="UP triggered",
+    bottom_assoc_label="UP associated",
     max_points=600_000,
     title="Two LFP channels (interaktiv)",
     top_name="Channel top",
@@ -768,6 +795,53 @@ def export_interactive_two_channel_lfp_html(
     ), row=2, col=1)
 
     shapes = []
+
+    def _mk_intervals(UP, DOWN):
+        if UP is None or DOWN is None:
+            return []
+        UP = np.asarray(UP, dtype=int)
+        DOWN = np.asarray(DOWN, dtype=int)
+        n = min(len(UP), len(DOWN))
+        if n == 0:
+            return []
+        out = []
+        for u, d in zip(UP[:n], DOWN[:n]):
+            if 0 <= u < len(time_s) and 0 < d <= len(time_s) and d > u:
+                out.append((float(time_s[u]), float(time_s[d - 1])))
+        return out
+
+    def _add_spans(groups, xref, yref):
+        for _, spans, fill in groups:
+            for (t0, t1) in spans:
+                if len(t) and (t1 < t[0] or t0 > t[-1]):
+                    continue
+                shapes.append(dict(
+                    type="rect",
+                    x0=t0, x1=t1,
+                    y0=0, y1=1,
+                    xref=xref, yref=yref,
+                    line=dict(width=0),
+                    fillcolor=fill,
+                ))
+
+    top_groups = []
+    if top_spont:
+        top_groups.append((str(top_spont_label), _mk_intervals(*top_spont), "rgba(46, 204, 113, 0.22)"))
+    if top_trig:
+        top_groups.append((str(top_trig_label), _mk_intervals(*top_trig), "rgba(31, 119, 180, 0.22)"))
+    if top_assoc:
+        top_groups.append((str(top_assoc_label), _mk_intervals(*top_assoc), "rgba(255, 127, 14, 0.22)"))
+
+    bottom_groups = []
+    if bottom_spont:
+        bottom_groups.append((str(bottom_spont_label), _mk_intervals(*bottom_spont), "rgba(46, 204, 113, 0.22)"))
+    if bottom_trig:
+        bottom_groups.append((str(bottom_trig_label), _mk_intervals(*bottom_trig), "rgba(31, 119, 180, 0.22)"))
+    if bottom_assoc:
+        bottom_groups.append((str(bottom_assoc_label), _mk_intervals(*bottom_assoc), "rgba(255, 127, 14, 0.22)"))
+
+    _add_spans(top_groups, "x", "y domain")
+    _add_spans(bottom_groups, "x2", "y2 domain")
 
     def _add_pulse_intervals(intervals, fill):
         if intervals is None or len(intervals) == 0:
@@ -818,6 +892,14 @@ def export_interactive_two_channel_lfp_html(
         _add_pulse_lines(pulse_times_2, "dash", 0.35, xref)
         _add_pulse_lines(pulse_times_1_off, "dot", 0.55, xref)
         _add_pulse_lines(pulse_times_2_off, "dash", 0.55, xref)
+
+    for label, _, fill in top_groups + bottom_groups:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="lines",
+            line=dict(width=12, color=fill),
+            name=label,
+        ))
 
     if pulse_times_1 is not None and len(pulse_times_1):
         fig.add_trace(go.Scatter(
@@ -929,7 +1011,7 @@ def export_interactive_two_channel_lfp_html(
     _apply_y_range(y_range_bottom, 2, data=x_bottom, pad_frac=0.08)
 
     out_html = os.path.join(save_dir, f"{base_tag}__dual_channel_no_spindle.html")
-    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    _write_plotly_html(fig, out_html, title)
     print(f"[HTML] dual channel (no spindle): {out_html}")
 
     return out_html
@@ -1216,7 +1298,7 @@ def export_interactive_three_channel_lfp_html(
     _apply_y_range(y_range_bottom, 3, data=x_bottom, pad_frac=0.10)
 
     out_html = os.path.join(save_dir, f"{base_tag}__triple_lfp_interactive.html")
-    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    _write_plotly_html(fig, out_html, title)
     print(f"[HTML] triple interaktiver LFP-Plot: {out_html}")
     return out_html
 
@@ -1506,7 +1588,7 @@ def export_interactive_four_channel_lfp_html(
     _apply_y_range(y_range_bottom, 4, data=x_bottom, pad_frac=0.10)
 
     out_html = os.path.join(save_dir, f"{base_tag}__four_lfp_interactive.html")
-    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    _write_plotly_html(fig, out_html, title)
     print(f"[HTML] four interaktiver LFP-Plot: {out_html}")
     return out_html
 
@@ -2141,7 +2223,7 @@ def export_interactive_spectrogram_html(
     )
 
     out_html = os.path.join(save_dir, f"{base_tag}__spectrogram_interactive.html")
-    plotly_offline_plot(fig, filename=out_html, auto_open=False, include_plotlyjs="cdn")
+    _write_plotly_html(fig, out_html, title)
     print(f"[HTML] interaktiver Spectrogramm-Plot: {out_html}")
 
     return out_html
@@ -2660,7 +2742,7 @@ def export_mua_html(
     fig.update_xaxes(title_text="Zeit (s)", row=2, col=1)
 
     out_path = os.path.join(save_dir, f"{base_tag}__mua_interactive.html")
-    plotly_offline_plot(fig, filename=out_path, auto_open=False, include_plotlyjs="cdn")
+    _write_plotly_html(fig, out_path, title)
     print(f"[MUA-HTML] {out_path}  (spikes={spk.size:,})")
 
 
@@ -2671,6 +2753,7 @@ def export_mua_ap_raw_html(
     title="MUA – HP-Signal + AP-Detektion (Rohsignal)",
     max_display_hz=8000.0,
     spont_counts=None,
+    channel=None,
 ):
     """
     Interaktives HTML des HP-gefilterten Rohsignals mit Schwellenlinie und
@@ -2792,7 +2875,7 @@ def export_mua_ap_raw_html(
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
         xaxis=dict(title="Zeit ab Aufnahme-Start (s)"),
-        yaxis=dict(title="HP-Signal (AU)"),
+        yaxis=dict(title=(f"ch{channel} — HP-Signal (AU)" if channel is not None else "HP-Signal (AU)")),
         # Statistik als sichtbare Beschriftung unter dem Plot
         annotations=[dict(
             text=_stats_line,
@@ -2808,7 +2891,7 @@ def export_mua_ap_raw_html(
     )
 
     out_path = os.path.join(save_dir, f"{base_tag}__mua_ap_raw.html")
-    plotly_offline_plot(fig, filename=out_path, auto_open=False, include_plotlyjs="cdn")
+    _write_plotly_html(fig, out_path, title)
     print(
         f"[MUA-AP-HTML] {out_path}  "
         f"(n_spikes={spk_valid.size:,}, thr={thr:.3f}, noise={noise:.3f})"

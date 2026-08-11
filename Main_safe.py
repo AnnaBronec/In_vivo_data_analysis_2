@@ -111,6 +111,8 @@ FORCE_ONSET_ONLY_PLOTS = os.environ.get("FORCE_ONSET_ONLY_PLOTS", "1") == "1"
 SHOW_COMMENT_PULSE_OFFSETS = os.environ.get("SHOW_COMMENT_PULSE_OFFSETS", "1") == "1"
 IGNORE_PULSE_2 = os.environ.get("IGNORE_PULSE_2", "0") == "1"
 SPINDLE_ZERO_PHASE = os.environ.get("SPINDLE_ZERO_PHASE", "1") == "1"
+SPINDLE_F_LO_HZ = float(os.environ.get("SPINDLE_F_LO_HZ", "10.0"))
+SPINDLE_F_HI_HZ = float(os.environ.get("SPINDLE_F_HI_HZ", "15.0"))
 _DEFAULT_SESSION = "/home/ananym/Code/In_vivo_data_analysis/Data/FOR ANNA IN VIVO/"
 BASE_PATH   = globals().get("BASE_PATH", _DEFAULT_SESSION)
 
@@ -143,6 +145,34 @@ def _load_simple_env_file(path_obj, override=False):
     return True
 
 
+def _load_experiment_section(experiment_name, path_obj, override=False):
+    """Load one [experiment_name] section of an INI-style experiments file
+    (see experiments.env) into os.environ, same override semantics as
+    _load_simple_env_file. Returns True iff the section was found and read."""
+    p = Path(path_obj)
+    if not p.is_file():
+        return False
+    import configparser
+    cp = configparser.ConfigParser()
+    cp.optionxform = str  # keep ENV_VAR_NAME case as-is (default lowercases keys)
+    try:
+        cp.read(p, encoding="utf-8")
+    except Exception:
+        return False
+    if experiment_name not in cp:
+        return False
+    for k, v in cp[experiment_name].items():
+        k = k.strip()
+        v = v.strip()
+        if not k:
+            continue
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        if override or (k not in os.environ):
+            os.environ[k] = v
+    return True
+
+
 def _bootstrap_analysis_config(base_path):
     loaded_paths = []
     candidates = []
@@ -150,7 +180,6 @@ def _bootstrap_analysis_config(base_path):
     if cfg_env:
         candidates.append(Path(cfg_env).expanduser())
     candidates.append(Path(base_path) / "analysis_config.env")
-    candidates.append(Path(__file__).resolve().with_name("analysis_config.env"))
 
     seen = set()
     for c in candidates:
@@ -164,6 +193,27 @@ def _bootstrap_analysis_config(base_path):
         seen.add(key)
         if _load_simple_env_file(r, override=False):
             loaded_paths.append(str(r))
+
+    # Named experiment profile (channels/freq bands/plot toggles shared across
+    # a whole animal/cohort). Selected via ANALYSIS_EXPERIMENT=<name>, e.g.
+    # set by batch_pipeline.py's --experiment flag. Ranks below the explicit
+    # ANALYSIS_CONFIG_FILE / per-session analysis_config.env above (those can
+    # still override individual keys) but above the shared global default.
+    experiment_name = os.environ.get("ANALYSIS_EXPERIMENT", "").strip()
+    if experiment_name:
+        exp_cfg_env = os.environ.get("EXPERIMENTS_CONFIG_FILE", "").strip()
+        exp_path = (
+            Path(exp_cfg_env).expanduser() if exp_cfg_env
+            else Path(__file__).resolve().with_name("experiments.env")
+        )
+        if _load_experiment_section(experiment_name, exp_path, override=False):
+            loaded_paths.append(f"{exp_path} [{experiment_name}]")
+        else:
+            print(f"[CONFIG][WARN] ANALYSIS_EXPERIMENT='{experiment_name}' not found in {exp_path}")
+
+    global_default = Path(__file__).resolve().with_name("analysis_config.env")
+    if _load_simple_env_file(global_default, override=False):
+        loaded_paths.append(str(global_default))
 
     force_coarse = str(os.environ.get("UP_FORCE_COARSE", "1")).strip().lower() not in ("0", "false", "no", "off")
     if force_coarse:
@@ -1620,6 +1670,107 @@ for i in candidate_idx:
         jump_ratio=jump_ratio, corr=_nan, quasi_bin=quasi_bin,
     )
 
+# ===== Sonden-Kanal-Erkennung (pri_ vs. aux/digital/nicht angeschlossen) =====
+# XDAT/Allego-Sessions haengen nach den echten Elektroden (pri_0..pri_N) noch
+# aux_1/aux_2 (GPIO-Analogeingaenge, z.B. Referenz/Beschleunigungssensor) und
+# din_/dout_ (digitale Marker) an. Ausserdem kann ein Port mehr "pri_"-Kanaele
+# melden als tatsaechlich eine Sonde angeschlossen hat (z.B. 32-Kanal-Port mit
+# nur einer 16-Kanal-Sonde -> Kanaele 16..31 sind "no-probe", floaten aber oft
+# mit HOHEM statt niedrigem Rauschen, eine reine Amplituden-Heuristik erkennt
+# das also nicht zuverlaessig).
+#
+# Bevorzugt wird deshalb die *.xdat.json-Metadatei (biointerface_map) gelesen,
+# die pro Kanal exakt sagt: chan_name (pri_/aux_/din_/dout_) + probe_id
+# ("no-probe" = nicht angeschlossen). Nur wenn keine passende JSON gefunden
+# wird (z.B. Neuralynx-Sessions ohne XDAT), faellt die Erkennung auf eine
+# Amplituden-Heuristik zurueck (aux-Kanaele liegen typischerweise 100-1000x
+# unter dem Sonden-Rauschpegel).
+#
+# Wird hier faelschlich ein aux/nicht-angeschlossener Kanal als "Main"/"SWR"-
+# Kanal gewaehlt, sieht die Y-Achse im HTML-Export absurd klein/verschoben aus
+# (oder zeigt reines Rauschen), obwohl der Rest der Pipeline korrekt rechnet --
+# MAIN_UP_CH/SWR_CH haben das bisher ignoriert und direkt auf den rohen
+# Kanalindex zugegriffen.
+
+def _load_xdat_probe_channel_indices(base_path, n_channels):
+    """Liest *.xdat.json im Session-Ordner (biointerface_map) und liefert
+    (idx_list, ports_by_idx) fuer echte, angeschlossene Sonden-Elektroden
+    ('pri_*' UND probe_id != 'no-probe'/None). (None, None), falls keine
+    passende JSON gefunden wird oder die Kanalzahl nicht zur CSV passt.
+    ports_by_idx erlaubt es, echte Mehrsonden-Sessions (mehrere Ports mit
+    angeschlossener Sonde, z.B. Port A + Port C) von einem einzelnen Port mit
+    ungenutzten Restplaetzen zu unterscheiden (die 'no-probe' sind, aber sonst
+    wie echte pri_-Kanaele des gleichen Ports aussehen)."""
+    try:
+        json_candidates = sorted(Path(base_path).glob("*.xdat.json"))
+        if not json_candidates:
+            return None, None
+        with open(json_candidates[0], encoding="utf-8") as f:
+            meta = json.load(f)
+        bm = meta["sapiens_base"]["biointerface_map"]
+        chan_name = bm["chan_name"]
+        if len(chan_name) != n_channels:
+            print(f"[CHAN-DETECT][WARN] {json_candidates[0].name}: {len(chan_name)} Kanaele in JSON "
+                  f"!= {n_channels} in CSV -> ignoriere JSON, nutze Amplituden-Heuristik.")
+            return None, None
+        probe_ids = bm.get("probe_id", [None] * len(chan_name))
+        ports = bm.get("port", [None] * len(chan_name))
+        idx = [
+            i for i in range(n_channels)
+            if str(chan_name[i]).startswith("pri") and probe_ids[i] not in (None, "no-probe")
+        ]
+        if not idx:
+            return None, None
+        return idx, {i: ports[i] for i in idx}
+    except Exception as e:
+        print(f"[CHAN-DETECT][WARN] xdat.json konnte nicht gelesen werden: {e}")
+        return None, None
+
+probe_like_idx, _probe_ports_by_idx = _load_xdat_probe_channel_indices(BASE_PATH, NUM_CHANNELS)
+if probe_like_idx is not None:
+    probe_like_idx = [i for i in probe_like_idx if i in candidate_idx]
+    _n_ports_connected = len(set(_probe_ports_by_idx.values())) if _probe_ports_by_idx else 1
+    print(f"[CHAN-DETECT] Sonden-Kanaele aus *.xdat.json gelesen (probe_id != 'no-probe'); "
+          f"angeschlossene Ports: {sorted(set(_probe_ports_by_idx.values())) if _probe_ports_by_idx else []}")
+else:
+    _n_ports_connected = None
+    AUX_REL_STD_MAX = float(os.environ.get("AUX_REL_STD_MAX", "0.05"))
+    probe_like_idx = [
+        i for i in candidate_idx
+        if (not _chan_metrics[i]["quasi_bin"])
+        and np.isfinite(_chan_metrics[i]["rel_std"])
+        and _chan_metrics[i]["rel_std"] >= AUX_REL_STD_MAX
+    ]
+    print(f"[CHAN-DETECT] keine passende *.xdat.json -> Amplituden-Heuristik (rel_std>={AUX_REL_STD_MAX:g}).")
+if not probe_like_idx:
+    print("[CHAN-DETECT][WARN] keine Kanaele als 'echte Sonde' erkannt -> nutze alle Kanaele.")
+    probe_like_idx = list(candidate_idx)
+n_probe_like = len(probe_like_idx)
+_non_probe_idx = [i for i in candidate_idx if i not in probe_like_idx]
+print(
+    f"[CHAN-DETECT] {n_probe_like}/{len(candidate_idx)} Kanaele sind echte, angeschlossene Sonden-Elektroden."
+    + (f" Ausgeschlossen (aux/digital/nicht angeschlossen): {_non_probe_idx}" if _non_probe_idx else "")
+)
+
+def _auto_pick_probe_channel(pool, label):
+    """Waehlt aus 'pool' den Kanal mit dem besten Qualitaets-Score (hohe Korrelation
+    zum Multi-Kanal-Template, wenig 50Hz-/HF-Rauschen). corr ist an dieser Stelle nur
+    fuer Pass-1-Ueberlebende gesetzt; Kanaele ohne corr-Wert werden neutral bewertet."""
+    pool = [i for i in pool if i in _chan_metrics]
+    if not pool:
+        return None
+    def _score(i):
+        m = _chan_metrics[i]
+        corr = m["corr"] if np.isfinite(m["corr"]) else 0.0
+        line = m["line_ratio"] if np.isfinite(m["line_ratio"]) else 0.5
+        hf = m["hf_ratio"] if np.isfinite(m["hf_ratio"]) else 0.5
+        return corr - 0.5 * line - 0.5 * hf
+    best = max(pool, key=_score)
+    print(f"[CHAN-AUTO] {label} automatisch gewaehlt: pri_{best} "
+          f"(corr={_chan_metrics[best]['corr']:.2f}, 50Hz={_chan_metrics[best]['line_ratio']:.3f}, "
+          f"HF={_chan_metrics[best]['hf_ratio']:.3f})")
+    return best
+
 # Pass 1: lokale Qualitätskriterien (kein Template nötig)
 _pass1_bad = set()
 for i in candidate_idx:
@@ -1720,13 +1871,56 @@ if _chan_filter_verbose:
 log(f"Channel filter: kept={NUM_CHANNELS_GOOD}/{NUM_CHANNELS}, good_idx={good_idx}")
 
 # Kanal-Policy:
-# - LFP/UP/Spindle: pri_38 (per ENV MAIN_UP_CH überschreibbar)
-# - SWR:            immer pri_33 (explizit aus globalem LFP_array, unabhängig von good_idx)
-# Bei wenigen Kanälen bleibt SWR standardmäßig deaktiviert (wie bisher), außer ENABLE_SWR wird passend gesetzt.
-dual_probe_min_ch = int(os.environ.get("DUAL_PROBE_MIN_CHANNELS", "24"))
-is_dual_probe_mode = int(NUM_CHANNELS) >= dual_probe_min_ch
-req_up_ch = int(os.environ.get("MAIN_UP_CH", "38"))
-req_swr_ch = 33
+# - LFP/UP/Spindle: automatisch der beste Kanal aus den erkannten Sonden-Elektroden
+#   (per ENV MAIN_UP_CH überschreibbar)
+# - SWR:            automatisch der beste verbleibende Sonden-Kanal
+#   (per ENV SWR_CH überschreibbar), unabhängig von good_idx nur was die reine
+#   Elektroden-Zugehörigkeit angeht (aux/digital wird aber IMMER ausgeschlossen)
+# Ob 1 oder 2 Sonden vorliegen, wird aus der Zahl der erkannten echten Elektroden
+# (n_probe_like, siehe [CHAN-DETECT] oben) abgeleitet, NICHT aus der rohen
+# Spaltenzahl -- die zählt bei XDAT/Allego-Sessions auch aux_1/aux_2/din_/dout_
+# mit, wodurch z.B. eine einzelne 32-Kanal-Sonde faelschlich als "dual probe"
+# durchging (32+2 aux+4 digital = 38 >= 24).
+if _n_ports_connected is not None:
+    # Ground truth aus der xdat.json: dual-probe nur, wenn mehr als ein Port
+    # (z.B. A + C) tatsaechlich eine angeschlossene Sonde hat -- ein einzelner
+    # Port mit vielen "no-probe"-Restplaetzen zaehlt NICHT als zweite Sonde.
+    is_dual_probe_mode = _n_ports_connected >= 2
+    print(f"[CHAN-DETECT] {_n_ports_connected} Port(s) mit angeschlossener Sonde "
+          f"-> {'DUAL' if is_dual_probe_mode else 'SINGLE'}-probe mode")
+else:
+    dual_probe_min_ch = int(os.environ.get("DUAL_PROBE_MIN_CHANNELS", "40"))
+    is_dual_probe_mode = n_probe_like >= dual_probe_min_ch
+    print(f"[CHAN-DETECT] n_probe_like={n_probe_like} vs dual_probe_min_ch={dual_probe_min_ch} "
+          f"-> {'DUAL' if is_dual_probe_mode else 'SINGLE'}-probe mode")
+
+_auto_pool_up = [j for j in probe_like_idx if j in good_idx] or probe_like_idx[:]
+
+_main_up_env = str(os.environ.get("MAIN_UP_CH", "")).strip()
+if _main_up_env:
+    req_up_ch = int(_main_up_env)
+    if req_up_ch not in probe_like_idx:
+        print(f"[WARN] MAIN_UP_CH={req_up_ch} sieht nicht nach einer echten Sonden-Elektrode aus "
+              f"(vermutlich aux/digital) -> wähle automatisch einen echten Kanal.")
+        req_up_ch = _auto_pick_probe_channel(_auto_pool_up, "MAIN_UP_CH") or req_up_ch
+else:
+    req_up_ch = _auto_pick_probe_channel(_auto_pool_up, "MAIN_UP_CH")
+    if req_up_ch is None:
+        req_up_ch = 38
+
+_swr_env = str(os.environ.get("SWR_CH", "")).strip()
+_auto_pool_swr = [j for j in _auto_pool_up if j != req_up_ch] or _auto_pool_up
+if _swr_env:
+    req_swr_ch = int(_swr_env)
+    if req_swr_ch not in probe_like_idx:
+        print(f"[WARN] SWR_CH={req_swr_ch} sieht nicht nach einer echten Sonden-Elektrode aus "
+              f"(vermutlich aux/digital) -> wähle automatisch einen echten Kanal.")
+        req_swr_ch = _auto_pick_probe_channel(_auto_pool_swr, "SWR_CH") or req_swr_ch
+else:
+    req_swr_ch = _auto_pick_probe_channel(_auto_pool_swr, "SWR_CH")
+    if req_swr_ch is None:
+        req_swr_ch = 33
+
 enable_swr_env = str(os.environ.get("ENABLE_SWR", "1")).strip().lower() not in ("0", "false", "no", "off")
 enable_swr = bool(is_dual_probe_mode) and bool(enable_swr_env)
 
@@ -3494,6 +3688,8 @@ spindle_use_psd_check = str(os.environ.get("SPINDLE_USE_PSD_CHECK", "0")).strip(
 spindle_intervals_s = detect_spindle_intervals_in_upstates(
     main_channel, time_s, dt, all_up_pairs
     ,
+    f_lo=SPINDLE_F_LO_HZ,
+    f_hi=SPINDLE_F_HI_HZ,
     thr_k_on=spindle_thr_on,
     thr_k_off=spindle_thr_off,
     min_dur_s=spindle_min_dur_s,
@@ -3577,7 +3773,7 @@ else:
 # Bandpass-Signal (10-15 Hz) für Spindle-Visualisierung/Amplituden.
 main_channel_for_spindle = main_channel_uV if (HTML_IN_uV and main_channel_uV is not None) else main_channel
 main_channel_bp_10_15 = _bandpass_1d(
-    main_channel_for_spindle, dt, f_lo=10.0, f_hi=15.0, order=3, causal=(not SPINDLE_ZERO_PHASE)
+    main_channel_for_spindle, dt, f_lo=SPINDLE_F_LO_HZ, f_hi=SPINDLE_F_HI_HZ, order=3, causal=(not SPINDLE_ZERO_PHASE)
 )
 
 # Pulse-orientierte Spindle-Klassifikation über echten Spindle-Onset.
@@ -4063,50 +4259,52 @@ else:
 
 
 
-# Interaktive HTML (mit UP-Schattierung) 
-export_interactive_lfp_html(
-    BASE_TAG, SAVE_DIR, time_s,
-    html_sig_src,
+# Interaktive HTML (mit UP-Schattierung)
+if os.environ.get("HTML_MAIN_ENABLE", "1") == "1":
+    export_interactive_lfp_html(
+        BASE_TAG, SAVE_DIR, time_s,
+        html_sig_src,
 
-    pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html_export,
-    pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_export,
-    pulse_intervals_1=ttl1_intervals,
-    pulse_intervals_2=ttl2_intervals_export,
-    up_spont=(Spontaneous_UP, Spontaneous_DOWN),
-    up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
-    up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
-    spindle_intervals=None,
-    exclude_intervals=artifact_intervals_s,
-    limit_to_last_pulse=False,
-    title=f"{BASE_TAG} — Main LFP ch{ch_idx_used} (interaktiv)",
-    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
-    show_pulse_intervals=(not PULSE_ONSET_ONLY),
-    y_range=html_y_range,
-)
+        pulse_times_1=pulse_times_1_html,
+        pulse_times_2=pulse_times_2_html_export,
+        pulse_times_1_off=pulse_times_1_off_html_plot,
+        pulse_times_2_off=pulse_times_2_off_html_export,
+        pulse_intervals_1=ttl1_intervals,
+        pulse_intervals_2=ttl2_intervals_export,
+        up_spont=(Spontaneous_UP, Spontaneous_DOWN),
+        up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
+        up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
+        spindle_intervals=None,
+        exclude_intervals=artifact_intervals_s,
+        limit_to_last_pulse=False,
+        title=f"{BASE_TAG} — Main LFP ch{ch_idx_used} (interaktiv)",
+        y_label=(f"ch{ch_idx_used} — LFP (µV)" if HTML_IN_uV else f"ch{ch_idx_used} — LFP ({UNIT_LABEL})"),
+        show_pulse_intervals=(not PULSE_ONSET_ONLY),
+        y_range=html_y_range,
+    )
 
 # Zusatz-HTML: nur Signal + Pulse (keine UP-/Spindle-Markierungen)
-export_interactive_lfp_html(
-    f"{BASE_TAG}__pulse_only", SAVE_DIR, time_s,
-    html_sig_src,
-    pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html_export,
-    pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_export,
-    pulse_intervals_1=ttl1_intervals,
-    pulse_intervals_2=ttl2_intervals_export,
-    up_spont=None,
-    up_trig=None,
-    up_assoc=None,
-    spindle_intervals=None,
-    exclude_intervals=artifact_intervals_s,
-    limit_to_last_pulse=False,
-    title=f"{BASE_TAG} — Signal + Pulse ch{ch_idx_used} (ohne Marker, interaktiv)",
-    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
-    show_pulse_intervals=(not PULSE_ONSET_ONLY),
-    y_range=html_y_range,
-)
+if os.environ.get("HTML_PULSE_ONLY_ENABLE", "1") == "1":
+    export_interactive_lfp_html(
+        f"{BASE_TAG}__pulse_only", SAVE_DIR, time_s,
+        html_sig_src,
+        pulse_times_1=pulse_times_1_html,
+        pulse_times_2=pulse_times_2_html_export,
+        pulse_times_1_off=pulse_times_1_off_html_plot,
+        pulse_times_2_off=pulse_times_2_off_html_export,
+        pulse_intervals_1=ttl1_intervals,
+        pulse_intervals_2=ttl2_intervals_export,
+        up_spont=None,
+        up_trig=None,
+        up_assoc=None,
+        spindle_intervals=None,
+        exclude_intervals=artifact_intervals_s,
+        limit_to_last_pulse=False,
+        title=f"{BASE_TAG} — Signal + Pulse ch{ch_idx_used} (ohne Marker, interaktiv)",
+        y_label=(f"ch{ch_idx_used} — LFP (µV)" if HTML_IN_uV else f"ch{ch_idx_used} — LFP ({UNIT_LABEL})"),
+        show_pulse_intervals=(not PULSE_ONSET_ONLY),
+        y_range=html_y_range,
+    )
 
 # Zusatz-HTML: nur Main-Channel im Spindle-Band (10-15 Hz)
 print(
@@ -4122,8 +4320,8 @@ main_channel_bp_10_15 = np.asarray(html_sig_src, float).copy()
 try:
     fs_html = 1.0 / float(dt)
     nyq_html = 0.5 * fs_html
-    lo_bp = 10.0
-    hi_bp = min(15.0, 0.95 * nyq_html)
+    lo_bp = SPINDLE_F_LO_HZ
+    hi_bp = min(SPINDLE_F_HI_HZ, 0.95 * nyq_html)
     if lo_bp < hi_bp:
         _bp_finite = np.isfinite(main_channel_bp_10_15)
         x_bp0 = np.nan_to_num(main_channel_bp_10_15, nan=float(np.nanmedian(main_channel_bp_10_15)))
@@ -4135,84 +4333,61 @@ try:
 except Exception as e:
     print(f"[WARN] 10-15 Hz bandpass failed: {e}")
 
-export_interactive_lfp_html(
-    f"{BASE_TAG}__main_10_15hz", SAVE_DIR, time_s, main_channel_bp_10_15,
-    pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html_export,
-    pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_export,
-    pulse_intervals_1=[],
-    pulse_intervals_2=[],
-    up_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
-    up_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
-    up_assoc=(Spindle_Assoc_UP, Spindle_Assoc_DOWN),
-    up_spont_label="Spindle spontaneous",
-    up_trig_label="Spindle triggered",
-    up_assoc_label="Spindle associated",
-    exclude_intervals=artifact_intervals_s,
-    title=f"{BASE_TAG} — Spindle classification ch{ch_idx_used} (10-15 Hz, interaktiv)",
-    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
-    show_pulse_intervals=False,
-    y_range=html_y_range,
-)
+if os.environ.get("HTML_SPINDLE_10_15HZ_ENABLE", "1") == "1":
+    export_interactive_lfp_html(
+        f"{BASE_TAG}__main_10_15hz", SAVE_DIR, time_s, main_channel_bp_10_15,
+        pulse_times_1=pulse_times_1_html,
+        pulse_times_2=pulse_times_2_html_export,
+        pulse_times_1_off=pulse_times_1_off_html_plot,
+        pulse_times_2_off=pulse_times_2_off_html_export,
+        pulse_intervals_1=[],
+        pulse_intervals_2=[],
+        up_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
+        up_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
+        up_assoc=(Spindle_Assoc_UP, Spindle_Assoc_DOWN),
+        up_spont_label="Spindle spontaneous",
+        up_trig_label="Spindle triggered",
+        up_assoc_label="Spindle associated",
+        exclude_intervals=artifact_intervals_s,
+        title=f"{BASE_TAG} — Spindle classification ch{ch_idx_used} (10-15 Hz, interaktiv)",
+        y_label=(f"ch{ch_idx_used} — LFP (µV)" if HTML_IN_uV else f"ch{ch_idx_used} — LFP ({UNIT_LABEL})"),
+        show_pulse_intervals=False,
+        y_range=html_y_range,
+    )
 
-export_interactive_lfp_html(
-    f"{BASE_TAG}__upstate_spindle_overlay", SAVE_DIR, time_s,
-    html_sig_src,
-    pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html_export,
-    pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_export,
-    pulse_intervals_1=ttl1_intervals,
-    pulse_intervals_2=ttl2_intervals_export,
-    up_spont=(Spontaneous_UP, Spontaneous_DOWN),
-    up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
-    up_assoc=None,
-    spindle_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
-    spindle_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
-    spindle_assoc=(Spindle_Assoc_UP, Spindle_Assoc_DOWN),
-    ripple_spont=(Ripple_Spont_UP, Ripple_Spont_DOWN),
-    ripple_trig=(Ripple_Trig_UP, Ripple_Trig_DOWN),
-    ripple_assoc=(Ripple_Assoc_UP, Ripple_Assoc_DOWN),
-    ripple_spont_label="SWR spontaneous",
-    ripple_trig_label="SWR triggered",
-    ripple_assoc_label="SWR associated",
-    exclude_intervals=artifact_intervals_s,
-    title=f"{BASE_TAG} — UP+Spindle+SWR Overlay ch{ch_idx_used} (interaktiv)",
-    y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
-    show_pulse_intervals=(not PULSE_ONSET_ONLY),
-    y_range=html_y_range,
-)
 
-export_interactive_dual_lfp_html(
-    f"{BASE_TAG}__lfp_plus_main_10_15hz", SAVE_DIR,
-    time_s,
-    main_channel_bp_10_15,
-    html_sig_src,
-    pulse_times_1=pulse_times_1_html,
-    pulse_times_2=pulse_times_2_html_export,
-    pulse_times_1_off=pulse_times_1_off_html_plot,
-    pulse_times_2_off=pulse_times_2_off_html_export,
-    pulse_intervals_1=ttl1_intervals,
-    pulse_intervals_2=ttl2_intervals_export,
-    top_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
-    top_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
-    top_assoc=(Spindle_Assoc_UP, Spindle_Assoc_DOWN),
-    bottom_spont=(Spontaneous_UP, Spontaneous_DOWN),
-    bottom_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
-    bottom_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
-    title=f"{BASE_TAG} — Main LFP + 10-15 Hz bandpass ch{ch_idx_used} (interaktiv)",
-    top_y_label=("10-15 Hz bandpass (µV)" if HTML_IN_uV else f"10-15 Hz bandpass ({UNIT_LABEL})"),
-    bottom_y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
-    y_range_top=None,
-    y_range_bottom=html_y_range,
-    show_pulse_intervals=(not PULSE_ONSET_ONLY),
-)
+if os.environ.get("HTML_MAIN_PLUS_BANDPASS_ENABLE", "1") == "1":
+    export_interactive_dual_lfp_html(
+        f"{BASE_TAG}__lfp_plus_main_10_15hz", SAVE_DIR,
+        time_s,
+        main_channel_bp_10_15,
+        html_sig_src,
+        pulse_times_1=pulse_times_1_html,
+        pulse_times_2=pulse_times_2_html_export,
+        pulse_times_1_off=pulse_times_1_off_html_plot,
+        pulse_times_2_off=pulse_times_2_off_html_export,
+        pulse_intervals_1=ttl1_intervals,
+        pulse_intervals_2=ttl2_intervals_export,
+        top_spont=(Spindle_Spont_UP, Spindle_Spont_DOWN),
+        top_trig=(Spindle_Trig_UP, Spindle_Trig_DOWN),
+        top_assoc=(Spindle_Assoc_UP, Spindle_Assoc_DOWN),
+        bottom_spont=(Spontaneous_UP, Spontaneous_DOWN),
+        bottom_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
+        bottom_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
+        title=f"{BASE_TAG} — Main LFP + 10-15 Hz bandpass ch{ch_idx_used} (interaktiv)",
+        top_y_label=(f"ch{ch_idx_used} — 10-15 Hz bandpass (µV)" if HTML_IN_uV else f"ch{ch_idx_used} — 10-15 Hz bandpass ({UNIT_LABEL})"),
+        bottom_y_label=(f"ch{ch_idx_used} — LFP (µV)" if HTML_IN_uV else f"ch{ch_idx_used} — LFP ({UNIT_LABEL})"),
+        y_range_top=None,
+        y_range_bottom=html_y_range,
+        show_pulse_intervals=(not PULSE_ONSET_ONLY),
+    )
 
 # Zusatz-HTML: 3 Panels (SWR-Kanal, LFP/UP-Kanal, 10-15Hz auf LFP/UP-Kanal)
 try:
     if not enable_swr:
         raise RuntimeError("SWR disabled by channel policy")
+    if os.environ.get("HTML_THREE_CHANNEL_ENABLE", "1") != "1":
+        raise RuntimeError("HTML_THREE_CHANNEL_ENABLE=0")
 
     req_swr_ch = int(swr_ch_idx_main)
     req_up_ch = int(ch_idx_used)
@@ -4245,7 +4420,7 @@ try:
     ch9_plot = _channel_signal_for_html(swr_ch_idx)
     ch40_plot = _channel_signal_for_html(up_ch_idx)
     ch40_bp_10_15_plot = _bandpass_1d(
-        ch40_plot, dt, f_lo=10.0, f_hi=15.0, order=3, causal=(not SPINDLE_ZERO_PHASE)
+        ch40_plot, dt, f_lo=SPINDLE_F_LO_HZ, f_hi=SPINDLE_F_HI_HZ, order=3, causal=(not SPINDLE_ZERO_PHASE)
     )
     if int(up_ch_idx) != int(ch_idx_used):
         print(
@@ -4409,11 +4584,15 @@ try:
 except Exception as e:
     if "SWR disabled by channel policy" in str(e):
         print("[INFO] 3-panel HTML export skipped: SWR disabled in single-electrode mode.")
+    elif "HTML_THREE_CHANNEL_ENABLE=0" in str(e):
+        print("[INFO] 3-panel HTML export skipped: disabled via HTML_THREE_CHANNEL_ENABLE.")
     else:
         print(f"[WARN] 3-panel HTML export skipped: {e}")
 
 # Zusatz-HTML: zwei "gute" Channels übereinander (ohne Spindle)
 try:
+    if os.environ.get("HTML_TWO_GOOD_CHANNELS_ENABLE", "1") != "1":
+        raise RuntimeError("HTML_TWO_GOOD_CHANNELS_ENABLE=0")
     preferred_second_ch = 40
     if preferred_second_ch in set(map(int, good_idx)):
         second_ch_idx = int(preferred_second_ch)
@@ -4454,19 +4633,24 @@ try:
         title=f"{BASE_TAG} — 2 good channels ch{ch_idx_used} + ch{second_ch_idx} (ohne Spindle, interaktiv)",
         top_name=f"Main channel (pri_{ch_idx_used})",
         bottom_name=f"Deeper good channel (pri_{second_ch_idx})",
-        top_y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
-        bottom_y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
+        top_y_label=(f"ch{ch_idx_used} — LFP (µV)" if HTML_IN_uV else f"ch{ch_idx_used} — LFP ({UNIT_LABEL})"),
+        bottom_y_label=(f"ch{second_ch_idx} — LFP (µV)" if HTML_IN_uV else f"ch{second_ch_idx} — LFP ({UNIT_LABEL})"),
         y_range_top=html_y_range,
         y_range_bottom=html_y_range,
         show_pulse_intervals=(not PULSE_ONSET_ONLY),
     )
     print(f"[HTML] two-good-ch export: main=pri_{ch_idx_used}, second=pri_{second_ch_idx}")
 except Exception as e:
-    print(f"[WARN] two-good-ch HTML export skipped: {e}")
+    if "HTML_TWO_GOOD_CHANNELS_ENABLE=0" in str(e):
+        print("[INFO] two-good-ch HTML export skipped: disabled via HTML_TWO_GOOD_CHANNELS_ENABLE.")
+    else:
+        print(f"[WARN] two-good-ch HTML export skipped: {e}")
 
 # MUA interaktiver Plot (LFP + Spike-Marker + Rate)
 try:
-    if len(mua_spike_times) > 0:
+    if os.environ.get("HTML_MUA_ENABLE", "1") != "1":
+        print("[INFO] MUA HTML export skipped: disabled via HTML_MUA_ENABLE.")
+    elif len(mua_spike_times) > 0:
         export_mua_html(
             f"{BASE_TAG}__mua",
             SAVE_DIR,
@@ -4477,7 +4661,7 @@ try:
             up_trig=(Pulse_triggered_UP, Pulse_triggered_DOWN),
             up_assoc=(Pulse_associated_UP, Pulse_associated_DOWN),
             title=f"{BASE_TAG} — MUA ch{_mua_ch} (HP>300Hz, thr=-3.5×MAD)",
-            y_label=("LFP (µV)" if HTML_IN_uV else f"LFP ({UNIT_LABEL})"),
+            y_label=(f"ch{_mua_ch} — LFP (µV)" if HTML_IN_uV else f"ch{_mua_ch} — LFP ({UNIT_LABEL})"),
         )
     else:
         print("[MUA-HTML] keine Spikes → HTML übersprungen")
@@ -4490,7 +4674,9 @@ try:
     _raw_for_html   = globals().get("_raw_sig",   None)
     _spk_for_html   = _mua_spk_rel   # 0-basiert, immer konsistent mit dem Rohsignal
     _cnt_for_html   = globals().get("_sp_counts", None)   # AP/Up-Zustand (spontan)
-    if _raw_for_html is not None and _spk_for_html.size > 0:
+    if os.environ.get("HTML_MUA_AP_RAW_ENABLE", "1") != "1":
+        print("[INFO] MUA-AP-raw HTML export skipped: disabled via HTML_MUA_AP_RAW_ENABLE.")
+    elif _raw_for_html is not None and _spk_for_html.size > 0:
         export_mua_ap_raw_html(
             f"{BASE_TAG}__mua",
             SAVE_DIR,
@@ -4500,6 +4686,7 @@ try:
             t0=0.0,
             title=f"{BASE_TAG} — HP-Signal ch{_mua_ch} + AP-Detektion (HP>300Hz, thr=-3.5×MAD)",
             spont_counts=_cnt_for_html,
+            channel=_mua_ch,
         )
     else:
         print("[MUA-AP-HTML] Rohsignal nicht verfügbar oder keine Spikes → übersprungen")

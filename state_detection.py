@@ -339,8 +339,11 @@ def classify_states(Spect_dat, time_s, pulse_times_1, pulse_times_2, dt, V1_1,
 
 
 
-    # 
-    f_lo, f_hi = 0.5, 4.0
+    # Slow-oscillation/Delta-Band, in dem Upstates ueber die Spektrogramm-Bandpower
+    # klassifiziert werden. Ueber UP_F_LO_HZ/UP_F_HI_HZ pro Session/Experiment
+    # ueberschreibbar (siehe analysis_config.env / experiments.env).
+    f_lo = float(os.environ.get("UP_F_LO_HZ", "0.5"))
+    f_hi = float(os.environ.get("UP_F_HI_HZ", "4.0"))
     band_mask = (freqs >= f_lo) & (freqs <= f_hi)
     if band_mask.sum() > 0:
         print("[BAND-EFF]", freqs[band_mask].min(), freqs[band_mask].max(), "bins", band_mask.sum())

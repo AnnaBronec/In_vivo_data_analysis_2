@@ -4,7 +4,15 @@
       "Bash(python3 -c ' *)",
       "Bash(python3 -m py_compile /home/ananym/Code/In_vivo_data_analysis/Source/Main_safe.py)",
       "Bash(python3 -m py_compile Main_safe.py state_detection.py Exports.py)",
-      "Bash(python3 /tmp/claude-1000/-home-ananym-Code-In-vivo-data-analysis-Source/d10593a9-80c1-45f5-a5d8-5ad5a2916a59/scratchpad/find_dead_code.py)"
+      "Bash(python3 /tmp/claude-1000/-home-ananym-Code-In-vivo-data-analysis-Source/d10593a9-80c1-45f5-a5d8-5ad5a2916a59/scratchpad/find_dead_code.py)",
+      "Bash(/home/ananym/Code/In_vivo_data_analysis/.venv/bin/pip install *)",
+      "Bash(../.venv/bin/python -m pytest tests/ -v)",
+      "Bash(/home/ananym/Code/In_vivo_data_analysis/.venv/bin/python3 -c ' *)",
+      "Bash(/home/ananym/Code/In_vivo_data_analysis/.venv/bin/python3 deep_channel_dual_probe_html.py \"/run/media/ananym/7FBA-F71B/invivo/20270730_injectedhM4Di_mPFC_twoprobes_contralateral/1_shortlyafter0.9_DCZ_lefthemisphere\")",
+      "Bash(/home/ananym/Code/In_vivo_data_analysis/.venv/bin/python3 -m py_compile analysis_wrapper.py deep_channel_dual_probe_html.py Exports.py)",
+      "Bash(/home/ananym/Code/In_vivo_data_analysis/.venv/bin/python3 -m py_compile deep_channel_dual_probe_html.py)",
+      "Bash(ps -p 69401 -o pid,etimes,pcpu,cmd)",
+      "Bash(mount)"
     ]
   }
 }
